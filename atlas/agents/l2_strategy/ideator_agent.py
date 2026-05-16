@@ -31,13 +31,27 @@ ARCHETYPES = [
 TEMP_MAP = [0.4, 0.6, 0.7, 0.85, 1.0]
 
 ALLOWED_FEATURES = [
-    "returns", "rsi_14", "macd", "macd_signal",
-    "ema_12", "ema_26", "sma_20",
-    "bollinger_upper", "bollinger_lower",
-    "vwap", "volume", "close", "open", "high", "low",
-    "price_vs_vwap_pct", "ema_spread_pct",
-    "relative_volume", "bollinger_band_position",
-    "volatility_regime", "trend_strength",
+    "returns",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "ema_12",
+    "ema_26",
+    "sma_20",
+    "bollinger_upper",
+    "bollinger_lower",
+    "vwap",
+    "volume",
+    "close",
+    "open",
+    "high",
+    "low",
+    "price_vs_vwap_pct",
+    "ema_spread_pct",
+    "relative_volume",
+    "bollinger_band_position",
+    "volatility_regime",
+    "trend_strength",
 ]
 
 
@@ -74,9 +88,7 @@ class IdeatorAgent(BaseAgent):
         self.db_client = db_client
         self.messaging = MessagingClient(redis_client)
         self._archetype = ARCHETYPES[instance_id % len(ARCHETYPES)]
-        self._asset_class = (
-            "equity" if instance_id % 2 == 0 else "crypto"
-        )
+        self._asset_class = "equity" if instance_id % 2 == 0 else "crypto"
 
     async def stop(self):
         await super().stop()
@@ -117,8 +129,7 @@ class IdeatorAgent(BaseAgent):
                 )
 
                 logger.info(
-                    f"{self.name}: ✅ Saved: {spec['strategy_name']} "
-                    f"[{strategy_id}]"
+                    f"{self.name}: ✅ Saved: {spec['strategy_name']} [{strategy_id}]"
                 )
 
                 await self.messaging.publish(
@@ -164,9 +175,7 @@ class IdeatorAgent(BaseAgent):
                 else ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
             )
 
-            features = await self.db_client.get_latest_features(
-                symbols, limit=1
-            )
+            features = await self.db_client.get_latest_features(symbols, limit=1)
 
             if features:
                 # Pick the symbol with richest feature data
@@ -203,9 +212,9 @@ class IdeatorAgent(BaseAgent):
             logger.warning(f"{self.name}: Feature fetch error: {e}")
 
         try:
-            # What has FAILED — learn from mistakes
+            # What has FAILED — learn from mistakes (temporal-aware)
             failed = await self.db_client.get_strategies_with_backtest(
-                status="failed_validation", limit=10
+                statuses=["failed_validation", "repair_candidate"], limit=10
             )
             for s in failed:
                 results = s.get("results", {})
@@ -222,21 +231,26 @@ class IdeatorAgent(BaseAgent):
                         params = {}
                 entry_conds = params.get("entry_conditions", [])
                 win_rate = results.get("win_rate", 0)
-                context["failed_patterns"].append({
-                    "entry": entry_conds,
-                    "sharpe": results.get("sharpe_ratio", "N/A"),
-                    "trades": results.get("total_trades", 0),
-                    "win_rate": win_rate if isinstance(win_rate, (int, float)) else 0,
-                    "reason": params.get("validation_notes", "unknown"),
-                })
+                context["failed_patterns"].append(
+                    {
+                        "entry": entry_conds,
+                        "composite_score": s.get("composite_score", "N/A"),
+                        "short_window_score": s.get("short_window_score", "N/A"),
+                        "trades": s.get("total_trades", 0),
+                        "win_rate": win_rate
+                        if isinstance(win_rate, (int, float))
+                        else 0,
+                        "reason": params.get("validation_notes", "unknown"),
+                    }
+                )
 
         except Exception as e:
             logger.warning(f"{self.name}: Failed patterns fetch: {e}")
 
         try:
-            # What has WORKED — learn from successes
-            validated = await self.db_client.get_top_strategies_by_sharpe(
-                min_sharpe=0.1, max_sharpe=10.0, limit=5
+            # What has WORKED — learn from successes (temporal-aware)
+            validated = await self.db_client.get_top_strategies_by_composite_score(
+                min_score=30, max_score=100, limit=5
             )
             for s in validated:
                 params = s.get("parameters", {})
@@ -245,11 +259,13 @@ class IdeatorAgent(BaseAgent):
                         params = json.loads(params)
                     except Exception:
                         params = {}
-                context["successful_patterns"].append({
-                    "entry": params.get("entry_conditions", []),
-                    "sharpe": s.get("sharpe", "N/A"),
-                    "archetype": params.get("archetype", "unknown"),
-                })
+                context["successful_patterns"].append(
+                    {
+                        "entry": params.get("entry_conditions", []),
+                        "temporal_score": s.get("short_window_score", "N/A"),
+                        "archetype": params.get("archetype", "unknown"),
+                    }
+                )
 
         except Exception as e:
             logger.warning(f"{self.name}: Successful patterns fetch: {e}")
@@ -265,6 +281,7 @@ class IdeatorAgent(BaseAgent):
         try:
             # How many bars we have per symbol (tells Claude data richness)
             from sqlalchemy import text
+
             async with self.db_client.engine.connect() as conn:
                 result = await conn.execute(
                     text("""
@@ -298,15 +315,16 @@ class IdeatorAgent(BaseAgent):
         primary_sym = context.get("primary_symbol", "NVDA")
 
         # Format market snapshot as real numbers
-        snapshot_str = "\n".join(
-            f"  {k}: {v}" for k, v in list(snapshot.items())[:15]
-        ) or "  No live features available"
+        snapshot_str = (
+            "\n".join(f"  {k}: {v}" for k, v in list(snapshot.items())[:15])
+            or "  No live features available"
+        )
 
         # Format failure lessons
         if failed:
             failed_lines = []
             for f in failed[:5]:
-                wr = f['win_rate']
+                wr = f["win_rate"]
                 wr_str = f"{wr:.0%}" if isinstance(wr, (int, float)) else str(wr)
                 failed_lines.append(
                     f"  Entry: {f['entry']} | Sharpe: {f['sharpe']} | "
@@ -328,16 +346,12 @@ class IdeatorAgent(BaseAgent):
             success_str = "  No validated strategies yet."
 
         # Data richness context
-        bars_str = "\n".join(
-            f"  {sym}: {count} bars"
-            for sym, count in list(bars.items())[:8]
-        ) or "  No bar counts available"
-
-        names_str = (
-            ", ".join(recent_names[:10])
-            if recent_names
-            else "none yet"
+        bars_str = (
+            "\n".join(f"  {sym}: {count} bars" for sym, count in list(bars.items())[:8])
+            or "  No bar counts available"
         )
+
+        names_str = ", ".join(recent_names[:10]) if recent_names else "none yet"
 
         system_prompt = """You are a senior quantitative researcher at a proprietary trading fund.
 You design algorithmic trading strategies that run on 1-minute OHLCV bar data.
@@ -354,7 +368,7 @@ Your output will be converted directly to executable Python code.
 Entry/exit conditions must be pure Python boolean comparisons — no English prose."""
 
         user_prompt = f"""=== MISSION ===
-Design ONE {archetype.upper().replace('_', ' ')} strategy for 1-minute {asset.upper()} data.
+Design ONE {archetype.upper().replace("_", " ")} strategy for 1-minute {asset.upper()} data.
 
 === CURRENT MARKET STATE (real values from live data) ===
 Primary symbol: {primary_sym}
@@ -389,10 +403,10 @@ Approved features (ONLY use these exact names):
 
 Realistic value ranges for {asset} 1-minute data:
   rsi_14:              0-100 (typical range: 30-70)
-  returns:             {'-0.003 to 0.003' if asset == 'equity' else '-0.008 to 0.008'}
-  price_vs_vwap_pct:   {'-0.005 to 0.005' if asset == 'equity' else '-0.015 to 0.015'}
+  returns:             {"-0.003 to 0.003" if asset == "equity" else "-0.008 to 0.008"}
+  price_vs_vwap_pct:   {"-0.005 to 0.005" if asset == "equity" else "-0.015 to 0.015"}
   relative_volume:     0.2 to 4.0 (>1.5 = elevated, >2.5 = very high)
-  ema_spread_pct:      {'-0.005 to 0.005' if asset == 'equity' else '-0.01 to 0.01'}
+  ema_spread_pct:      {"-0.005 to 0.005" if asset == "equity" else "-0.01 to 0.01"}
   bollinger_band_pos:  0.0 to 1.0 (0=lower band, 1=upper band, 0.5=middle)
   volatility_regime:   0.3 to 2.5 (>1.3 = elevated vol)
   trend_strength:      0.0 to 0.008
@@ -474,7 +488,7 @@ Output ONLY valid JSON. No markdown, no explanation, no code fences.
             if first == -1 or last == -1:
                 raise ValueError("No JSON found in response")
 
-            spec = json.loads(cleaned[first:last+1])
+            spec = json.loads(cleaned[first : last + 1])
             spec["asset_class"] = context["asset_class"]
             spec = normalize_strategy(spec)
 
@@ -514,9 +528,7 @@ Output ONLY valid JSON. No markdown, no explanation, no code fences.
             # Fallback to local template
             return await self._generate_local(context)
 
-    async def _generate_local(
-        self, context: dict
-    ) -> tuple[dict, None, None]:
+    async def _generate_local(self, context: dict) -> tuple[dict, None, None]:
         """Fallback when Claude fails — uses proven template conditions."""
         asset = context["asset_class"]
         archetype = context["archetype"]
@@ -567,7 +579,7 @@ Output ONLY valid JSON. No markdown, no explanation, no code fences.
 
         t = TEMPLATES.get(
             (asset, archetype),
-            {"entry": ["ema_12 > ema_26"], "exit": ["ema_12 < ema_26"]}
+            {"entry": ["ema_12 > ema_26"], "exit": ["ema_12 < ema_26"]},
         )
 
         spec = {
@@ -596,10 +608,7 @@ async def main():
     await db_client.connect()
     redis_client = Redis.from_url(settings.redis_url)
 
-    agents = [
-        IdeatorAgent(i, TEMP_MAP[i], redis_client, db_client)
-        for i in range(5)
-    ]
+    agents = [IdeatorAgent(i, TEMP_MAP[i], redis_client, db_client) for i in range(5)]
     await asyncio.gather(*(agent.start() for agent in agents))
     await asyncio.Event().wait()
 

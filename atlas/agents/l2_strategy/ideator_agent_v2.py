@@ -20,54 +20,81 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
 )
 
 ARCHETYPES = [
-    "momentum", "mean_reversion",
-    "breakout", "volatility_regime", "trend_following",
+    "momentum",
+    "mean_reversion",
+    "breakout",
+    "volatility_regime",
+    "trend_following",
 ]
 
 TEMP_MAP = [0.4, 0.7, 0.5, 0.85, 1.0]
 
 ALLOWED_FEATURES = [
-    "returns", "rsi_14", "macd", "macd_signal",
-    "ema_12", "ema_26", "sma_20",
-    "bollinger_upper", "bollinger_lower",
-    "vwap", "close", "open", "high", "low", "volume",
-    "price_vs_vwap_pct", "ema_spread_pct",
-    "relative_volume", "bollinger_band_position",
-    "volatility_regime", "trend_strength",
+    "returns",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "ema_12",
+    "ema_26",
+    "sma_20",
+    "bollinger_upper",
+    "bollinger_lower",
+    "vwap",
+    "close",
+    "open",
+    "high",
+    "low",
+    "volume",
+    "price_vs_vwap_pct",
+    "ema_spread_pct",
+    "relative_volume",
+    "bollinger_band_position",
+    "volatility_regime",
+    "trend_strength",
 ]
 
 # Proven fallback templates — these DO generate trades
 LOCAL_TEMPLATES = {
-    ("equity", "momentum"):
-        (["ema_spread_pct > 0.001", "relative_volume > 1.3"],
-         ["ema_spread_pct < 0.0", "rsi_14 > 68"]),
-    ("equity", "mean_reversion"):
-        (["bollinger_band_position < 0.15", "rsi_14 < 38"],
-         ["bollinger_band_position > 0.75"]),
-    ("equity", "breakout"):
-        (["bollinger_band_position > 0.92", "relative_volume > 1.8"],
-         ["rsi_14 > 72"]),
-    ("equity", "trend_following"):
-        (["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"],
-         ["ema_12 < ema_26"]),
-    ("equity", "volatility_regime"):
-        (["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
-         ["volatility_regime < 0.9"]),
-    ("crypto", "momentum"):
-        (["ema_spread_pct > 0.002", "relative_volume > 1.5"],
-         ["ema_spread_pct < 0.0", "rsi_14 > 70"]),
-    ("crypto", "mean_reversion"):
-        (["rsi_14 < 32", "price_vs_vwap_pct < -0.004"],
-         ["rsi_14 > 58"]),
-    ("crypto", "breakout"):
-        (["bollinger_band_position > 0.9", "relative_volume > 2.0"],
-         ["rsi_14 > 75"]),
-    ("crypto", "trend_following"):
-        (["ema_12 > ema_26", "trend_strength > 0.001"],
-         ["ema_12 < ema_26"]),
-    ("crypto", "volatility_regime"):
-        (["volatility_regime > 1.5", "rsi_14 < 40"],
-         ["volatility_regime < 0.8"]),
+    ("equity", "momentum"): (
+        ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
+        ["ema_spread_pct < 0.0", "rsi_14 > 68"],
+    ),
+    ("equity", "mean_reversion"): (
+        ["bollinger_band_position < 0.15", "rsi_14 < 38"],
+        ["bollinger_band_position > 0.75"],
+    ),
+    ("equity", "breakout"): (
+        ["bollinger_band_position > 0.92", "relative_volume > 1.8"],
+        ["rsi_14 > 72"],
+    ),
+    ("equity", "trend_following"): (
+        ["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"],
+        ["ema_12 < ema_26"],
+    ),
+    ("equity", "volatility_regime"): (
+        ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
+        ["volatility_regime < 0.9"],
+    ),
+    ("crypto", "momentum"): (
+        ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
+        ["ema_spread_pct < 0.0", "rsi_14 > 70"],
+    ),
+    ("crypto", "mean_reversion"): (
+        ["rsi_14 < 32", "price_vs_vwap_pct < -0.004"],
+        ["rsi_14 > 58"],
+    ),
+    ("crypto", "breakout"): (
+        ["bollinger_band_position > 0.9", "relative_volume > 2.0"],
+        ["rsi_14 > 75"],
+    ),
+    ("crypto", "trend_following"): (
+        ["ema_12 > ema_26", "trend_strength > 0.001"],
+        ["ema_12 < ema_26"],
+    ),
+    ("crypto", "volatility_regime"): (
+        ["volatility_regime > 1.5", "rsi_14 < 40"],
+        ["volatility_regime < 0.8"],
+    ),
 }
 
 
@@ -111,6 +138,7 @@ class IdeatorAgentV2(BaseAgent):
         self._ctx_cache: dict = {}
         self._ctx_cycle: int = 0
         self._CACHE_TTL: int = 10
+        self._failure_warned: bool = False  # one-shot log suppression
 
     async def stop(self):
         await super().stop()
@@ -137,9 +165,7 @@ class IdeatorAgentV2(BaseAgent):
 
                 # Dedup
                 sig = compute_strategy_signature(spec)
-                existing = await self.db_client.get_strategy_signatures(
-                    limit=500
-                )
+                existing = await self.db_client.get_strategy_signatures(limit=500)
                 if sig in existing:
                     logger.info(f"{self.name}: Duplicate — skip")
                     await asyncio.sleep(5)
@@ -161,9 +187,11 @@ class IdeatorAgentV2(BaseAgent):
 
                 await self.messaging.publish(
                     Channel.STRATEGY_SIGNALS,
-                    {"event": "new_strategy",
-                     "strategy_id": strategy_id,
-                     "agent": self.name},
+                    {
+                        "event": "new_strategy",
+                        "strategy_id": strategy_id,
+                        "agent": self.name,
+                    },
                 )
 
                 # Lean agents run faster
@@ -194,9 +222,7 @@ class IdeatorAgentV2(BaseAgent):
                 if self._asset_class == "equity"
                 else ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
             )
-            features = await self.db_client.get_latest_features(
-                symbols, limit=1
-            )
+            features = await self.db_client.get_latest_features(symbols, limit=1)
             if features:
                 best = max(
                     features.items(),
@@ -208,16 +234,19 @@ class IdeatorAgentV2(BaseAgent):
                     picks = {
                         k: round(float(v), 4)
                         for k, v in vals.items()
-                        if k in [
-                            "rsi_14", "ema_spread_pct",
+                        if k
+                        in [
+                            "rsi_14",
+                            "ema_spread_pct",
                             "bollinger_band_position",
-                            "relative_volume", "volatility_regime",
+                            "relative_volume",
+                            "volatility_regime",
                             "price_vs_vwap_pct",
-                        ] and v is not None
+                        ]
+                        and v is not None
                     }
-                    ctx["snapshot_line"] = (
-                        f"{sym}: "
-                        + ", ".join(f"{k}={v}" for k, v in picks.items())
+                    ctx["snapshot_line"] = f"{sym}: " + ", ".join(
+                        f"{k}={v}" for k, v in picks.items()
                     )
                     rsi = float(vals.get("rsi_14", 50))
                     vol = float(vals.get("volatility_regime", 1.0))
@@ -237,14 +266,14 @@ class IdeatorAgentV2(BaseAgent):
             logger.warning(f"{self.name}: Feature fetch: {e}")
 
         try:
-            # Summarize failures as ONE compressed line
+            # Summarize failures as ONE compressed line (temporal-aware)
             failed = await self.db_client.get_strategies_with_backtest(
-                status="failed_validation", limit=8
+                statuses=["failed_validation", "repair_candidate"], limit=8
             )
             if failed:
                 reasons = []
                 zero_trade_count = 0
-                low_sharpe_count = 0
+                low_score_count = 0
                 for s in failed:
                     params = s.get("parameters", {})
                     if isinstance(params, str):
@@ -254,15 +283,15 @@ class IdeatorAgentV2(BaseAgent):
                             params = {}
                     notes = params.get("validation_notes", "")
                     trades = s.get("total_trades", 0) or 0
-                    sharpe = s.get("sharpe_ratio", 0) or 0
+                    score = s.get("composite_score", 0) or 0
                     if int(trades) < 3:
                         zero_trade_count += 1
-                    if float(sharpe) < 0:
-                        low_sharpe_count += 1
+                    if float(score) < 30:
+                        low_score_count += 1
                     if "trades" in str(notes):
                         reasons.append("too few trades")
-                    elif "sharpe" in str(notes):
-                        reasons.append("negative sharpe")
+                    elif "composite" in str(notes) or "score" in str(notes):
+                        reasons.append("low composite score")
                     elif "drawdown" in str(notes):
                         reasons.append("high drawdown")
 
@@ -272,22 +301,25 @@ class IdeatorAgentV2(BaseAgent):
                         f"{zero_trade_count}/{len(failed)} had <3 trades "
                         f"(thresholds too extreme)"
                     )
-                if low_sharpe_count > 0:
+                if low_score_count > 0:
                     parts.append(
-                        f"{low_sharpe_count}/{len(failed)} had negative sharpe"
+                        f"{low_score_count}/{len(failed)} had low composite score"
                     )
                 ctx["failure_summary"] = (
-                    "; ".join(parts) if parts
+                    "; ".join(parts)
+                    if parts
                     else f"{len(failed)} failed: " + ", ".join(set(reasons))
                 )
 
         except Exception as e:
-            logger.warning(f"{self.name}: Failure fetch: {e}")
+            if not self._failure_warned:
+                logger.warning(f"{self.name}: Failure fetch: {e}")
+                self._failure_warned = True
 
         try:
-            # Summarize successes as ONE compressed line
-            wins = await self.db_client.get_top_strategies_by_sharpe(
-                min_sharpe=0.1, max_sharpe=10.0, limit=3
+            # Summarize successes as ONE compressed line (temporal-aware)
+            wins = await self.db_client.get_top_strategies_by_composite_score(
+                min_score=30, max_score=100, limit=3
             )
             if wins:
                 lines = []
@@ -299,16 +331,18 @@ class IdeatorAgentV2(BaseAgent):
                         except Exception:
                             params = {}
                     entry = params.get("entry_conditions", [])
-                    sh = round(float(w.get("sharpe_ratio", 0)), 2)
-                    lines.append(f"entry={entry} sharpe={sh}")
+                    score = round(float(w.get("short_window_score", 0)), 1)
+                    lines.append(f"entry={entry} temporal_score={score}")
                 ctx["success_summary"] = " | ".join(lines)
 
         except Exception as e:
-            logger.warning(f"{self.name}: Success fetch: {e}")
+            if not self._failure_warned:
+                logger.warning(f"{self.name}: Success fetch: {e}")
+                self._failure_warned = True
 
         try:
-            ctx["recent_names"] = (
-                await self.db_client.get_recent_strategy_names(limit=15)
+            ctx["recent_names"] = await self.db_client.get_recent_strategy_names(
+                limit=15
             )
         except Exception:
             pass
@@ -318,9 +352,7 @@ class IdeatorAgentV2(BaseAgent):
     # ─────────────────────────────────────────────────────────
     # GENERATE — routes by mode
     # ─────────────────────────────────────────────────────────
-    async def _generate(
-        self, ctx: dict
-    ) -> tuple[dict | None, str | None, str | None]:
+    async def _generate(self, ctx: dict) -> tuple[dict | None, str | None, str | None]:
         if self.mode == "local":
             return await self._generate_local(ctx)
         elif self.mode == "lean":
@@ -340,10 +372,7 @@ class IdeatorAgentV2(BaseAgent):
         regime = ctx["regime"]
         recent = ", ".join(ctx["recent_names"][:8]) or "none"
 
-        returns_range = (
-            "-0.003 to 0.003" if asset == "equity"
-            else "-0.008 to 0.008"
-        )
+        returns_range = "-0.003 to 0.003" if asset == "equity" else "-0.008 to 0.008"
 
         system_prompt = (
             f"You are a quant researcher designing 1-minute {asset} "
@@ -353,11 +382,11 @@ class IdeatorAgentV2(BaseAgent):
 
         user_prompt = f"""Design ONE {archetype} strategy for 1-minute {asset} data.
 
-Market: {ctx['snapshot_line'] or 'no live data'}
+Market: {ctx["snapshot_line"] or "no live data"}
 Regime: {regime}
 
-Recent failures: {ctx['failure_summary']}
-Working strategies: {ctx['success_summary']}
+Recent failures: {ctx["failure_summary"]}
+Working strategies: {ctx["success_summary"]}
 Avoid names: {recent}
 
 APPROVED FEATURES (use ONLY these exact names):
@@ -395,70 +424,78 @@ Output ONLY this JSON:
 "expected_win_rate":0.52,"risk_level":"medium",
 "tags":["{archetype}","{asset}"]}}"""
 
-        try:
-            resp = await self.client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=max_tokens,
-                temperature=self.temperature,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw = resp.content[0].text
-            logger.info(f"{self.name}: Raw ({max_tokens}t):\n{raw[:400]}")
+        import asyncio as _asyncio
 
-            # Extract JSON
-            cleaned = raw.strip()
-            if "```" in cleaned:
-                start = cleaned.find("\n", cleaned.find("```")) + 1
-                end = cleaned.rfind("```")
-                cleaned = cleaned[start:end].strip()
-            f = cleaned.find("{")
-            l = cleaned.rfind("}")
-            if f == -1:
-                raise ValueError("No JSON in response")
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = await self.client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=max_tokens,
+                    temperature=self.temperature,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                raw = resp.content[0].text
+                logger.info(f"{self.name}: Raw ({max_tokens}t):\n{raw[:400]}")
 
-            spec = json.loads(cleaned[f:l+1])
-            spec["asset_class"] = asset
-            spec = normalize_strategy(spec)
+                # Extract JSON
+                cleaned = raw.strip()
+                if "```" in cleaned:
+                    start = cleaned.find("\n", cleaned.find("```")) + 1
+                    end = cleaned.rfind("```")
+                    cleaned = cleaned[start:end].strip()
+                f = cleaned.find("{")
+                l = cleaned.rfind("}")
+                if f == -1:
+                    raise ValueError("No JSON in response")
 
-            valid, reason = validate_strategy(spec)
-            if not valid:
-                raise ValueError(f"Invalid: {reason}")
+                spec = json.loads(cleaned[f : l + 1])
+                spec["asset_class"] = asset
+                spec = normalize_strategy(spec)
 
-            await self.db_client.log(
-                agent_id=self.agent_id,
-                level="INFO",
-                message=f"Generated: {spec['strategy_name']}",
-                metadata={
-                    "mode": self.mode,
-                    "tokens": max_tokens,
-                    "tokens_used": resp.usage.output_tokens,
-                    "archetype": archetype,
-                    "reasoning": spec.get("reasoning", "")[:200],
-                    "entry": spec.get("entry_conditions"),
-                },
-            )
-            return spec, user_prompt, raw
+                valid, reason = validate_strategy(spec)
+                if not valid:
+                    raise ValueError(f"Invalid: {reason}")
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"{self.name}: JSON error: {e}")
-            return await self._generate_local(ctx)
-        except Exception as e:
-            logger.warning(f"{self.name}: Claude error: {e}")
-            return await self._generate_local(ctx)
+                await self.db_client.log(
+                    agent_id=self.agent_id,
+                    level="INFO",
+                    message=f"Generated: {spec['strategy_name']}",
+                    metadata={
+                        "mode": self.mode,
+                        "tokens": max_tokens,
+                        "tokens_used": resp.usage.output_tokens,
+                        "archetype": archetype,
+                        "reasoning": spec.get("reasoning", "")[:200],
+                        "entry": spec.get("entry_conditions"),
+                    },
+                )
+                return spec, user_prompt, raw
+
+            except Exception as e:
+                last_err = e
+                if attempt < 2:
+                    wait = 2 * (2**attempt)
+                    logger.warning(
+                        f"{self.name}: Attempt {attempt + 1}/3 failed: {e}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    await _asyncio.sleep(wait)
+                else:
+                    logger.warning(f"{self.name}: All 3 attempts failed: {last_err}")
+
+        return await self._generate_local(ctx)
 
     # ─────────────────────────────────────────────────────────
     # LOCAL FALLBACK — proven templates, always generates trades
     # ─────────────────────────────────────────────────────────
-    async def _generate_local(
-        self, ctx: dict
-    ) -> tuple[dict, None, None]:
+    async def _generate_local(self, ctx: dict) -> tuple[dict, None, None]:
         asset = ctx["asset_class"]
         archetype = ctx["archetype"]
         key = (asset, archetype)
         entry, exit_ = LOCAL_TEMPLATES.get(
-            key,
-            (["ema_12 > ema_26"], ["ema_12 < ema_26"])
+            key, (["ema_12 > ema_26"], ["ema_12 < ema_26"])
         )
         suffix = datetime.utcnow().strftime("%H%M%S")
         spec = {

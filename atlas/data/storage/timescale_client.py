@@ -799,24 +799,29 @@ class TimescaleClient:
             return out
 
     async def get_strategies_with_backtest(
-        self, status: str = "failed_validation", limit: int = 10
+        self, statuses: list[str] | None = None, limit: int = 10
     ) -> list[dict]:
-        """Returns strategies of given status with backtest results joined.
-        Used by the ideator to learn from past failures.
+        """Returns strategies with backtest results joined, ordered by composite_score.
+        Used by the ideator to learn from past failures and successes.
+        Defaults to failed_validation + repair_candidate if no statuses given.
         """
+        if statuses is None:
+            statuses = ["failed_validation", "repair_candidate"]
         query = """
             SELECT s.id, s.name, s.code, s.parameters, s.status, s.created_at,
-                   s.author_agent, b.total_trades, b.sharpe_ratio,
+                   s.author_agent, b.total_trades,
                    b.max_drawdown, b.win_rate, b.profit_factor, b.composite_score,
                    b.short_window_score, b.gross_edge, b.cost_burden
             FROM strategies s
             JOIN backtest_results b ON s.id = b.strategy_id
-            WHERE s.status = :status
-            ORDER BY b.total_trades DESC
+            WHERE s.status = ANY(:statuses)
+            ORDER BY b.composite_score DESC
             LIMIT :limit
         """
         async with self.engine.connect() as conn:
-            result = await conn.execute(text(query), {"status": status, "limit": limit})
+            result = await conn.execute(
+                text(query), {"statuses": statuses, "limit": limit}
+            )
             rows = result.fetchall()
             out = []
             for r in rows:
@@ -831,14 +836,13 @@ class TimescaleClient:
                         "created_at": r[5],
                         "author_agent": r[6],
                         "total_trades": r[7] or 0,
-                        "sharpe_ratio": r[8] or 0,
-                        "max_drawdown": r[9] or 0,
-                        "win_rate": r[10] or 0,
-                        "profit_factor": r[11] or 1.0,
-                        "composite_score": r[12] or 0.0,
-                        "short_window_score": r[13] or 0.0,
-                        "gross_edge": r[14] or 0.0,
-                        "cost_burden": r[15] or 0.0,
+                        "max_drawdown": r[8] or 0,
+                        "win_rate": r[9] or 0,
+                        "profit_factor": r[10] or 1.0,
+                        "composite_score": r[11] or 0.0,
+                        "short_window_score": r[12] or 0.0,
+                        "gross_edge": r[13] or 0.0,
+                        "cost_burden": r[14] or 0.0,
                     }
                 )
             return out
