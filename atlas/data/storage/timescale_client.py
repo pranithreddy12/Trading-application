@@ -835,14 +835,103 @@ class TimescaleClient:
                 )
             return out
 
+    async def get_top_strategies_by_composite_score(
+        self, min_score: float, max_score: float, limit: int
+    ) -> list[dict]:
+        """Returns strategies sorted by short_window_score (temporal fitness).
+        Includes pending_validation and benchmark strategies that have been backtested.
+        """
+        query = """
+            SELECT s.id, s.name, s.code, s.parameters, s.status, s.created_at,
+                   s.author_agent, b.short_window_score
+            FROM strategies s
+            JOIN backtest_results b ON s.id = b.strategy_id
+            WHERE b.short_window_score IS NOT NULL
+              AND b.short_window_score >= :min_score
+              AND b.short_window_score <= :max_score
+              AND s.status IN ('pending_validation', 'benchmark')
+            ORDER BY b.short_window_score DESC
+            LIMIT :limit
+        """
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(query),
+                {"min_score": min_score, "max_score": max_score, "limit": limit},
+            )
+            rows = result.fetchall()
+            out = []
+            for r in rows:
+                out.append(
+                    {
+                        "id": str(r[0]),
+                        "name": r[1],
+                        "code": r[2],
+                        "parameters": r[3]
+                        if isinstance(r[3], dict)
+                        else json.loads(r[3]),
+                        "status": r[4],
+                        "created_at": r[5],
+                        "short_window_score": float(r[7]) if r[7] is not None else 0.0,
+                    }
+                )
+            return out
+
+    async def check_combination_exists(self, parent_a: str, parent_b: str) -> bool:
+        """Check if a combination of these two parents already exists (unordered)."""
+        query = """
+            SELECT 1 FROM combination_memory
+            WHERE (parent_a = :a AND parent_b = :b)
+               OR (parent_a = :b AND parent_b = :a)
+            LIMIT 1
+        """
+        async with self.engine.connect() as conn:
+            result = await conn.execute(text(query), {"a": parent_a, "b": parent_b})
+            return result.fetchone() is not None
+
+    async def save_combination_record(
+        self,
+        parent_a: str,
+        parent_b: str,
+        child_id: str,
+        combination_type: str = "claude_hybrid",
+        parent_a_score: float = 0.0,
+        parent_b_score: float = 0.0,
+        child_score: float = 0.0,
+    ) -> None:
+        """Record a combination in combination_memory with score delta."""
+        # Normalize ordering to avoid (a,b) vs (b,a) duplicates
+        if parent_a > parent_b:
+            parent_a, parent_b = parent_b, parent_a
+            parent_a_score, parent_b_score = parent_b_score, parent_a_score
+        query = """
+            INSERT INTO combination_memory
+                (parent_a, parent_b, child_id, combination_type,
+                 parent_a_sharpe, parent_b_sharpe, child_sharpe, sharpe_delta)
+            VALUES
+                (:parent_a, :parent_b, :child_id, :combination_type,
+                 :parent_a_score, :parent_b_score, :child_score, :sharpe_delta)
+            ON CONFLICT (parent_a, parent_b, combination_type) DO NOTHING
+        """
+        params = {
+            "parent_a": parent_a,
+            "parent_b": parent_b,
+            "child_id": child_id,
+            "combination_type": combination_type,
+            "parent_a_score": parent_a_score,
+            "parent_b_score": parent_b_score,
+            "child_score": child_score,
+            "sharpe_delta": child_score - max(parent_a_score, parent_b_score),
+        }
+        await self._execute_insert(query, params)
+
     async def save_backtest_results(
         self, strategy_id: str, results: dict, start_date: str, end_date: str
     ) -> None:
-        """Saves backtest results"""
+        """Saves backtest results including short_window temporal scores"""
         query = """
-            INSERT INTO backtest_results (strategy_id, start_date, end_date, sharpe, cagr, max_drawdown, win_rate, total_trades, passed_validation, results, entry_count, exit_count, bars_processed)
-            VALUES (:strategy_id, :start_date, :end_date, :sharpe, :cagr, :max_drawdown, :win_rate, :total_trades, :passed_validation, :results, :entry_count, :exit_count, :bars_processed)
-            ON CONFLICT (strategy_id) DO UPDATE SET
+            INSERT INTO backtest_results (strategy_id, start_date, end_date, sharpe, cagr, max_drawdown, win_rate, total_trades, passed_validation, results, entry_count, exit_count, bars_processed, short_window_score, score_7d, score_14d, score_30d)
+            VALUES (:strategy_id, :start_date, :end_date, :sharpe, :cagr, :max_drawdown, :win_rate, :total_trades, :passed_validation, :results, :entry_count, :exit_count, :bars_processed, :short_window_score, :score_7d, :score_14d, :score_30d)
+            ON CONFLICT (strategy_id, start_date, end_date) DO UPDATE SET
                 sharpe = EXCLUDED.sharpe,
                 cagr = EXCLUDED.cagr,
                 max_drawdown = EXCLUDED.max_drawdown,
@@ -852,7 +941,11 @@ class TimescaleClient:
                 results = EXCLUDED.results,
                 entry_count = EXCLUDED.entry_count,
                 exit_count = EXCLUDED.exit_count,
-                bars_processed = EXCLUDED.bars_processed
+                bars_processed = EXCLUDED.bars_processed,
+                short_window_score = EXCLUDED.short_window_score,
+                score_7d = EXCLUDED.score_7d,
+                score_14d = EXCLUDED.score_14d,
+                score_30d = EXCLUDED.score_30d
         """
         params = {
             "strategy_id": strategy_id,
@@ -872,6 +965,10 @@ class TimescaleClient:
             "entry_count": results.get("entry_count", 0),
             "exit_count": results.get("exit_count", 0),
             "bars_processed": results.get("bars_processed", 0),
+            "short_window_score": results.get("short_window_score"),
+            "score_7d": results.get("score_7d"),
+            "score_14d": results.get("score_14d"),
+            "score_30d": results.get("score_30d"),
         }
         await self._execute_insert(query, params)
 
@@ -988,12 +1085,12 @@ class TimescaleClient:
             JOIN backtest_results b ON s.id = b.strategy_id
             WHERE (
                 (s.status = 'failed_validation' AND b.entry_count > 0 AND b.total_trades >= 3)
-                OR s.status IN ('research_candidate', 'validated_B')
+                OR s.status IN ('repair_candidate', 'research_candidate')
             )
             ORDER BY
                 CASE s.status
-                    WHEN 'validated_B' THEN 1
-                    WHEN 'research_candidate' THEN 2
+                    WHEN 'research_candidate' THEN 1
+                    WHEN 'repair_candidate' THEN 2
                     ELSE 3
                 END,
                 b.sharpe DESC
@@ -1002,9 +1099,15 @@ class TimescaleClient:
         async with self.engine.connect() as conn:
             result = await conn.execute(text(query), {"limit": limit})
             rows = result.fetchall()
+            import decimal
+
             out = []
             for r in rows:
                 d = dict(r._mapping)
+                # Convert Decimal values to native float/int for JSON safety
+                for k, v in d.items():
+                    if isinstance(v, decimal.Decimal):
+                        d[k] = float(v) if "." in str(v) else int(v)
                 if isinstance(d.get("parameters"), str):
                     d["parameters"] = json.loads(d["parameters"])
                 if isinstance(d.get("normalized_strategy"), str):

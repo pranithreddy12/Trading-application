@@ -35,20 +35,22 @@ async def main():
     for s in pending:
         await agent._validate_one(s["id"], s.get("name", "unknown"))
 
-    va = await db.get_strategies_by_status("validated_A")
-    vb = await db.get_strategies_by_status("validated_B")
+    elite = await db.get_strategies_by_status("elite")
+    validated = await db.get_strategies_by_status("validated")
     rc = await db.get_strategies_by_status("research_candidate")
+    repair = await db.get_strategies_by_status("repair_candidate")
     failed = await db.get_strategies_by_status("failed_validation")
-    all_scored = len(va) + len(vb) + len(rc) + len(failed)
+    all_scored = len(elite) + len(validated) + len(rc) + len(repair) + len(failed)
 
     logger.info("=" * 50)
     logger.info(f"VALIDATION COMPLETE ({settings.environment} mode)")
-    logger.info(f"  validated_A        {len(va)}")
-    logger.info(f"  validated_B        {len(vb)}")
+    logger.info(f"  elite              {len(elite)}")
+    logger.info(f"  validated          {len(validated)}")
     logger.info(f"  research_candidate {len(rc)}")
+    logger.info(f"  repair_candidate   {len(repair)}")
     logger.info(f"  failed_validation  {len(failed)}")
     if all_scored > 0:
-        passed = len(va) + len(vb) + len(rc)
+        passed = len(elite) + len(validated) + len(rc) + len(repair)
         logger.info(
             f"  Pass rate          {passed}/{all_scored} ({passed / all_scored * 100:.1f}%)"
         )

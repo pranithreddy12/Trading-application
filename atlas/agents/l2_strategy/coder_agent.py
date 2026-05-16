@@ -1,4 +1,3 @@
-print("=== CODER FILE LOADED ===", flush=True)
 import textwrap
 
 import asyncio
@@ -222,23 +221,16 @@ class {class_name}:
 
 
 async def main():
-    print("=== CODER MAIN STARTED ===", flush=True)
-    print("=== CONNECTING DB ===", flush=True)
-
+    logger.info("Starting CoderAgent...")
     db_client = TimescaleClient(settings.database_url)
     await db_client.connect()
 
     redis_client = Redis.from_url(settings.redis_url)
 
-    print("=== CODING STRATEGIES ===", flush=True)
-
     agent = CoderAgent(redis_client, db_client)
-
     await agent.start()
-
     await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    print("=== CODER EXECUTION HIT ===", flush=True)
     asyncio.run(main())

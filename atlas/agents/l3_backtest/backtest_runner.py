@@ -1,5 +1,3 @@
-print("=== BACKTEST FILE LOADED ===", flush=True)
-
 import asyncio
 import json
 import pandas as pd
@@ -11,6 +9,11 @@ from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
 from atlas.data.storage.timescale_client import TimescaleClient
 from atlas.config.settings import get_settings
+from atlas.agents.l3_backtest.short_window_evaluator import (
+    is_short_window,
+    compute_short_window_metrics,
+    compute_composite_short_window_score,
+)
 
 
 def clean_metrics(obj):
@@ -468,8 +471,11 @@ class BacktestRunner(BaseAgent):
 
             logger.info(
                 f"Backtest complete for {strategy_id} | "
+                f"Entries={results.get('entry_count', '?')} | "
+                f"Exits={results.get('exit_count', '?')} | "
                 f"Trades={results.get('total_trades')} | "
-                f"Sharpe={results.get('holdout_sharpe')}"
+                f"Sharpe={results.get('holdout_sharpe')} | "
+                f"Symbol={symbol}"
             )
 
         except Exception as e:
@@ -516,68 +522,79 @@ class BacktestRunner(BaseAgent):
 
         df = df.copy()
         df["signal"] = signals
-        df["position"] = df["signal"].shift(1).fillna(0)
 
         # =====================================================
-        # TRACK INDIVIDUAL TRADES
+        # STATE MACHINE TRADE EXTRACTION
+        # FLAT (0) → ENTRY (+1) → LONG (1) → EXIT (-1) → FLAT (0)
         # =====================================================
         trades = []
-        open_trade = None
+        pos = 0  # 0 = flat, 1 = long
+        entry_price = 0.0
+        entry_time = None
+        entry_bar = 0
+
+        position_series = pd.Series(0, index=df.index, dtype=int)
+        closed_positions_count = 0
 
         for i in range(len(df)):
-            sig = df["signal"].iloc[i]
+            sig = signals.iloc[i]
 
-            if open_trade is None and sig != 0:
-                open_trade = {
-                    "side": "long" if sig == 1 else "short",
-                    "entry_time": df["time"].iloc[i],
-                    "entry_price": float(df["close"].iloc[i]),
-                    "bars_held": 0,
-                }
-            elif open_trade is not None:
-                should_exit = (open_trade["side"] == "long" and sig <= 0) or (
-                    open_trade["side"] == "short" and sig >= 0
-                )
-                if should_exit:
+            if pos == 0:
+                if sig == 1:
+                    pos = 1
+                    entry_price = float(df["close"].iloc[i])
+                    entry_time = df["time"].iloc[i]
+                    entry_bar = i
+            elif pos == 1:
+                if sig == -1:
                     exit_price = float(df["close"].iloc[i])
-                    entry = open_trade["entry_price"]
-                    pnl = (
-                        (exit_price - entry)
-                        if open_trade["side"] == "long"
-                        else (entry - exit_price)
-                    )
-                    pnl_pct = pnl / entry if entry != 0 else 0.0
+                    pnl = exit_price - entry_price
+                    pnl_pct = pnl / entry_price if entry_price != 0 else 0.0
                     trades.append(
                         {
-                            "entry_time": open_trade["entry_time"],
+                            "entry_time": entry_time,
                             "exit_time": df["time"].iloc[i],
-                            "entry_price": round(entry, 8),
+                            "entry_price": round(entry_price, 8),
                             "exit_price": round(exit_price, 8),
-                            "side": open_trade["side"],
+                            "side": "long",
                             "pnl": round(pnl, 8),
                             "pnl_pct": round(pnl_pct, 8),
-                            "bars_held": open_trade["bars_held"],
+                            "bars_held": i - entry_bar,
                             "exit_reason": "signal",
                         }
                     )
-                    open_trade = None
-                    if sig != 0:
-                        open_trade = {
-                            "side": "long" if sig == 1 else "short",
-                            "entry_time": df["time"].iloc[i],
-                            "entry_price": float(df["close"].iloc[i]),
-                            "bars_held": 0,
-                        }
-                else:
-                    open_trade["bars_held"] += 1
+                    pos = 0
+                    closed_positions_count += 1
 
-        logger.info(f"Backtest extracted {len(trades)} round-trip trades")
+            position_series.iloc[i] = pos
+
+        logger.info(
+            f"Backtest extracted {len(trades)} closed trades from "
+            f"{entry_count} entry signals, {exit_count} exit signals"
+        )
+
+        # Anomaly detection
+        if exit_count > 0 and closed_positions_count > 0:
+            exits_per_trade = exit_count / closed_positions_count
+            if exits_per_trade > 3:
+                logger.warning(
+                    f"ANOMALY: {exits_per_trade:.1f} exit signals per closed trade "
+                    f"({exit_count} exits, {closed_positions_count} trades)"
+                )
+        if exit_count > entry_count * 2 and entry_count > 0:
+            logger.warning(
+                f"ANOMALY: exit_count ({exit_count}) > 2x entry_count ({entry_count})"
+            )
+
+        # Use state machine position series for metric computation
+        df["position"] = position_series
+        df["market_return"] = df["close"].pct_change().fillna(0)
 
         n = len(df)
         train_end = int(n * 0.6)
         test_end = int(n * 0.8)
 
-        def calc_metrics(sub_df):
+        def calc_metrics_institutional(sub_df):
             if len(sub_df) == 0:
                 return (0.0, 0.0, 0.0, 0.0, 0.0, 0, 1.0)
 
@@ -667,8 +684,76 @@ class BacktestRunner(BaseAgent):
         test_df = df.iloc[train_end:test_end]
         holdout_df = df.iloc[test_end:]
 
-        _, _, train_sharpe, _, _, _, _ = calc_metrics(train_df)
-        _, _, test_sharpe, _, _, _, _ = calc_metrics(test_df)
+        if is_short_window(df):
+            sw_train = compute_short_window_metrics(
+                train_df,
+                train_df["position"],
+                train_df["market_return"],
+                self.position_size,
+                self.commission_pct,
+                self.slippage_pct,
+                self.spread_cost_pct,
+            )
+            sw_test = compute_short_window_metrics(
+                test_df,
+                test_df["position"],
+                test_df["market_return"],
+                self.position_size,
+                self.commission_pct,
+                self.slippage_pct,
+                self.spread_cost_pct,
+            )
+            sw_holdout = compute_short_window_metrics(
+                holdout_df,
+                holdout_df["position"],
+                holdout_df["market_return"],
+                self.position_size,
+                self.commission_pct,
+                self.slippage_pct,
+                self.spread_cost_pct,
+            )
+
+            composite = compute_composite_short_window_score(sw_holdout)
+
+            logger.info(
+                f"SHORT WINDOW MODE: {len(df)} bars | "
+                f"Return={sw_holdout['total_return']:+.4%} | "
+                f"Gross={sw_holdout['gross_edge']:+.4%} | "
+                f"Cost={sw_holdout['cost_burden']:+.4%} | "
+                f"Trades={sw_holdout['total_trades']} | "
+                f"PF={sw_holdout['profit_factor']:.2f} | "
+                f"WR={sw_holdout['win_rate']:.1%} | "
+                f"Composite={composite}"
+            )
+
+            results = {
+                "total_return": float(sw_holdout["total_return"]),
+                "cagr": 0.0,
+                "sharpe_ratio": 0.0,
+                "max_drawdown": float(sw_holdout["max_drawdown"] * 100),
+                "win_rate": float(sw_holdout["win_rate"]),
+                "total_trades": int(sw_holdout["total_trades"]),
+                "entry_count": entry_count,
+                "exit_count": exit_count,
+                "bars_processed": len(df),
+                "avg_trade_duration_bars": 10,
+                "profit_factor": float(sw_holdout["profit_factor"]),
+                "calmar_ratio": 0.0,
+                "holdout_sharpe": 0.0,
+                "train_sharpe": 0.0,
+                "test_sharpe": 0.0,
+                "evaluation_mode": "short_window",
+                "composite_score": float(composite),
+                "short_window_score": float(composite),
+                "gross_edge": float(sw_holdout["gross_edge"]),
+                "cost_burden": float(sw_holdout["cost_burden"]),
+                "avg_return_per_trade": float(sw_holdout["avg_return_per_trade"]),
+            }
+            return results, trades
+
+        # INSTITUTIONAL MODE — full annualized Sharpe (requires >20k bars)
+        _, _, train_sharpe, _, _, _, _ = calc_metrics_institutional(train_df)
+        _, _, test_sharpe, _, _, _, _ = calc_metrics_institutional(test_df)
 
         (
             h_ret,
@@ -678,7 +763,7 @@ class BacktestRunner(BaseAgent):
             h_win_rate,
             h_total_trades,
             h_profit_factor,
-        ) = calc_metrics(holdout_df)
+        ) = calc_metrics_institutional(holdout_df)
 
         calmar_ratio = h_cagr / abs(h_max_drawdown) if h_max_drawdown < 0 else 0.0
 
@@ -698,6 +783,11 @@ class BacktestRunner(BaseAgent):
             "holdout_sharpe": float(holdout_sharpe),
             "train_sharpe": float(train_sharpe),
             "test_sharpe": float(test_sharpe),
+            "evaluation_mode": "institutional",
+            "composite_score": 0.0,
+            "gross_edge": 0.0,
+            "cost_burden": 0.0,
+            "avg_return_per_trade": 0.0,
         }, trades
 
 

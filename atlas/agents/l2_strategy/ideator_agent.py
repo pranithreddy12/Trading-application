@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import random
-from collections import Counter
 from datetime import datetime
 from loguru import logger
 from redis.asyncio import Redis
@@ -21,128 +20,32 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
     compute_strategy_signature,
 )
 
-
-ARCHETYPES = ["momentum", "mean_reversion", "breakout", "volatility", "trend_following"]
-
-ASSET_CLASSES = ["equity", "crypto"]
-
-AVAILABLE_FEATURES = [
-    "returns",
-    "log_returns",
-    "rsi_14",
-    "macd",
-    "macd_signal",
-    "sma_5",
-    "sma_20",
-    "ema_12",
-    "ema_26",
-    "bollinger_upper",
-    "bollinger_lower",
-    "rolling_volatility",
-    "vwap",
-    # Normalized cross-asset features
-    "price_vs_vwap_pct",
-    "ema_spread_pct",
-    "relative_volume",
-    "bollinger_band_position",
+ARCHETYPES = [
+    "momentum",
+    "mean_reversion",
+    "breakout",
     "volatility_regime",
-    "trend_strength",
+    "trend_following",
 ]
 
-NORMALIZED_FEATURES = [
-    "price_vs_vwap_pct",
-    "ema_spread_pct",
-    "relative_volume",
-    "bollinger_band_position",
-    "volatility_regime",
-    "trend_strength",
-]
+TEMP_MAP = [0.4, 0.6, 0.7, 0.85, 1.0]
 
-EQUITY_ENTRY_TEMPLATES = {
-    "momentum": ["returns > 0.0005", "macd > macd_signal"],
-    "mean_reversion": ["rsi_14 < 35", "close < vwap"],
-    "breakout": ["close > bollinger_upper", "relative_volume > 1.5"],
-    "volatility": ["volatility_regime > 1.2", "rsi_14 < 40"],
-    "trend_following": ["ema_spread_pct > 0.001", "close > sma_20"],
-}
-
-EQUITY_EXIT_TEMPLATES = {
-    "momentum": ["returns < -0.0005", "rsi_14 > 70"],
-    "mean_reversion": ["bollinger_band_position > 0.8", "close > vwap"],
-    "breakout": ["rsi_14 > 70", "close < sma_20"],
-    "volatility": ["volatility_regime < 0.8", "rsi_14 > 60"],
-    "trend_following": ["ema_spread_pct < -0.001", "rsi_14 < 40"],
-}
-
-CRYPTO_ENTRY_TEMPLATES = {
-    "momentum": ["returns > 0.001", "trend_strength > 0.002"],
-    "mean_reversion": ["rsi_14 < 30", "price_vs_vwap_pct < -0.005"],
-    "breakout": ["close > bollinger_upper", "relative_volume > 2.0"],
-    "volatility": ["volatility_regime > 1.5", "rsi_14 < 35"],
-    "trend_following": ["ema_12 > ema_26", "trend_strength > 0.001"],
-}
-
-CRYPTO_EXIT_TEMPLATES = {
-    "momentum": ["returns < -0.001", "rsi_14 > 75"],
-    "mean_reversion": ["bollinger_band_position > 0.9", "price_vs_vwap_pct > 0.005"],
-    "breakout": ["rsi_14 > 75", "close < sma_20"],
-    "volatility": ["volatility_regime < 0.7", "rsi_14 > 65"],
-    "trend_following": ["ema_12 < ema_26", "rsi_14 < 35"],
-}
-
-TEMP_MAP = [0.3, 0.5, 0.7, 0.9, 1.0]
-
-FEATURE_SUBSETS = {
-    "A": ["vwap", "macd", "macd_signal"],
-    "B": ["rsi_14", "bollinger_upper", "bollinger_lower", "bollinger_band_position"],
-    "C": ["ema_12", "ema_26", "ema_spread_pct", "trend_strength"],
-    "D": ["volatility_regime", "relative_volume", "returns"],
-}
-
-ARCHETYPE_FEATURES = {
-    "momentum": [
-        "macd",
-        "macd_signal",
-        "relative_volume",
-        "price_vs_vwap_pct",
-        "returns",
-    ],
-    "mean_reversion": [
-        "bollinger_band_position",
-        "rsi_14",
-        "price_vs_vwap_pct",
-        "bollinger_upper",
-        "bollinger_lower",
-    ],
-    "breakout": [
-        "bollinger_upper",
-        "bollinger_lower",
-        "relative_volume",
-        "volatility_regime",
-        "vwap",
-    ],
-    "volatility": ["volatility_regime", "bollinger_band_position", "rsi_14", "returns"],
-    "trend_following": ["ema_spread_pct", "trend_strength", "vwap", "ema_12", "ema_26"],
-}
-
-ALLOWED_SYMBOLS = [
-    "NVDA",
-    "TSLA",
-    "AAPL",
-    "SPY",
-    "QQQ",
-    "MSFT",
-    "AMZN",
-    "META",
-    "GOOGL",
-    "AMD",
+ALLOWED_FEATURES = [
+    "returns", "rsi_14", "macd", "macd_signal",
+    "ema_12", "ema_26", "sma_20",
+    "bollinger_upper", "bollinger_lower",
+    "vwap", "volume", "close", "open", "high", "low",
+    "price_vs_vwap_pct", "ema_spread_pct",
+    "relative_volume", "bollinger_band_position",
+    "volatility_regime", "trend_strength",
 ]
 
 
 class IdeatorAgent(BaseAgent):
     """
-    Generates trading strategy specifications using Claude API (with local fallback).
-    Runs as 5 parallel instances with different temperatures and archetypes.
+    Generates high-quality trading strategy specs using Claude.
+    Uses real market context, backtest feedback, and chain-of-thought.
+    3000 token budget — Claude actually thinks, not just fills templates.
     """
 
     def __init__(
@@ -161,21 +64,19 @@ class IdeatorAgent(BaseAgent):
         self.instance_id = instance_id
         self.temperature = max(0.0, min(1.0, temperature))
         self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=20.0),
+            timeout=httpx.Timeout(120.0, connect=30.0),
             verify=True,
         )
         self.client = AsyncAnthropic(
             api_key=settings.anthropic_api_key,
-            base_url="https://api.anthropic.com",
             http_client=self.http_client,
         )
         self.db_client = db_client
-        self.signal_buffer = []
-        self.SIGNAL_THRESHOLD = 10
         self.messaging = MessagingClient(redis_client)
         self._archetype = ARCHETYPES[instance_id % len(ARCHETYPES)]
-        self._asset_class = ASSET_CLASSES[instance_id % len(ASSET_CLASSES)]
-        self._feature_cycle = 0
+        self._asset_class = (
+            "equity" if instance_id % 2 == 0 else "crypto"
+        )
 
     async def stop(self):
         await super().stop()
@@ -183,69 +84,41 @@ class IdeatorAgent(BaseAgent):
 
     async def run(self):
         logger.info(
-            f"{self.name}: RUN LOOP START "
-            f"(temp={self.temperature}, archetype={self._archetype})"
+            f"{self.name}: START — archetype={self._archetype}, "
+            f"asset={self._asset_class}, temp={self.temperature}"
         )
-
         while True:
             try:
-                logger.info(f"{self.name}: Fetching latest features")
+                # 1. Gather rich context
+                context = await self._build_context()
 
-                features = await asyncio.wait_for(
-                    self.db_client.get_latest_features(ALLOWED_SYMBOLS, limit=5),
-                    timeout=15,
-                )
+                # 2. Generate strategy with full Claude reasoning
+                spec, prompt, raw = await self._generate_strategy(context)
 
-                logger.info(
-                    f"{self.name}: Features fetched = {len(features) if features else 0}"
-                )
-
-                if not features:
-                    logger.warning(f"{self.name}: No features available")
-                    await asyncio.sleep(10)
+                if not spec:
+                    await asyncio.sleep(15)
                     continue
 
-                self._feature_cycle = (self._feature_cycle + 1) % 4
-
-                strategy_spec, prompt, raw_response = await self._generate_strategy(
-                    features
-                )
-
-                if not isinstance(strategy_spec, dict):
-                    raise TypeError(
-                        f"Expected strategy_spec to be dict, got {type(strategy_spec)}"
-                    )
-                if "strategy_name" not in strategy_spec:
-                    raise ValueError(
-                        f"Missing strategy_name in generated spec: {strategy_spec}"
-                    )
-
-                signature = compute_strategy_signature(strategy_spec)
-                existing = await self.db_client.get_strategy_signatures(limit=200)
-                if signature in existing:
-                    logger.warning(
-                        f"{self.name}: Duplicate signature '{strategy_spec['strategy_name']}', skipping"
-                    )
+                # 3. Dedup check
+                sig = compute_strategy_signature(spec)
+                existing = await self.db_client.get_strategy_signatures(limit=500)
+                if sig in existing:
+                    logger.info(f"{self.name}: Duplicate — skipping")
                     await asyncio.sleep(5)
                     continue
 
-                logger.info(f"{self.name}: Writing strategy to DB")
-
-                strategy_id = await asyncio.wait_for(
-                    self.db_client.save_strategy(
-                        strategy_spec,
-                        status="pending_code",
-                        author_agent=self.name,
-                        prompt=prompt,
-                        raw_response=raw_response,
-                        strategy_signature=signature,
-                    ),
-                    timeout=15,
+                # 4. Save
+                strategy_id = await self.db_client.save_strategy(
+                    spec,
+                    status="pending_code",
+                    author_agent=self.name,
+                    prompt=prompt,
+                    raw_response=raw,
                 )
 
                 logger.info(
-                    f"{self.name}: Strategy inserted successfully: "
-                    f"{strategy_spec['strategy_name']} ({strategy_id})"
+                    f"{self.name}: ✅ Saved: {spec['strategy_name']} "
+                    f"[{strategy_id}]"
                 )
 
                 await self.messaging.publish(
@@ -258,285 +131,476 @@ class IdeatorAgent(BaseAgent):
                     },
                 )
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(12)
 
             except Exception as e:
-                logger.error(f"{self.name}: Run loop error: {e}", exc_info=True)
-                await asyncio.sleep(5)
+                logger.error(f"{self.name}: Loop error: {e}", exc_info=True)
+                await asyncio.sleep(10)
 
-    async def _handle_signal(self, message: dict):
-        self.signal_buffer.append(message)
-        if len(self.signal_buffer) >= self.SIGNAL_THRESHOLD:
-            features = {
-                k: v
-                for m in self.signal_buffer
-                for k, v in m.get("features", {}).items()
-            }
-            spec, _, _ = await self._generate_strategy(features)
-            logger.info(
-                f"{self.name}: Generated signal-based strategy: {spec.get('strategy_name', 'unknown')}"
-            )
-            self.signal_buffer.clear()
-
-    async def _generate_strategy(
-        self, features: dict
-    ) -> tuple[dict, str | None, str | None]:
-        try:
-            if settings.anthropic_api_key in (None, "", "test_key"):
-                raise RuntimeError("No valid Anthropic API key")
-            return await self._generate_via_claude(features)
-        except Exception as e:
-            logger.warning(
-                f"{self.name}: Claude generation failed ({e}), using local fallback"
-            )
-            return await self._generate_local(features)
-
-    def _extract_json(self, raw: str) -> str:
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            first_newline = cleaned.find("\n")
-            if first_newline != -1:
-                cleaned = cleaned[first_newline + 1 :]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3].strip()
-        first_brace = cleaned.find("{")
-        last_brace = cleaned.rfind("}")
-        if first_brace == -1 or last_brace == -1:
-            raise json.JSONDecodeError("No JSON object found", cleaned, 0)
-        return cleaned[first_brace : last_brace + 1]
-
-    def _get_feature_ranges(self) -> dict:
-        is_equity = self._asset_class == "equity"
-        if is_equity:
-            return {
-                "rsi_14": "0-100",
-                "returns": "-0.005 to 0.005",
-                "price_vs_vwap_pct": "-0.01 to 0.01",
-                "relative_volume": "0.1-5",
-                "volatility_regime": "0.3-3",
-                "ema_spread_pct": "-0.01 to 0.01",
-            }
-        return {
-            "rsi_14": "0-100",
-            "returns": "-0.01 to 0.01",
-            "price_vs_vwap_pct": "-0.02 to 0.02",
-            "relative_volume": "0.1-5",
-            "volatility_regime": "0.3-3",
-            "trend_strength": "0.0-0.01",
-            "ema_spread_pct": "-0.02 to 0.02",
+    # =========================================================
+    # CONTEXT BUILDER — gives Claude real data to reason from
+    # =========================================================
+    async def _build_context(self) -> dict:
+        """
+        Fetch real market state + backtest feedback.
+        Claude gets actual numbers, not placeholders.
+        """
+        context = {
+            "archetype": self._archetype,
+            "asset_class": self._asset_class,
+            "market_snapshot": {},
+            "regime": "neutral",
+            "failed_patterns": [],
+            "successful_patterns": [],
+            "recent_names": [],
+            "bars_available": {},
         }
 
-    def _build_minimal_prompt(
-        self, regime: str, used_combos: list[str] | None = None
-    ) -> tuple[str, str]:
-        is_equity = self._asset_class == "equity"
-        domain = "US EQUITIES" if is_equity else "CRYPTO (Binance)"
-        asset_tag = "equity" if is_equity else "crypto"
-        returns_range = "-0.005 to 0.005" if is_equity else "-0.01 to 0.01"
-        vwap_range = "-0.01 to 0.01" if is_equity else "-0.02 to 0.02"
-
-        arch_features = ARCHETYPE_FEATURES.get(self._archetype, AVAILABLE_FEATURES)
-        subset_key = list(FEATURE_SUBSETS.keys())[self._feature_cycle % 4]
-        rotated = FEATURE_SUBSETS[subset_key]
-        primary_features = [f for f in arch_features if f in rotated] or arch_features[
-            :3
-        ]
-        allowed = ", ".join(primary_features)
-
-        novelty_hint = ""
-        if used_combos:
-            top = ", ".join(used_combos[:3])
-            novelty_hint = (
-                f"\nAvoid repeating these recently used feature combinations: {top}"
+        try:
+            # Real feature values for top symbols
+            symbols = (
+                ["NVDA", "SPY", "AAPL", "TSLA", "QQQ"]
+                if self._asset_class == "equity"
+                else ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
             )
 
-        system_prompt = f"""You are a quantitative trading strategist for 1-minute {domain} markets.
-Generate ONE realistic intraday {self._archetype} strategy.
-Rules:
-- 2-3 entry conditions, 1-2 exit conditions
-- Use only approved features
-- Use realistic thresholds
-- No raw price thresholds
-- No natural language in conditions
-- Output valid JSON only"""
+            features = await self.db_client.get_latest_features(
+                symbols, limit=1
+            )
 
-        user_prompt = f"""Asset class: {asset_tag}
-Archetype: {self._archetype}
-Features: {allowed}
+            if features:
+                # Pick the symbol with richest feature data
+                best_sym = max(
+                    features.items(),
+                    key=lambda x: len(x[1]) if isinstance(x[1], dict) else 0,
+                )
+                sym_name, sym_features = best_sym
 
-Typical ranges:
-rsi_14: 0-100
-returns: {returns_range}
-price_vs_vwap_pct: {vwap_range}
-relative_volume: 0.1-5
-volatility_regime: 0.3-3
+                if isinstance(sym_features, dict):
+                    context["market_snapshot"] = {
+                        k: round(float(v), 6)
+                        for k, v in sym_features.items()
+                        if v is not None and k in ALLOWED_FEATURES
+                    }
+                    context["primary_symbol"] = sym_name
 
+                    # Determine regime from real data
+                    rsi = sym_features.get("rsi_14", 50)
+                    vol = sym_features.get("volatility_regime", 1.0)
+                    trend = sym_features.get("ema_spread_pct", 0)
+                    if rsi and float(rsi) < 35:
+                        context["regime"] = "oversold/bearish"
+                    elif rsi and float(rsi) > 65:
+                        context["regime"] = "overbought/bullish"
+                    elif vol and float(vol) > 1.5:
+                        context["regime"] = "high_volatility"
+                    elif trend and abs(float(trend)) > 0.003:
+                        context["regime"] = "strong_trend"
+                    else:
+                        context["regime"] = "ranging/neutral"
+
+        except Exception as e:
+            logger.warning(f"{self.name}: Feature fetch error: {e}")
+
+        try:
+            # What has FAILED — learn from mistakes
+            failed = await self.db_client.get_strategies_with_backtest(
+                status="failed_validation", limit=10
+            )
+            for s in failed:
+                results = s.get("results", {})
+                if isinstance(results, str):
+                    try:
+                        results = json.loads(results)
+                    except Exception:
+                        results = {}
+                params = s.get("parameters", {})
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except Exception:
+                        params = {}
+                entry_conds = params.get("entry_conditions", [])
+                win_rate = results.get("win_rate", 0)
+                context["failed_patterns"].append({
+                    "entry": entry_conds,
+                    "sharpe": results.get("sharpe_ratio", "N/A"),
+                    "trades": results.get("total_trades", 0),
+                    "win_rate": win_rate if isinstance(win_rate, (int, float)) else 0,
+                    "reason": params.get("validation_notes", "unknown"),
+                })
+
+        except Exception as e:
+            logger.warning(f"{self.name}: Failed patterns fetch: {e}")
+
+        try:
+            # What has WORKED — learn from successes
+            validated = await self.db_client.get_top_strategies_by_sharpe(
+                min_sharpe=0.1, max_sharpe=10.0, limit=5
+            )
+            for s in validated:
+                params = s.get("parameters", {})
+                if isinstance(params, str):
+                    try:
+                        params = json.loads(params)
+                    except Exception:
+                        params = {}
+                context["successful_patterns"].append({
+                    "entry": params.get("entry_conditions", []),
+                    "sharpe": s.get("sharpe", "N/A"),
+                    "archetype": params.get("archetype", "unknown"),
+                })
+
+        except Exception as e:
+            logger.warning(f"{self.name}: Successful patterns fetch: {e}")
+
+        try:
+            # Recent strategy names to avoid duplicates
+            names = await self.db_client.get_recent_strategy_names(limit=20)
+            context["recent_names"] = names
+
+        except Exception as e:
+            logger.warning(f"{self.name}: Recent names fetch: {e}")
+
+        try:
+            # How many bars we have per symbol (tells Claude data richness)
+            from sqlalchemy import text
+            async with self.db_client.engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT symbol, COUNT(*) as bars
+                        FROM market_data_l1
+                        GROUP BY symbol
+                        ORDER BY bars DESC
+                        LIMIT 10
+                    """)
+                )
+                context["bars_available"] = {
+                    row[0]: row[1] for row in result.fetchall()
+                }
+        except Exception as e:
+            logger.warning(f"{self.name}: Bars count fetch: {e}")
+
+        return context
+
+    # =========================================================
+    # PROMPT BUILDER — real context, chain-of-thought
+    # =========================================================
+    def _build_prompt(self, context: dict) -> tuple[str, str]:
+        asset = context["asset_class"]
+        archetype = context["archetype"]
+        regime = context["regime"]
+        snapshot = context["market_snapshot"]
+        failed = context["failed_patterns"]
+        successful = context["successful_patterns"]
+        recent_names = context["recent_names"]
+        bars = context["bars_available"]
+        primary_sym = context.get("primary_symbol", "NVDA")
+
+        # Format market snapshot as real numbers
+        snapshot_str = "\n".join(
+            f"  {k}: {v}" for k, v in list(snapshot.items())[:15]
+        ) or "  No live features available"
+
+        # Format failure lessons
+        if failed:
+            failed_lines = []
+            for f in failed[:5]:
+                wr = f['win_rate']
+                wr_str = f"{wr:.0%}" if isinstance(wr, (int, float)) else str(wr)
+                failed_lines.append(
+                    f"  Entry: {f['entry']} | Sharpe: {f['sharpe']} | "
+                    f"Trades: {f['trades']} | Win rate: {wr_str} | "
+                    f"Failed because: {f['reason']}"
+                )
+            failed_str = "\n".join(failed_lines)
+        else:
+            failed_str = "  No failed strategies yet."
+
+        # Format success lessons
+        if successful:
+            success_str = "\n".join(
+                f"  Entry: {s['entry']} | Sharpe: {s['sharpe']} | "
+                f"Type: {s['archetype']}"
+                for s in successful[:3]
+            )
+        else:
+            success_str = "  No validated strategies yet."
+
+        # Data richness context
+        bars_str = "\n".join(
+            f"  {sym}: {count} bars"
+            for sym, count in list(bars.items())[:8]
+        ) or "  No bar counts available"
+
+        names_str = (
+            ", ".join(recent_names[:10])
+            if recent_names
+            else "none yet"
+        )
+
+        system_prompt = """You are a senior quantitative researcher at a proprietary trading fund.
+You design algorithmic trading strategies that run on 1-minute OHLCV bar data.
+Your strategies must be mathematically sound and produce real trading signals.
+
+You think step by step:
+1. Analyze the current market conditions
+2. Identify why recent strategies failed
+3. Reason about what market inefficiency to exploit
+4. Design conditions that will actually trigger on the available data
+5. Validate your logic before outputting
+
+Your output will be converted directly to executable Python code.
+Entry/exit conditions must be pure Python boolean comparisons — no English prose."""
+
+        user_prompt = f"""=== MISSION ===
+Design ONE {archetype.upper().replace('_', ' ')} strategy for 1-minute {asset.upper()} data.
+
+=== CURRENT MARKET STATE (real values from live data) ===
+Primary symbol: {primary_sym}
 Market regime: {regime}
-Target 5-50 weekly entries. Avoid overly restrictive conditions.{novelty_hint}
+Live feature snapshot:
+{snapshot_str}
 
-Generate a realistic strategy with moderate trigger frequency.
-Output valid JSON only:
-{{"strategy_name":"descriptive_snake_case_name","hypothesis":"one sentence","entry_conditions":["feature > threshold","feature < threshold"],"exit_conditions":["feature > threshold","feature < threshold"],"stop_loss":"0.5% below entry","take_profit":"1% above entry","position_sizing":"10% of portfolio","timeframe":"1m","asset_class":"{asset_tag}","expected_sharpe":1.5,"expected_win_rate":0.55,"risk_level":"medium","tags":["{self._archetype}"]}}"""
+=== DATA AVAILABLE FOR BACKTESTING ===
+{bars_str}
+Use this to calibrate how many trades your strategy should generate.
+With ~2800 bars, a strategy triggering every 50 bars = ~56 trades.
+Target: 20-100 trades over the available data period.
+
+=== WHAT HAS FAILED (learn from these mistakes) ===
+{failed_str}
+
+=== WHAT HAS WORKED ===
+{success_str}
+
+=== DESIGN CONSTRAINTS ===
+Asset class: {asset}
+Archetype: {archetype}
+
+Approved features (ONLY use these exact names):
+  returns, rsi_14, macd, macd_signal,
+  ema_12, ema_26, sma_20,
+  bollinger_upper, bollinger_lower,
+  vwap, close, open, high, low, volume,
+  price_vs_vwap_pct, ema_spread_pct,
+  relative_volume, bollinger_band_position,
+  volatility_regime, trend_strength
+
+Realistic value ranges for {asset} 1-minute data:
+  rsi_14:              0-100 (typical range: 30-70)
+  returns:             {'-0.003 to 0.003' if asset == 'equity' else '-0.008 to 0.008'}
+  price_vs_vwap_pct:   {'-0.005 to 0.005' if asset == 'equity' else '-0.015 to 0.015'}
+  relative_volume:     0.2 to 4.0 (>1.5 = elevated, >2.5 = very high)
+  ema_spread_pct:      {'-0.005 to 0.005' if asset == 'equity' else '-0.01 to 0.01'}
+  bollinger_band_pos:  0.0 to 1.0 (0=lower band, 1=upper band, 0.5=middle)
+  volatility_regime:   0.3 to 2.5 (>1.3 = elevated vol)
+  trend_strength:      0.0 to 0.008
+
+Condition format rules:
+  CORRECT: "rsi_14 < 35"
+  CORRECT: "price_vs_vwap_pct < -0.002"
+  CORRECT: "relative_volume > 1.5"
+  CORRECT: "bollinger_band_position < 0.2"
+  CORRECT: "ema_spread_pct > 0.001"
+  WRONG: "For LONG: close breaks above..."
+  WRONG: "when RSI crosses below 30"
+  WRONG: "if trend is bullish"
+  WRONG: "rsi_14 < 20" (too extreme — triggers almost never)
+  WRONG: "relative_volume > 5.0" (almost never happens)
+
+Avoid these recently used strategy names: {names_str}
+
+=== YOUR THINKING PROCESS ===
+Before outputting JSON, think through:
+1. What market condition does {archetype} exploit right now given regime={regime}?
+2. Which 2-3 features best capture this condition?
+3. What threshold values will trigger realistically (check the ranges above)?
+4. Will entry AND exit conditions both fire with enough frequency?
+5. Why would this strategy make money rather than lose it?
+
+=== OUTPUT FORMAT ===
+Output ONLY valid JSON. No markdown, no explanation, no code fences.
+{{
+  "strategy_name": "unique_descriptive_snake_case_name",
+  "hypothesis": "precise one-sentence explanation of the market inefficiency",
+  "reasoning": "2-3 sentences explaining WHY this works and HOW you calibrated the thresholds",
+  "entry_conditions": ["feature > threshold", "feature < threshold"],
+  "exit_conditions": ["feature > threshold"],
+  "stop_loss": "0.5% below entry",
+  "take_profit": "1.0% above entry",
+  "position_sizing": "10% of portfolio",
+  "timeframe": "1m",
+  "asset_class": "{asset}",
+  "expected_sharpe": 1.2,
+  "expected_win_rate": 0.52,
+  "expected_trades_per_week": 25,
+  "risk_level": "medium",
+  "tags": ["{archetype}", "{asset}"]
+}}"""
 
         return system_prompt, user_prompt
 
-    async def _generate_via_claude(
-        self, features: dict
-    ) -> tuple[dict, str | None, str | None]:
-        regime = "neutral"
+    # =========================================================
+    # GENERATION — 3000 tokens, chain-of-thought
+    # =========================================================
+    async def _generate_strategy(
+        self, context: dict
+    ) -> tuple[dict | None, str | None, str | None]:
+
+        system_prompt, user_prompt = self._build_prompt(context)
+
         try:
-            rsi_vals = [
-                f.get("rsi_14", 50) for f in features.values() if isinstance(f, dict)
-            ]
-            if rsi_vals:
-                avg_rsi = sum(rsi_vals) / len(rsi_vals)
-                if avg_rsi < 35:
-                    regime = "bearish"
-                elif avg_rsi > 65:
-                    regime = "bullish"
-        except Exception:
-            pass
+            response = await self.client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=3000,
+                temperature=self.temperature,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
 
-        # Fetch recent feature combos for novelty avoidance
-        used_combos = None
-        try:
-            recent = await self.db_client.get_recent_feature_combos(limit=50)
-            same_arch = [
-                ", ".join(sorted(fs)) for fs, a in recent if a == self._archetype
-            ]
-            freq = Counter(same_arch)
-            used_combos = [c for c, _ in freq.most_common(5)]
-        except Exception:
-            pass
+            raw = response.content[0].text
+            logger.info(f"{self.name}: Claude response:\n{raw[:500]}...")
 
-        system_prompt, user_prompt = self._build_minimal_prompt(regime, used_combos)
+            # Extract JSON
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                start = cleaned.find("\n", cleaned.find("```")) + 1
+                end = cleaned.rfind("```")
+                cleaned = cleaned[start:end].strip()
 
-        models = ["claude-sonnet-4-6"]
+            first = cleaned.find("{")
+            last = cleaned.rfind("}")
+            if first == -1 or last == -1:
+                raise ValueError("No JSON found in response")
 
-        last_error = None
-        for model in models:
-            try:
-                response = await self.client.messages.create(
-                    model=model,
-                    max_tokens=500,
-                    temperature=self.temperature,
-                    messages=[
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    system=system_prompt,
-                )
-                raw = response.content[0].text
+            spec = json.loads(cleaned[first:last+1])
+            spec["asset_class"] = context["asset_class"]
+            spec = normalize_strategy(spec)
 
-                logger.info(f"{self.name}: Claude raw response ({model}): {raw}")
+            valid, reason = validate_strategy(spec)
+            if not valid:
+                raise ValueError(f"Validation failed: {reason}")
 
-                cleaned = self._extract_json(raw)
-                strategy_spec = json.loads(cleaned)
+            logger.info(
+                f"{self.name}: Generated '{spec['strategy_name']}' | "
+                f"entry={spec.get('entry_conditions')} | "
+                f"reasoning={spec.get('reasoning', 'N/A')[:100]}"
+            )
 
-                strategy_spec["asset_class"] = self._asset_class
+            await self.db_client.log(
+                agent_id=self.agent_id,
+                level="INFO",
+                message=f"Strategy generated: {spec['strategy_name']}",
+                metadata={
+                    "strategy_name": spec["strategy_name"],
+                    "archetype": self._archetype,
+                    "asset_class": context["asset_class"],
+                    "regime": context["regime"],
+                    "entry_conditions": spec.get("entry_conditions"),
+                    "reasoning": spec.get("reasoning", ""),
+                    "tokens_used": response.usage.output_tokens,
+                },
+            )
 
-                strategy_spec = normalize_strategy(strategy_spec)
+            return spec, user_prompt, raw
 
-                if "tags" not in strategy_spec:
-                    strategy_spec["tags"] = []
-                if self._archetype not in strategy_spec["tags"]:
-                    strategy_spec["tags"].append(self._archetype)
+        except json.JSONDecodeError as e:
+            logger.error(f"{self.name}: JSON parse error: {e}\nRaw: {raw[:300]}")
+            return None, user_prompt, None
 
-                valid, reason = validate_strategy(strategy_spec)
-                if not valid:
-                    raise ValueError(
-                        f"Strategy failed validation: {reason} | spec={strategy_spec}"
-                    )
+        except Exception as e:
+            logger.error(f"{self.name}: Generation error: {e}", exc_info=True)
+            # Fallback to local template
+            return await self._generate_local(context)
 
-                await self.db_client.log(
-                    agent_id=self.agent_id,
-                    level="INFO",
-                    message=f"Generated strategy via Claude ({model})",
-                    metadata={
-                        "prompt": user_prompt[:500],
-                        "response": raw,
-                        "model": model,
-                        "features_used": list(features.keys()),
-                        "archetype": self._archetype,
-                        "temperature": self.temperature,
-                        "agent_name": self.name,
-                        "normalized_spec": strategy_spec,
-                        "regime": regime,
-                    },
-                )
-
-                return strategy_spec, user_prompt, raw
-
-            except json.JSONDecodeError as e:
-                logger.warning(
-                    f"{self.name}: Claude model {model} returned invalid JSON: {e}"
-                )
-                last_error = e
-                continue
-            except Exception as e:
-                logger.warning(
-                    f"{self.name}: Claude model {model} failed ({e}), trying next"
-                )
-                last_error = e
-                continue
-
-        raise last_error or RuntimeError("All Claude models failed")
-
-    async def _generate_local(self, features: dict) -> tuple[dict, None, None]:
-        is_equity = self._asset_class == "equity"
-        entry_map = EQUITY_ENTRY_TEMPLATES if is_equity else CRYPTO_ENTRY_TEMPLATES
-        exit_map = EQUITY_EXIT_TEMPLATES if is_equity else CRYPTO_EXIT_TEMPLATES
-        entry = entry_map.get(self._archetype, ["ema_12 > ema_26"])
-        exit_ = exit_map.get(self._archetype, ["ema_12 < ema_26"])
+    async def _generate_local(
+        self, context: dict
+    ) -> tuple[dict, None, None]:
+        """Fallback when Claude fails — uses proven template conditions."""
+        asset = context["asset_class"]
+        archetype = context["archetype"]
         suffix = datetime.utcnow().strftime("%H%M%S")
-        domain = "equity" if is_equity else "crypto"
-        spec = {
-            "strategy_name": (
-                f"{self._archetype.title()}_{domain}_{self.name}_{suffix}"
-            ),
-            "hypothesis": (
-                f"{self._archetype.replace('_', ' ').title()} "
-                f"strategy for 1m {domain} data."
-            ),
-            "entry_conditions": entry,
-            "exit_conditions": exit_,
-            "stop_loss": "0.5% below entry",
-            "take_profit": "1% above entry",
-            "position_sizing": (f"{random.choice(['5', '10', '15'])}% of portfolio"),
-            "timeframe": "1m",
-            "asset_class": domain,
-            "expected_sharpe": round(random.uniform(0.8, 2.0), 2),
-            "expected_win_rate": round(random.uniform(0.45, 0.65), 2),
-            "risk_level": random.choice(["low", "medium", "high"]),
-            "tags": [self._archetype],
-        }
-        await self.db_client.log(
-            agent_id=self.agent_id,
-            level="INFO",
-            message="Generated equity strategy via local fallback",
-            metadata={
-                "archetype": self._archetype,
-                "temperature": self.temperature,
-                "strategy_name": spec["strategy_name"],
-                "agent_name": self.name,
+
+        TEMPLATES = {
+            ("equity", "momentum"): {
+                "entry": ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
+                "exit": ["ema_spread_pct < 0.0", "rsi_14 > 68"],
             },
+            ("equity", "mean_reversion"): {
+                "entry": ["bollinger_band_position < 0.15", "rsi_14 < 38"],
+                "exit": ["bollinger_band_position > 0.75"],
+            },
+            ("equity", "breakout"): {
+                "entry": ["bollinger_band_position > 0.92", "relative_volume > 1.8"],
+                "exit": ["rsi_14 > 72"],
+            },
+            ("equity", "trend_following"): {
+                "entry": ["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"],
+                "exit": ["ema_12 < ema_26"],
+            },
+            ("equity", "volatility_regime"): {
+                "entry": ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
+                "exit": ["volatility_regime < 0.9", "rsi_14 > 60"],
+            },
+            ("crypto", "momentum"): {
+                "entry": ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
+                "exit": ["ema_spread_pct < 0.0", "rsi_14 > 70"],
+            },
+            ("crypto", "mean_reversion"): {
+                "entry": ["rsi_14 < 32", "price_vs_vwap_pct < -0.004"],
+                "exit": ["rsi_14 > 58"],
+            },
+            ("crypto", "breakout"): {
+                "entry": ["bollinger_band_position > 0.9", "relative_volume > 2.0"],
+                "exit": ["rsi_14 > 75"],
+            },
+            ("crypto", "trend_following"): {
+                "entry": ["ema_12 > ema_26", "trend_strength > 0.001"],
+                "exit": ["ema_12 < ema_26"],
+            },
+            ("crypto", "volatility_regime"): {
+                "entry": ["volatility_regime > 1.5", "rsi_14 < 40"],
+                "exit": ["volatility_regime < 0.8"],
+            },
+        }
+
+        t = TEMPLATES.get(
+            (asset, archetype),
+            {"entry": ["ema_12 > ema_26"], "exit": ["ema_12 < ema_26"]}
         )
+
+        spec = {
+            "strategy_name": f"{archetype}_{asset}_local_{suffix}",
+            "hypothesis": f"Local template: {archetype} on {asset} 1m data",
+            "reasoning": "Fallback template — Claude unavailable",
+            "entry_conditions": t["entry"],
+            "exit_conditions": t["exit"],
+            "stop_loss": "0.5% below entry",
+            "take_profit": "1.0% above entry",
+            "position_sizing": "10% of portfolio",
+            "timeframe": "1m",
+            "asset_class": asset,
+            "expected_sharpe": 1.0,
+            "expected_win_rate": 0.5,
+            "expected_trades_per_week": 20,
+            "risk_level": "medium",
+            "tags": [archetype, asset, "local_fallback"],
+        }
         return spec, None, None
 
 
 async def main():
     print("=== IDEATOR MAIN STARTED ===", flush=True)
-    print("=== CONNECTING DB ===", flush=True)
-
     db_client = TimescaleClient(settings.database_url)
     await db_client.connect()
     redis_client = Redis.from_url(settings.redis_url)
 
-    print("=== GENERATING STRATEGIES ===", flush=True)
-
-    agents = [IdeatorAgent(i, TEMP_MAP[i], redis_client, db_client) for i in range(5)]
-
+    agents = [
+        IdeatorAgent(i, TEMP_MAP[i], redis_client, db_client)
+        for i in range(5)
+    ]
     await asyncio.gather(*(agent.start() for agent in agents))
-
     await asyncio.Event().wait()
 
 

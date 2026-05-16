@@ -1,0 +1,762 @@
+{
+  "timestamp": "2026-05-16T09:58:24.147236+00:00",
+  "environment": "development",
+  "overall_status": "PASS",
+  "stages": {
+    "01_schema_validation": {
+      "stage_name": "01_schema_validation",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table api_keys exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table api_request_audit exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table audit_logs exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table copy_execution_log exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table copy_leader_accounts exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table copy_follower_accounts exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "01_schema_validation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Table positions exists",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 36.29803657531738
+    },
+    "02_key_generation": {
+      "stage_name": "02_key_generation",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated admin key: 36f57537...",
+          "detail": null,
+          "latency_ms": 0,
+          "traceback_str": null
+        },
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated trader key: 9bf7aa44...",
+          "detail": null,
+          "latency_ms": 0,
+          "traceback_str": null
+        },
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated read_only key: 0cd15210...",
+          "detail": null,
+          "latency_ms": 0,
+          "traceback_str": null
+        },
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated follower key: 2928d29c...",
+          "detail": null,
+          "latency_ms": 0,
+          "traceback_str": null
+        },
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated monitor key: 50789b01...",
+          "detail": null,
+          "latency_ms": 0,
+          "traceback_str": null
+        },
+        {
+          "stage": "02_key_generation",
+          "status": "PASS",
+          "defect": null,
+          "message": "Generated keys available for downstream stages",
+          "detail": {
+            "admin": "36f57537...",
+            "trader": "9bf7aa44...",
+            "read_only": "0cd15210...",
+            "follower": "2928d29c...",
+            "monitor": "50789b01..."
+          },
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 4492.807149887085
+    },
+    "03_route_auth": {
+      "stage_name": "03_route_auth",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /health -> 200",
+          "detail": null,
+          "latency_ms": 3695.1494216918945,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /copy/logs -> 200",
+          "detail": null,
+          "latency_ms": 2760.474681854248,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /leaders -> 200",
+          "detail": null,
+          "latency_ms": 1820.5351829528809,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /followers -> 200",
+          "detail": null,
+          "latency_ms": 1629.7359466552734,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /portfolio -> 200",
+          "detail": null,
+          "latency_ms": 1512.8016471862793,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /positions -> 200",
+          "detail": null,
+          "latency_ms": 1722.5134372711182,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /risk -> 200",
+          "detail": null,
+          "latency_ms": 1792.62375831604,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /strategies -> 200",
+          "detail": null,
+          "latency_ms": 1890.9566402435303,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /status -> 200",
+          "detail": null,
+          "latency_ms": 1903.2566547393799,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /copy/status -> 200",
+          "detail": null,
+          "latency_ms": 1742.1252727508545,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /health -> 200",
+          "detail": null,
+          "latency_ms": 4288.665056228638,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /copy/logs -> 200",
+          "detail": null,
+          "latency_ms": 1718.1777954101562,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /leaders -> 200",
+          "detail": null,
+          "latency_ms": 4129.014730453491,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /followers -> 200",
+          "detail": null,
+          "latency_ms": 1706.4056396484375,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /portfolio -> 200",
+          "detail": null,
+          "latency_ms": 1688.612937927246,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /positions -> 200",
+          "detail": null,
+          "latency_ms": 1715.2488231658936,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /risk -> 200",
+          "detail": null,
+          "latency_ms": 1775.4461765289307,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /strategies -> 200",
+          "detail": null,
+          "latency_ms": 1742.7465915679932,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /status -> 200",
+          "detail": null,
+          "latency_ms": 1800.7075786590576,
+          "traceback_str": null
+        },
+        {
+          "stage": "03_route_auth",
+          "status": "PASS",
+          "defect": null,
+          "message": "read_only -> GET /copy/status -> 200",
+          "detail": null,
+          "latency_ms": 1724.7552871704102,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 42776.42488479614
+    },
+    "04_rate_limiting": {
+      "stage_name": "04_rate_limiting",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "04_rate_limiting",
+          "status": "PASS",
+          "defect": null,
+          "message": "Rate limit triggered on attempt 3 -> 429",
+          "detail": null,
+          "latency_ms": 1663.163661956787,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 10873.487949371338
+    },
+    "05_health_verification": {
+      "stage_name": "05_health_verification",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "05_health_verification",
+          "status": "PASS",
+          "defect": null,
+          "message": "health.status = healthy",
+          "detail": null,
+          "latency_ms": 1705.2690982818604,
+          "traceback_str": null
+        },
+        {
+          "stage": "05_health_verification",
+          "status": "PASS",
+          "defect": null,
+          "message": "health.timestamp = 2026-05-16T09:59:26.959419",
+          "detail": null,
+          "latency_ms": 1705.2690982818604,
+          "traceback_str": null
+        },
+        {
+          "stage": "05_health_verification",
+          "status": "PASS",
+          "defect": null,
+          "message": "health.latency_ms = 15",
+          "detail": null,
+          "latency_ms": 1705.2690982818604,
+          "traceback_str": null
+        },
+        {
+          "stage": "05_health_verification",
+          "status": "PASS",
+          "defect": null,
+          "message": "components: {\"api\": \"operational\", \"db\": \"connected\", \"redis\": \"connected\", \"copy_trader\": \"unknown\", \"validator\": \"unknown\"}",
+          "detail": null,
+          "latency_ms": 1705.2690982818604,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 1705.2690982818604
+    },
+    "06_copy_status": {
+      "stage_name": "06_copy_status",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "06_copy_status",
+          "status": "PASS",
+          "defect": null,
+          "message": "copy_status.timestamp = 2026-05-16T09:59:28.664604",
+          "detail": null,
+          "latency_ms": 1700.0808715820312,
+          "traceback_str": null
+        },
+        {
+          "stage": "06_copy_status",
+          "status": "PASS",
+          "defect": null,
+          "message": "copy_status.running_state = stale",
+          "detail": null,
+          "latency_ms": 1700.0808715820312,
+          "traceback_str": null
+        },
+        {
+          "stage": "06_copy_status",
+          "status": "PASS",
+          "defect": null,
+          "message": "copy_status.active_leaders = 1",
+          "detail": null,
+          "latency_ms": 1700.0808715820312,
+          "traceback_str": null
+        },
+        {
+          "stage": "06_copy_status",
+          "status": "PASS",
+          "defect": null,
+          "message": "copy_status.active_followers = 1",
+          "detail": null,
+          "latency_ms": 1700.0808715820312,
+          "traceback_str": null
+        },
+        {
+          "stage": "06_copy_status",
+          "status": "PASS",
+          "defect": null,
+          "message": "copy_status.filled_orders = 2",
+          "detail": null,
+          "latency_ms": 1700.0808715820312,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 1700.5810737609863
+    },
+    "07_security_matrix": {
+      "stage_name": "07_security_matrix",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /health -> PASS",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /copy/logs -> PASS",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /leaders -> PASS",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /followers -> PASS",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "admin -> GET /copy/status -> PASS",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "revoked -> GET /health -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "revoked -> GET /copy/logs -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "revoked -> GET /leaders -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "revoked -> GET /followers -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "revoked -> GET /copy/status -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "invalid -> GET /health -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "invalid -> GET /copy/logs -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "invalid -> GET /leaders -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "invalid -> GET /followers -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "07_security_matrix",
+          "status": "PASS",
+          "defect": null,
+          "message": "invalid -> GET /copy/status -> UNAUTHORIZED",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 53051.86176300049
+    },
+    "08_audit_trail": {
+      "stage_name": "08_audit_trail",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "08_audit_trail",
+          "status": "PASS",
+          "defect": null,
+          "message": "api_request_audit rows: 393",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "08_audit_trail",
+          "status": "PASS",
+          "defect": null,
+          "message": "audit_logs rows: 77",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "08_audit_trail",
+          "status": "PASS",
+          "defect": null,
+          "message": "api_keys rows: 63",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 41.86296463012695
+    },
+    "09_restart_certification": {
+      "stage_name": "09_restart_certification",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "09_restart_certification",
+          "status": "PASS",
+          "defect": null,
+          "message": "Admin key valid after restart (no auth corruption)",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "09_restart_certification",
+          "status": "PASS",
+          "defect": null,
+          "message": "Read-only key valid after restart",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        },
+        {
+          "stage": "09_restart_certification",
+          "status": "PASS",
+          "defect": null,
+          "message": "No state corruption: leaders before=1, after=1",
+          "detail": null,
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 11188.564777374268
+    },
+    "10_latency_metrics": {
+      "stage_name": "10_latency_metrics",
+      "status": "PASS",
+      "defect": null,
+      "evidence": [
+        {
+          "stage": "10_latency_metrics",
+          "status": "PASS",
+          "defect": null,
+          "message": "Latency metrics collected",
+          "detail": {
+            "01_schema_validation": 36.3,
+            "02_key_generation": 4492.81,
+            "03_route_auth": 42776.42,
+            "04_rate_limiting": 10873.49,
+            "05_health_verification": 1705.27,
+            "06_copy_status": 1700.58,
+            "07_security_matrix": 53051.86,
+            "08_audit_trail": 41.86,
+            "09_restart_certification": 11188.56
+          },
+          "latency_ms": 0.0,
+          "traceback_str": null
+        }
+      ],
+      "error": null,
+      "traceback": null,
+      "latency_ms": 0.0
+    }
+  },
+  "security_matrix": {
+    "admin": {
+      "GET /health": "PASS",
+      "GET /copy/logs": "PASS",
+      "GET /leaders": "PASS",
+      "GET /followers": "PASS",
+      "GET /copy/status": "PASS"
+    },
+    "read_only": {
+      "GET /health": "PASS",
+      "GET /copy/logs": "PASS",
+      "GET /leaders": "PASS",
+      "GET /followers": "PASS",
+      "GET /copy/status": "PASS"
+    },
+    "revoked": {
+      "GET /health": "UNAUTHORIZED",
+      "GET /copy/logs": "UNAUTHORIZED",
+      "GET /leaders": "UNAUTHORIZED",
+      "GET /followers": "UNAUTHORIZED",
+      "GET /copy/status": "UNAUTHORIZED"
+    },
+    "invalid": {
+      "GET /health": "UNAUTHORIZED",
+      "GET /copy/logs": "UNAUTHORIZED",
+      "GET /leaders": "UNAUTHORIZED",
+      "GET /followers": "UNAUTHORIZED",
+      "GET /copy/status": "UNAUTHORIZED"
+    }
+  },
+  "latency_report": {
+    "01_schema_validation": 36.3,
+    "02_key_generation": 4492.81,
+    "03_route_auth": 42776.42,
+    "04_rate_limiting": 10873.49,
+    "05_health_verification": 1705.27,
+    "06_copy_status": 1700.58,
+    "07_security_matrix": 53051.86,
+    "08_audit_trail": 41.86,
+    "09_restart_certification": 11188.56
+  },
+  "summary": {
+    "total_stages": 10,
+    "passed": 10,
+    "failed": 0,
+    "errors": 0,
+    "skipped": 0,
+    "defects": {},
+    "schema_errors": 0,
+    "auth_errors": 0,
+    "rate_limit_429_confirmed": true,
+    "audit_rows_gt_zero": true,
+    "key_generation_pass": true
+  }
+}

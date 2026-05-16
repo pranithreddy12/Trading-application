@@ -19,3 +19,6 @@ Thumbs.db
 nul
 memory.md
 demo.txt
+pre_day6_temporal_backup.sql
+*_backup.sql
+*.dump
