@@ -801,7 +801,9 @@ class TimescaleClient:
     async def get_strategies_with_backtest(
         self, statuses: list[str] | None = None, limit: int = 10
     ) -> list[dict]:
-        """Returns strategies with backtest results joined, ordered by composite_score.
+        """Returns strategies with backtest results joined, ordered by short_window_score.
+        Only queries verified top-level columns; profit_factor/composite_score/gross_edge/cost_burden
+        are extracted from the results JSONB.
         Used by the ideator to learn from past failures and successes.
         Defaults to failed_validation + repair_candidate if no statuses given.
         """
@@ -810,12 +812,12 @@ class TimescaleClient:
         query = """
             SELECT s.id, s.name, s.code, s.parameters, s.status, s.created_at,
                    s.author_agent, b.total_trades,
-                   b.max_drawdown, b.win_rate, b.profit_factor, b.composite_score,
-                   b.short_window_score, b.gross_edge, b.cost_burden
+                   b.max_drawdown, b.win_rate, b.short_window_score,
+                   b.results
             FROM strategies s
             JOIN backtest_results b ON s.id = b.strategy_id
             WHERE s.status = ANY(:statuses)
-            ORDER BY b.composite_score DESC
+            ORDER BY b.short_window_score DESC NULLS LAST
             LIMIT :limit
         """
         async with self.engine.connect() as conn:
@@ -826,6 +828,12 @@ class TimescaleClient:
             out = []
             for r in rows:
                 params = r[3] if isinstance(r[3], dict) else json.loads(r[3])
+                results_raw = r[11] if r[11] else {}
+                results = (
+                    json.loads(results_raw)
+                    if isinstance(results_raw, str)
+                    else (results_raw if isinstance(results_raw, dict) else {})
+                )
                 out.append(
                     {
                         "id": str(r[0]),
@@ -838,11 +846,11 @@ class TimescaleClient:
                         "total_trades": r[7] or 0,
                         "max_drawdown": r[8] or 0,
                         "win_rate": r[9] or 0,
-                        "profit_factor": r[10] or 1.0,
-                        "composite_score": r[11] or 0.0,
-                        "short_window_score": r[12] or 0.0,
-                        "gross_edge": r[13] or 0.0,
-                        "cost_burden": r[14] or 0.0,
+                        "short_window_score": r[10] or 0.0,
+                        "profit_factor": float(results.get("profit_factor", 1.0)),
+                        "composite_score": float(results.get("composite_score", 0.0)),
+                        "gross_edge": float(results.get("gross_edge", 0.0)),
+                        "cost_burden": float(results.get("cost_burden", 0.0)),
                     }
                 )
             return out

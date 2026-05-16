@@ -138,7 +138,8 @@ class IdeatorAgentV2(BaseAgent):
         self._ctx_cache: dict = {}
         self._ctx_cycle: int = 0
         self._CACHE_TTL: int = 10
-        self._failure_warned: bool = False  # one-shot log suppression
+        self._failure_warned: bool = False
+        self._context_enabled: bool = True
 
     async def stop(self):
         await super().stop()
@@ -206,6 +207,16 @@ class IdeatorAgentV2(BaseAgent):
     # CONTEXT — cached, compressed
     # ─────────────────────────────────────────────────────────
     async def _build_context(self) -> dict:
+        if not self._context_enabled:
+            return {
+                "archetype": self._archetype,
+                "asset_class": self._asset_class,
+                "regime": "neutral",
+                "snapshot_line": "",
+                "failure_summary": "Context enrichment disabled.",
+                "success_summary": "Context enrichment disabled.",
+                "recent_names": [],
+            }
         ctx = {
             "archetype": self._archetype,
             "asset_class": self._asset_class,
@@ -315,6 +326,11 @@ class IdeatorAgentV2(BaseAgent):
             if not self._failure_warned:
                 logger.warning(f"{self.name}: Failure fetch: {e}")
                 self._failure_warned = True
+            if any(
+                c in str(e)
+                for c in ["profit_factor", "composite_score", "does not exist"]
+            ):
+                self._context_enabled = False
 
         try:
             # Summarize successes as ONE compressed line (temporal-aware)
