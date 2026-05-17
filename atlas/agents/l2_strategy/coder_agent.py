@@ -5,7 +5,6 @@ import json
 import re
 from loguru import logger
 from redis.asyncio import Redis
-from anthropic import AsyncAnthropic
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
@@ -33,8 +32,6 @@ class CoderAgent(BaseAgent):
             layer="L2",
             redis_client=redis_client,
         )
-
-        self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.db_client = db_client
 
     async def run(self):
@@ -205,14 +202,20 @@ class {class_name}:
 
 {condition_block}
 
+        # Edge-trigger entries — fire only on transition False→True
+        buy = entry.fillna(False) & ~entry.fillna(False).shift(1).fillna(False)
+
+        # Edge-trigger exits — fire only on transition False→True
+        sell = exit_.fillna(False) & ~exit_.fillna(False).shift(1).fillna(False)
+
         # Apply entries
-        signals.loc[entry.fillna(False)] = 1
+        signals.loc[buy] = 1
 
         # Apply exits
-        signals.loc[exit_.fillna(False)] = -1
+        signals.loc[sell] = -1
 
         # Neutralize overlaps
-        overlap = entry & exit_
+        overlap = buy & sell
         signals.loc[overlap.fillna(False)] = 0
 
         return signals

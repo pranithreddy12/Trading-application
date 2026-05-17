@@ -21,7 +21,7 @@ from copy import deepcopy
 from enum import Enum
 from loguru import logger
 from redis.asyncio import Redis
-from anthropic import AsyncAnthropic
+from atlas.core.claude_client import claude as _claude
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
@@ -387,7 +387,6 @@ class MutatorAgent(BaseAgent):
             redis_client=redis_client,
         )
         self.RUN_INTERVAL_SECONDS = 900  # 15 minutes in demo mode
-        self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.db_client = db_client
 
     async def run(self):
@@ -629,14 +628,12 @@ CRITICAL RULES — VIOLATION WILL INVALIDATE YOUR OUTPUT:
         user_prompt = self._build_claude_prompt(candidate, diagnostic)
 
         try:
-            response = await self.client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1200,
-                temperature=0.5,  # Lower temperature for more conservative mutations
+            content = await _claude.complete(
+                user=user_prompt,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=1200,
+                temperature=0.5,
             )
-            content = response.content[0].text
 
             # JSON extraction hardening
             cleaned = extract_json_block(content)
