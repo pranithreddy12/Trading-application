@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import random
+import time as _time
 from datetime import datetime
 from loguru import logger
 from redis.asyncio import Redis
@@ -55,6 +56,223 @@ ALLOWED_FEATURES = [
 ]
 
 
+class _CircuitBreaker:
+    """CLOSED → OPEN (threshold failures) → HALF_OPEN (after cooldown) → CLOSED (probe succeeds) / OPEN (probe fails)."""
+
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+    __slots__ = ("_state", "_failures", "_last_time", "_lock", "threshold", "cooldown")
+
+    def __init__(self, threshold: int = 5, cooldown: float = 60.0):
+        self._state = self.CLOSED
+        self._failures = 0
+        self._last_time = 0.0
+        self._lock = asyncio.Lock()
+        self.threshold = threshold
+        self.cooldown = cooldown
+
+    async def record_failure(self) -> None:
+        async with self._lock:
+            if self._state == self.HALF_OPEN:
+                self._state = self.OPEN
+                self._last_time = _time.monotonic()
+                return
+            self._failures += 1
+            self._last_time = _time.monotonic()
+            if self._failures >= self.threshold:
+                self._state = self.OPEN
+
+    async def record_success(self) -> None:
+        async with self._lock:
+            if self._state == self.HALF_OPEN:
+                self._state = self.CLOSED
+                self._failures = 0
+                return
+            self._failures = max(0, self._failures - 1)
+            if self._state == self.OPEN and self._failures < self.threshold:
+                self._state = self.CLOSED
+
+    async def is_open(self) -> bool:
+        async with self._lock:
+            if self._state == self.CLOSED:
+                return False
+            if (
+                self._state == self.OPEN
+                and _time.monotonic() - self._last_time > self.cooldown
+            ):
+                self._state = self.HALF_OPEN
+            return True
+
+    async def try_claim_half_open(self) -> bool:
+        """Atomically claim the HALF_OPEN probe slot. Only one caller succeeds."""
+        async with self._lock:
+            if self._state == self.HALF_OPEN:
+                self._state = self.CLOSED
+                self._failures = 0
+                return True
+            return False
+
+
+_circuit_breaker = _CircuitBreaker(threshold=5, cooldown=60.0)
+_llm_semaphore = asyncio.Semaphore(2)
+
+
+# Diverse fallback templates — multiple variants per (asset, archetype)
+DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
+    ("equity", "momentum"): [
+        (
+            ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
+            ["ema_spread_pct < 0.0", "rsi_14 > 68"],
+        ),
+        (
+            ["price_vs_vwap_pct > 0.002", "relative_volume > 1.2"],
+            ["price_vs_vwap_pct < -0.001"],
+        ),
+        (
+            ["ema_12 > ema_26", "rsi_14 > 55", "relative_volume > 1.1"],
+            ["ema_12 < ema_26"],
+        ),
+    ],
+    ("equity", "mean_reversion"): [
+        (
+            ["bollinger_band_position < 0.15", "rsi_14 < 38"],
+            ["bollinger_band_position > 0.75"],
+        ),
+        (["price_vs_vwap_pct < -0.002", "rsi_14 < 35"], ["price_vs_vwap_pct > 0.001"]),
+        (
+            ["bollinger_band_position < 0.2", "ema_spread_pct < -0.001"],
+            ["bollinger_band_position > 0.7"],
+        ),
+    ],
+    ("equity", "breakout"): [
+        (["bollinger_band_position > 0.92", "relative_volume > 1.8"], ["rsi_14 > 72"]),
+        (
+            [
+                "bollinger_band_position > 0.85",
+                "relative_volume > 2.0",
+                "trend_strength > 0.001",
+            ],
+            ["rsi_14 > 75"],
+        ),
+        (
+            [
+                "volatility_regime > 1.3",
+                "bollinger_band_position > 0.8",
+                "relative_volume > 1.5",
+            ],
+            ["bollinger_band_position < 0.6"],
+        ),
+    ],
+    ("equity", "trend_following"): [
+        (["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"], ["ema_12 < ema_26"]),
+        (
+            ["trend_strength > 0.002", "ema_spread_pct > 0.001"],
+            ["trend_strength < 0.0", "ema_spread_pct < -0.001"],
+        ),
+        (["sma_20 > ema_12", "relative_volume > 1.2"], ["sma_20 < ema_12"]),
+    ],
+    ("equity", "volatility_regime"): [
+        (
+            ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
+            ["volatility_regime < 0.9"],
+        ),
+        (
+            [
+                "volatility_regime > 1.5",
+                "rsi_14 < 40",
+                "bollinger_band_position < 0.25",
+            ],
+            ["volatility_regime < 0.9", "rsi_14 > 50"],
+        ),
+        (
+            [
+                "volatility_regime > 1.3",
+                "price_vs_vwap_pct < -0.002",
+                "bollinger_band_position < 0.4",
+            ],
+            ["volatility_regime < 1.0"],
+        ),
+    ],
+    ("crypto", "momentum"): [
+        (
+            ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
+            ["ema_spread_pct < 0.0", "rsi_14 > 70"],
+        ),
+        (
+            ["price_vs_vwap_pct > 0.003", "relative_volume > 1.4"],
+            ["price_vs_vwap_pct < -0.002"],
+        ),
+        (
+            ["ema_12 > ema_26", "trend_strength > 0.002", "relative_volume > 1.3"],
+            ["ema_12 < ema_26"],
+        ),
+    ],
+    ("crypto", "mean_reversion"): [
+        (["rsi_14 < 32", "price_vs_vwap_pct < -0.004"], ["rsi_14 > 58"]),
+        (
+            ["bollinger_band_position < 0.12", "rsi_14 < 35"],
+            ["bollinger_band_position > 0.7"],
+        ),
+        (
+            [
+                "price_vs_vwap_pct < -0.005",
+                "rsi_14 < 30",
+                "bollinger_band_position < 0.2",
+            ],
+            ["price_vs_vwap_pct > 0.0"],
+        ),
+    ],
+    ("crypto", "breakout"): [
+        (["bollinger_band_position > 0.9", "relative_volume > 2.0"], ["rsi_14 > 75"]),
+        (
+            [
+                "bollinger_band_position > 0.88",
+                "relative_volume > 2.2",
+                "volatility_regime > 1.5",
+            ],
+            ["rsi_14 > 78"],
+        ),
+        (
+            [
+                "price_vs_vwap_pct > 0.005",
+                "relative_volume > 1.8",
+                "bollinger_band_position > 0.85",
+            ],
+            ["price_vs_vwap_pct < 0.001"],
+        ),
+    ],
+    ("crypto", "trend_following"): [
+        (["ema_12 > ema_26", "trend_strength > 0.001"], ["ema_12 < ema_26"]),
+        (
+            [
+                "trend_strength > 0.003",
+                "ema_spread_pct > 0.002",
+                "relative_volume > 1.3",
+            ],
+            ["trend_strength < 0.0"],
+        ),
+        (["sma_20 > ema_12", "price_vs_vwap_pct > 0.002"], ["sma_20 < ema_12"]),
+    ],
+    ("crypto", "volatility_regime"): [
+        (["volatility_regime > 1.5", "rsi_14 < 40"], ["volatility_regime < 0.8"]),
+        (
+            ["volatility_regime > 1.6", "bollinger_band_position < 0.2", "rsi_14 < 35"],
+            ["volatility_regime < 1.0"],
+        ),
+        (
+            [
+                "volatility_regime > 1.4",
+                "price_vs_vwap_pct < -0.004",
+                "bollinger_band_position < 0.3",
+            ],
+            ["volatility_regime < 0.9"],
+        ),
+    ],
+}
+
+
 class IdeatorAgent(BaseAgent):
     """
     Generates high-quality trading strategy specs using Claude.
@@ -77,9 +295,11 @@ class IdeatorAgent(BaseAgent):
         )
         self.instance_id = instance_id
         self.temperature = max(0.0, min(1.0, temperature))
+        _transport = httpx.AsyncHTTPTransport(http2=False, retries=2)
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=30.0),
             verify=True,
+            transport=_transport,
         )
         self.client = AsyncAnthropic(
             api_key=settings.anthropic_api_key,
@@ -463,131 +683,186 @@ Output ONLY valid JSON. No markdown, no explanation, no code fences.
     ) -> tuple[dict | None, str | None, str | None]:
 
         system_prompt, user_prompt = self._build_prompt(context)
+        last_err = None
+        asset = context["asset_class"]
+        archetype = self._archetype
 
-        try:
-            response = await self.client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=3000,
-                temperature=self.temperature,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+        if await _circuit_breaker.is_open():
+            if await _circuit_breaker.try_claim_half_open():
+                logger.info(f"{self.name}: Circuit breaker HALF_OPEN — probe call")
+                try:
+                    resp = await self.client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=3000,
+                        temperature=self.temperature,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+                    raw = resp.content[0].text
+                    logger.info(f"{self.name}: Probe response:\n{raw[:500]}...")
+                    cleaned = raw.strip()
+                    if "```" in cleaned:
+                        start = cleaned.find("\n", cleaned.find("```")) + 1
+                        end = cleaned.rfind("```")
+                        cleaned = cleaned[start:end].strip()
+                    first = cleaned.find("{")
+                    last = cleaned.rfind("}")
+                    if first == -1 or last == -1:
+                        raise ValueError("No JSON in probe response")
+                    spec = json.loads(cleaned[first : last + 1])
+                    spec["asset_class"] = asset
+                    spec = normalize_strategy(spec)
+                    valid, reason = validate_strategy(spec)
+                    if not valid:
+                        raise ValueError(f"Invalid: {reason}")
+                    await _circuit_breaker.record_success()
+                    await self.db_client.log(
+                        agent_id=self.agent_id,
+                        level="INFO",
+                        message=f"Generated via probe: {spec['strategy_name']}",
+                        metadata={
+                            "archetype": self._archetype,
+                            "asset_class": asset,
+                            "entry": spec.get("entry_conditions"),
+                            "reasoning": spec.get("reasoning", "")[:200],
+                        },
+                    )
+                    return spec, user_prompt, raw
+                except Exception as e:
+                    await _circuit_breaker.record_failure()
+                    logger.warning(
+                        f"{self.name}: Probe failed: {type(e).__name__}: {repr(e)}"
+                    )
+
+            logger.warning(
+                f"{self.name}: Circuit breaker OPEN — falling back to local templates"
             )
-
-            raw = response.content[0].text
-            logger.info(f"{self.name}: Claude response:\n{raw[:500]}...")
-
-            # Extract JSON
-            cleaned = raw.strip()
-            if "```" in cleaned:
-                start = cleaned.find("\n", cleaned.find("```")) + 1
-                end = cleaned.rfind("```")
-                cleaned = cleaned[start:end].strip()
-
-            first = cleaned.find("{")
-            last = cleaned.rfind("}")
-            if first == -1 or last == -1:
-                raise ValueError("No JSON found in response")
-
-            spec = json.loads(cleaned[first : last + 1])
-            spec["asset_class"] = context["asset_class"]
-            spec = normalize_strategy(spec)
-
-            valid, reason = validate_strategy(spec)
-            if not valid:
-                raise ValueError(f"Validation failed: {reason}")
-
-            logger.info(
-                f"{self.name}: Generated '{spec['strategy_name']}' | "
-                f"entry={spec.get('entry_conditions')} | "
-                f"reasoning={spec.get('reasoning', 'N/A')[:100]}"
-            )
-
-            await self.db_client.log(
-                agent_id=self.agent_id,
-                level="INFO",
-                message=f"Strategy generated: {spec['strategy_name']}",
-                metadata={
-                    "strategy_name": spec["strategy_name"],
-                    "archetype": self._archetype,
-                    "asset_class": context["asset_class"],
-                    "regime": context["regime"],
-                    "entry_conditions": spec.get("entry_conditions"),
-                    "reasoning": spec.get("reasoning", ""),
-                    "tokens_used": response.usage.output_tokens,
-                },
-            )
-
-            return spec, user_prompt, raw
-
-        except json.JSONDecodeError as e:
-            logger.error(f"{self.name}: JSON parse error: {e}\nRaw: {raw[:300]}")
-            return None, user_prompt, None
-
-        except Exception as e:
-            logger.error(f"{self.name}: Generation error: {e}", exc_info=True)
-            # Fallback to local template
             return await self._generate_local(context)
 
+        async with _llm_semaphore:
+            for attempt in range(3):
+                try:
+                    response = await self.client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=3000,
+                        temperature=self.temperature,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+
+                    raw = response.content[0].text
+                    logger.info(f"{self.name}: Claude response:\n{raw[:500]}...")
+
+                    # Extract JSON
+                    cleaned = raw.strip()
+                    if "```" in cleaned:
+                        start = cleaned.find("\n", cleaned.find("```")) + 1
+                        end = cleaned.rfind("```")
+                        cleaned = cleaned[start:end].strip()
+
+                    first = cleaned.find("{")
+                    last = cleaned.rfind("}")
+                    if first == -1 or last == -1:
+                        raise ValueError("No JSON found in response")
+
+                    spec = json.loads(cleaned[first : last + 1])
+                    spec["asset_class"] = asset
+                    spec = normalize_strategy(spec)
+
+                    valid, reason = validate_strategy(spec)
+                    if not valid:
+                        raise ValueError(f"Validation failed: {reason}")
+
+                    await _circuit_breaker.record_success()
+
+                    logger.info(
+                        f"{self.name}: Generated '{spec['strategy_name']}' | "
+                        f"entry={spec.get('entry_conditions')} | "
+                        f"reasoning={spec.get('reasoning', 'N/A')[:100]}"
+                    )
+
+                    await self.db_client.log(
+                        agent_id=self.agent_id,
+                        level="INFO",
+                        message=f"Strategy generated: {spec['strategy_name']}",
+                        metadata={
+                            "strategy_name": spec["strategy_name"],
+                            "archetype": self._archetype,
+                            "asset_class": asset,
+                            "regime": context["regime"],
+                            "entry_conditions": spec.get("entry_conditions"),
+                            "reasoning": spec.get("reasoning", ""),
+                            "tokens_used": response.usage.output_tokens,
+                        },
+                    )
+
+                    return spec, user_prompt, raw
+
+                except json.JSONDecodeError as e:
+                    last_err = e
+                    await _circuit_breaker.record_failure()
+                    logger.error(
+                        f"{self.name}: JSON parse error: {type(e).__name__}: {repr(e)}"
+                    )
+                    if attempt < 2:
+                        wait = 2 * (2**attempt) + random.uniform(0.5, 2.5)
+                        logger.warning(f"{self.name}: Retrying in {wait:.1f}s...")
+                        await asyncio.sleep(wait)
+                    continue
+
+                except Exception as e:
+                    last_err = e
+                    await _circuit_breaker.record_failure()
+                    if attempt < 2:
+                        wait = 2 * (2**attempt) + random.uniform(0.5, 2.5)
+                        logger.warning(
+                            f"{self.name}: Attempt {attempt + 1}/3 failed: "
+                            f"{type(e).__name__}: {repr(e)}. "
+                            f"Retrying in {wait:.1f}s..."
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.error(
+                            f"{self.name}: All 3 attempts failed: "
+                            f"{type(last_err).__name__}: {repr(last_err)}"
+                        )
+
+        logger.info(
+            f"{self.name}: All Anthropic retries exhausted — falling back to local templates"
+        )
+        return await self._generate_local(context)
+
+    # ─────────────────────────────────────────────────────────
+    # LOCAL FALLBACK — proven templates, always generates trades
+    # ─────────────────────────────────────────────────────────
     async def _generate_local(self, context: dict) -> tuple[dict, None, None]:
-        """Fallback when Claude fails — uses proven template conditions."""
+        """Fallback when Claude fails — uses diverse proven templates."""
         asset = context["asset_class"]
         archetype = context["archetype"]
+        regime = context.get("regime", "neutral")
+        key = (asset, archetype)
+
+        variants = DIVERSE_TEMPLATES.get(key, DIVERSE_TEMPLATES[("equity", "momentum")])
+        entry, exit_ = random.choice(variants)
+
+        if regime in ("oversold", "oversold/bearish"):
+            entry = [c for c in entry if "bollinger_band_position >" not in c]
+            exit_ = [c for c in exit_ if "bollinger_band_position <" not in c]
+        elif regime in ("overbought", "overbought/bullish"):
+            entry = [
+                c.replace("rsi_14 > 68", "rsi_14 > 72")
+                .replace("rsi_14 > 70", "rsi_14 > 75")
+                .replace("rsi_14 > 72", "rsi_14 > 78")
+                for c in entry
+            ]
+
         suffix = datetime.utcnow().strftime("%H%M%S")
-
-        TEMPLATES = {
-            ("equity", "momentum"): {
-                "entry": ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
-                "exit": ["ema_spread_pct < 0.0", "rsi_14 > 68"],
-            },
-            ("equity", "mean_reversion"): {
-                "entry": ["bollinger_band_position < 0.15", "rsi_14 < 38"],
-                "exit": ["bollinger_band_position > 0.75"],
-            },
-            ("equity", "breakout"): {
-                "entry": ["bollinger_band_position > 0.92", "relative_volume > 1.8"],
-                "exit": ["rsi_14 > 72"],
-            },
-            ("equity", "trend_following"): {
-                "entry": ["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"],
-                "exit": ["ema_12 < ema_26"],
-            },
-            ("equity", "volatility_regime"): {
-                "entry": ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
-                "exit": ["volatility_regime < 0.9", "rsi_14 > 60"],
-            },
-            ("crypto", "momentum"): {
-                "entry": ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
-                "exit": ["ema_spread_pct < 0.0", "rsi_14 > 70"],
-            },
-            ("crypto", "mean_reversion"): {
-                "entry": ["rsi_14 < 32", "price_vs_vwap_pct < -0.004"],
-                "exit": ["rsi_14 > 58"],
-            },
-            ("crypto", "breakout"): {
-                "entry": ["bollinger_band_position > 0.9", "relative_volume > 2.0"],
-                "exit": ["rsi_14 > 75"],
-            },
-            ("crypto", "trend_following"): {
-                "entry": ["ema_12 > ema_26", "trend_strength > 0.001"],
-                "exit": ["ema_12 < ema_26"],
-            },
-            ("crypto", "volatility_regime"): {
-                "entry": ["volatility_regime > 1.5", "rsi_14 < 40"],
-                "exit": ["volatility_regime < 0.8"],
-            },
-        }
-
-        t = TEMPLATES.get(
-            (asset, archetype),
-            {"entry": ["ema_12 > ema_26"], "exit": ["ema_12 < ema_26"]},
-        )
-
         spec = {
             "strategy_name": f"{archetype}_{asset}_local_{suffix}",
             "hypothesis": f"Local template: {archetype} on {asset} 1m data",
-            "reasoning": "Fallback template — Claude unavailable",
-            "entry_conditions": t["entry"],
-            "exit_conditions": t["exit"],
+            "reasoning": "Fallback template — guaranteed signal generation",
+            "entry_conditions": entry,
+            "exit_conditions": exit_,
             "stop_loss": "0.5% below entry",
             "take_profit": "1.0% above entry",
             "position_sizing": "10% of portfolio",
@@ -609,8 +884,11 @@ async def main():
     redis_client = Redis.from_url(settings.redis_url)
 
     agents = [IdeatorAgent(i, TEMP_MAP[i], redis_client, db_client) for i in range(5)]
-    await asyncio.gather(*(agent.start() for agent in agents))
-    await asyncio.Event().wait()
+    for a in agents:
+        await a.start()
+    main_tasks = [a._main_task for a in agents if a._main_task]
+    if main_tasks:
+        await asyncio.gather(*main_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -3,14 +3,14 @@ print("=== IDEATOR V2 LOADED ===", flush=True)
 import asyncio
 import json
 import random
+import time as _time
 from datetime import datetime
 from loguru import logger
 from redis.asyncio import Redis
-from anthropic import AsyncAnthropic
-import httpx
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
+from atlas.core.claude_client import claude as _claude
 from atlas.config.settings import settings
 from atlas.data.storage.timescale_client import TimescaleClient
 from atlas.agents.l2_strategy.strategy_normalizer import (
@@ -98,6 +98,160 @@ LOCAL_TEMPLATES = {
 }
 
 
+# Diverse fallback templates — multiple variants per (asset, archetype)
+DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
+    ("equity", "momentum"): [
+        (
+            ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
+            ["ema_spread_pct < 0.0", "rsi_14 > 68"],
+        ),
+        (
+            ["price_vs_vwap_pct > 0.002", "relative_volume > 1.2"],
+            ["price_vs_vwap_pct < -0.001"],
+        ),
+        (
+            ["ema_12 > ema_26", "rsi_14 > 55", "relative_volume > 1.1"],
+            ["ema_12 < ema_26"],
+        ),
+    ],
+    ("equity", "mean_reversion"): [
+        (
+            ["bollinger_band_position < 0.15", "rsi_14 < 38"],
+            ["bollinger_band_position > 0.75"],
+        ),
+        (["price_vs_vwap_pct < -0.002", "rsi_14 < 35"], ["price_vs_vwap_pct > 0.001"]),
+        (
+            ["bollinger_band_position < 0.2", "ema_spread_pct < -0.001"],
+            ["bollinger_band_position > 0.7"],
+        ),
+    ],
+    ("equity", "breakout"): [
+        (["bollinger_band_position > 0.92", "relative_volume > 1.8"], ["rsi_14 > 72"]),
+        (
+            [
+                "bollinger_band_position > 0.85",
+                "relative_volume > 2.0",
+                "trend_strength > 0.001",
+            ],
+            ["rsi_14 > 75"],
+        ),
+        (
+            [
+                "volatility_regime > 1.3",
+                "bollinger_band_position > 0.8",
+                "relative_volume > 1.5",
+            ],
+            ["bollinger_band_position < 0.6"],
+        ),
+    ],
+    ("equity", "trend_following"): [
+        (["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"], ["ema_12 < ema_26"]),
+        (
+            ["trend_strength > 0.002", "ema_spread_pct > 0.001"],
+            ["trend_strength < 0.0", "ema_spread_pct < -0.001"],
+        ),
+        (["sma_20 > ema_12", "relative_volume > 1.2"], ["sma_20 < ema_12"]),
+    ],
+    ("equity", "volatility_regime"): [
+        (
+            ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
+            ["volatility_regime < 0.9"],
+        ),
+        (
+            [
+                "volatility_regime > 1.5",
+                "rsi_14 < 40",
+                "bollinger_band_position < 0.25",
+            ],
+            ["volatility_regime < 0.9", "rsi_14 > 50"],
+        ),
+        (
+            [
+                "volatility_regime > 1.3",
+                "price_vs_vwap_pct < -0.002",
+                "bollinger_band_position < 0.4",
+            ],
+            ["volatility_regime < 1.0"],
+        ),
+    ],
+    ("crypto", "momentum"): [
+        (
+            ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
+            ["ema_spread_pct < 0.0", "rsi_14 > 70"],
+        ),
+        (
+            ["price_vs_vwap_pct > 0.003", "relative_volume > 1.4"],
+            ["price_vs_vwap_pct < -0.002"],
+        ),
+        (
+            ["ema_12 > ema_26", "trend_strength > 0.002", "relative_volume > 1.3"],
+            ["ema_12 < ema_26"],
+        ),
+    ],
+    ("crypto", "mean_reversion"): [
+        (["rsi_14 < 32", "price_vs_vwap_pct < -0.004"], ["rsi_14 > 58"]),
+        (
+            ["bollinger_band_position < 0.12", "rsi_14 < 35"],
+            ["bollinger_band_position > 0.7"],
+        ),
+        (
+            [
+                "price_vs_vwap_pct < -0.005",
+                "rsi_14 < 30",
+                "bollinger_band_position < 0.2",
+            ],
+            ["price_vs_vwap_pct > 0.0"],
+        ),
+    ],
+    ("crypto", "breakout"): [
+        (["bollinger_band_position > 0.9", "relative_volume > 2.0"], ["rsi_14 > 75"]),
+        (
+            [
+                "bollinger_band_position > 0.88",
+                "relative_volume > 2.2",
+                "volatility_regime > 1.5",
+            ],
+            ["rsi_14 > 78"],
+        ),
+        (
+            [
+                "price_vs_vwap_pct > 0.005",
+                "relative_volume > 1.8",
+                "bollinger_band_position > 0.85",
+            ],
+            ["price_vs_vwap_pct < 0.001"],
+        ),
+    ],
+    ("crypto", "trend_following"): [
+        (["ema_12 > ema_26", "trend_strength > 0.001"], ["ema_12 < ema_26"]),
+        (
+            [
+                "trend_strength > 0.003",
+                "ema_spread_pct > 0.002",
+                "relative_volume > 1.3",
+            ],
+            ["trend_strength < 0.0"],
+        ),
+        (["sma_20 > ema_12", "price_vs_vwap_pct > 0.002"], ["sma_20 < ema_12"]),
+    ],
+    ("crypto", "volatility_regime"): [
+        (["volatility_regime > 1.5", "rsi_14 < 40"], ["volatility_regime < 0.8"]),
+        (
+            ["volatility_regime > 1.6", "bollinger_band_position < 0.2", "rsi_14 < 35"],
+            ["volatility_regime < 1.0"],
+        ),
+        (
+            [
+                "volatility_regime > 1.4",
+                "price_vs_vwap_pct < -0.004",
+                "bollinger_band_position < 0.3",
+            ],
+            ["volatility_regime < 0.9"],
+        ),
+    ],
+}
+
+
 class IdeatorAgentV2(BaseAgent):
     """
     Optimized ideator — real context, compressed prompts, cached DB.
@@ -121,14 +275,7 @@ class IdeatorAgentV2(BaseAgent):
         self.instance_id = instance_id
         self.temperature = max(0.0, min(1.0, temperature))
         self.mode = mode
-        self.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(90.0, connect=30.0),
-            verify=True,
-        )
-        self.client = AsyncAnthropic(
-            api_key=settings.anthropic_api_key,
-            http_client=self.http_client,
-        )
+        self._claude = _claude
         self.db_client = db_client
         self.messaging = MessagingClient(redis_client)
         self._archetype = ARCHETYPES[instance_id % len(ARCHETYPES)]
@@ -140,10 +287,6 @@ class IdeatorAgentV2(BaseAgent):
         self._CACHE_TTL: int = 10
         self._failure_warned: bool = False
         self._context_enabled: bool = True
-
-    async def stop(self):
-        await super().stop()
-        await self.http_client.aclose()
 
     async def run(self):
         logger.info(
@@ -440,68 +583,49 @@ Output ONLY this JSON:
 "expected_win_rate":0.52,"risk_level":"medium",
 "tags":["{archetype}","{asset}"]}}"""
 
-        import asyncio as _asyncio
+        try:
+            raw = await self._claude.complete(
+                user=user_prompt,
+                system=system_prompt,
+                max_tokens=max_tokens,
+                temperature=self.temperature,
+            )
+            logger.info(f"{self.name}: Claude response:\n{raw[:400]}")
 
-        last_err = None
-        for attempt in range(3):
-            try:
-                resp = await self.client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=max_tokens,
-                    temperature=self.temperature,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}],
-                )
-                raw = resp.content[0].text
-                logger.info(f"{self.name}: Raw ({max_tokens}t):\n{raw[:400]}")
+            cleaned = raw.strip()
+            if "```" in cleaned:
+                start = cleaned.find("\n", cleaned.find("```")) + 1
+                end = cleaned.rfind("```")
+                cleaned = cleaned[start:end].strip()
+            f = cleaned.find("{")
+            l = cleaned.rfind("}")
+            if f == -1:
+                raise ValueError("No JSON in response")
 
-                # Extract JSON
-                cleaned = raw.strip()
-                if "```" in cleaned:
-                    start = cleaned.find("\n", cleaned.find("```")) + 1
-                    end = cleaned.rfind("```")
-                    cleaned = cleaned[start:end].strip()
-                f = cleaned.find("{")
-                l = cleaned.rfind("}")
-                if f == -1:
-                    raise ValueError("No JSON in response")
+            spec = json.loads(cleaned[f:l+1])
+            spec["asset_class"] = asset
+            spec = normalize_strategy(spec)
+            valid, reason = validate_strategy(spec)
+            if not valid:
+                raise ValueError(f"Invalid: {reason}")
 
-                spec = json.loads(cleaned[f : l + 1])
-                spec["asset_class"] = asset
-                spec = normalize_strategy(spec)
+            await self.db_client.log(
+                agent_id=self.agent_id,
+                level="INFO",
+                message=f"Generated: {spec['strategy_name']}",
+                metadata={
+                    "mode": self.mode,
+                    "tokens": max_tokens,
+                    "archetype": archetype,
+                    "reasoning": spec.get("reasoning", "")[:200],
+                    "entry": spec.get("entry_conditions"),
+                },
+            )
+            return spec, user_prompt, raw
 
-                valid, reason = validate_strategy(spec)
-                if not valid:
-                    raise ValueError(f"Invalid: {reason}")
-
-                await self.db_client.log(
-                    agent_id=self.agent_id,
-                    level="INFO",
-                    message=f"Generated: {spec['strategy_name']}",
-                    metadata={
-                        "mode": self.mode,
-                        "tokens": max_tokens,
-                        "tokens_used": resp.usage.output_tokens,
-                        "archetype": archetype,
-                        "reasoning": spec.get("reasoning", "")[:200],
-                        "entry": spec.get("entry_conditions"),
-                    },
-                )
-                return spec, user_prompt, raw
-
-            except Exception as e:
-                last_err = e
-                if attempt < 2:
-                    wait = 2 * (2**attempt)
-                    logger.warning(
-                        f"{self.name}: Attempt {attempt + 1}/3 failed: {e}. "
-                        f"Retrying in {wait}s..."
-                    )
-                    await _asyncio.sleep(wait)
-                else:
-                    logger.warning(f"{self.name}: All 3 attempts failed: {last_err}")
-
-        return await self._generate_local(ctx)
+        except Exception as e:
+            logger.warning(f"{self.name}: Claude failed: {e}")
+            return await self._generate_local(ctx)
 
     # ─────────────────────────────────────────────────────────
     # LOCAL FALLBACK — proven templates, always generates trades
@@ -509,10 +633,24 @@ Output ONLY this JSON:
     async def _generate_local(self, ctx: dict) -> tuple[dict, None, None]:
         asset = ctx["asset_class"]
         archetype = ctx["archetype"]
+        regime = ctx.get("regime", "neutral")
         key = (asset, archetype)
-        entry, exit_ = LOCAL_TEMPLATES.get(
-            key, (["ema_12 > ema_26"], ["ema_12 < ema_26"])
-        )
+
+        variants = DIVERSE_TEMPLATES.get(key, DIVERSE_TEMPLATES[("equity", "momentum")])
+        entry, exit_ = random.choice(variants)
+
+        # Regime-aware threshold adjustments
+        if regime in ("oversold", "oversold/bearish"):
+            entry = [c for c in entry if "bollinger_band_position >" not in c]
+            exit_ = [c for c in exit_ if "bollinger_band_position <" not in c]
+        elif regime in ("overbought", "overbought/bullish"):
+            entry = [
+                c.replace("rsi_14 > 68", "rsi_14 > 72")
+                .replace("rsi_14 > 70", "rsi_14 > 75")
+                .replace("rsi_14 > 72", "rsi_14 > 78")
+                for c in entry
+            ]
+
         suffix = datetime.utcnow().strftime("%H%M%S")
         spec = {
             "strategy_name": f"{archetype}_{asset}_tmpl_{suffix}",
@@ -553,8 +691,12 @@ async def main():
         IdeatorAgentV2(4, 0.0, redis, db, mode="local"),
     ]
 
-    await asyncio.gather(*(a.start() for a in agents))
-    await asyncio.Event().wait()
+    for a in agents:
+        await a.start()
+    # Keep alive until all agent main tasks complete
+    main_tasks = [a._main_task for a in agents if a._main_task]
+    if main_tasks:
+        await asyncio.gather(*main_tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":
