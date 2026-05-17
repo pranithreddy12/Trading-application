@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     crypto_pairs: str
     environment: str
     anthropic_api_key: str = Field(..., alias="ANTHROPIC_API_KEY")
+    alpaca_api_key: str = ""
+    alpaca_secret_key: str = ""
     polygon_delayed: bool = True
 
     model_config = SettingsConfigDict(
