@@ -7,6 +7,7 @@ import time as _time
 from datetime import datetime
 from loguru import logger
 from redis.asyncio import Redis
+import os
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
@@ -17,6 +18,11 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
     normalize_strategy,
     validate_strategy,
     compute_strategy_signature,
+)
+from atlas.core.execution_cost_intelligence import (
+    generate_cost_priors,
+    estimate_round_trip_cost,
+    classify_cost_profile,
 )
 
 ARCHETYPES = [
@@ -256,6 +262,7 @@ class IdeatorAgentV2(BaseAgent):
     """
     Optimized ideator — real context, compressed prompts, cached DB.
     max_tokens=1500, context refreshed every 10 cycles.
+    NOW WITH: Execution Cost Intelligence Layer integration for cost-aware generation.
     """
 
     def __init__(
@@ -287,6 +294,11 @@ class IdeatorAgentV2(BaseAgent):
         self._CACHE_TTL: int = 10
         self._failure_warned: bool = False
         self._context_enabled: bool = True
+        
+        # Cost Intelligence Feature Flag
+        self._cost_intelligence_enabled = os.environ.get(
+            "EXECUTION_COST_INTELLIGENCE", "ADVISORY"
+        ) in ("ADVISORY", "ENFORCED", "FULL", "ON")
 
     async def run(self):
         logger.info(
@@ -315,6 +327,8 @@ class IdeatorAgentV2(BaseAgent):
                     await asyncio.sleep(5)
                     continue
 
+                import os
+                batch = os.environ.get("GENERATION_BATCH", None)
                 strategy_id = await self.db_client.save_strategy(
                     spec,
                     status="pending_code",
@@ -322,6 +336,7 @@ class IdeatorAgentV2(BaseAgent):
                     prompt=prompt,
                     raw_response=raw,
                     strategy_signature=sig,
+                    generation_batch=batch,
                 )
 
                 logger.info(
@@ -359,6 +374,7 @@ class IdeatorAgentV2(BaseAgent):
                 "failure_summary": "Context enrichment disabled.",
                 "success_summary": "Context enrichment disabled.",
                 "recent_names": [],
+                "pattern_intelligence": "Context enrichment disabled.",
             }
         ctx = {
             "archetype": self._archetype,
@@ -368,6 +384,7 @@ class IdeatorAgentV2(BaseAgent):
             "failure_summary": "No failures yet.",
             "success_summary": "No validated strategies yet.",
             "recent_names": [],
+            "pattern_intelligence": "No pattern data yet.",
         }
 
         try:
@@ -506,6 +523,97 @@ class IdeatorAgentV2(BaseAgent):
         except Exception:
             pass
 
+        try:
+            patterns = await self.db_client.get_top_patterns(
+                min_confidence=0.0, limit=10
+            )
+            lines = []
+            for p in patterns.get("winning", []):
+                ff = ", ".join(p.get("feature_family", [])[:3]) or "any"
+                lines.append(
+                    f"[WIN] {p['archetype']} ({p['asset_class']}) "
+                    f"score={p['composite_score_avg']} "
+                    f"features=[{ff}] "
+                    f"conf={p['confidence_score']}"
+                )
+            for p in patterns.get("neutral", []):
+                ff = ", ".join(p.get("feature_family", [])[:3]) or "any"
+                lines.append(
+                    f"[NEUTRAL] {p['archetype']} ({p['asset_class']}) "
+                    f"score={p['composite_score_avg']} "
+                    f"features=[{ff}]"
+                )
+            for p in patterns.get("losing", []):
+                ff = ", ".join(p.get("feature_family", [])[:3]) or "any"
+                lines.append(
+                    f"[AVOID] {p['archetype']} ({p['asset_class']}) "
+                    f"score={p['composite_score_avg']} "
+                    f"features=[{ff}]"
+                )
+            for p in patterns.get("cost_traps", []):
+                ff = ", ".join(p.get("feature_family", [])[:3]) or "any"
+                lines.append(
+                    f"[COST_TRAP] {p['archetype']} ({p['asset_class']}) "
+                    f"burden={p['cost_burden_avg']} "
+                    f"features=[{ff}]"
+                )
+            ctx["pattern_intelligence"] = (
+                "\n".join(lines) if lines else "No pattern data yet."
+            )
+        except Exception as e:
+            ctx["pattern_intelligence"] = f"Pattern fetch failed: {e}"
+
+        try:
+            import os
+            mutation_enabled = os.environ.get("MUTATION_INTELLIGENCE", "OFF") == "ON"
+            if not mutation_enabled:
+                ctx["mutation_intelligence"] = "Mutation Intelligence DISABLED via env."
+            else:
+                mutations = await self.db_client.get_mutation_leaderboard()
+                if mutations:
+                    m_lines = []
+                    for m in mutations:
+                        if m["conversion_rate"] is None:
+                            continue
+                        if m["conversion_rate"] > 30 and m["avg_score_delta"] > 0:
+                            m_lines.append(f"[HIGH CONVICTION] {m['mutation_type']} (conv={m['conversion_rate']}%, delta={m['avg_score_delta']:+.2f})")
+                        elif m["conversion_rate"] < 10 and m["avg_score_delta"] < 0:
+                            m_lines.append(f"[AVOID] {m['mutation_type']} (conv={m['conversion_rate']}%, delta={m['avg_score_delta']:+.2f})")
+                        else:
+                            m_lines.append(f"[NEUTRAL] {m['mutation_type']} (conv={m['conversion_rate']}%, delta={m['avg_score_delta']:+.2f})")
+                    ctx["mutation_intelligence"] = "\n".join(m_lines) if m_lines else "No actionable mutation data."
+                else:
+                    ctx["mutation_intelligence"] = "No mutation data available."
+        except Exception as e:
+            ctx["mutation_intelligence"] = f"Mutation fetch failed: {e}"
+
+        # ─────────────────────────────────────────────────────────
+        # COST INTELLIGENCE CONTEXT (NEW)
+        # ─────────────────────────────────────────────────────────
+        if self._cost_intelligence_enabled:
+            try:
+                cost_priors = generate_cost_priors(
+                    asset_class=self._asset_class,
+                    archetype=self._archetype,
+                    trade_frequency_target=None,  # Let ECIL use archetype defaults
+                )
+                ctx["cost_intelligence"] = (
+                    f"EXECUTION COST AWARENESS (Advisory):\n"
+                    f"{cost_priors['cost_principle']}\n\n"
+                    f"FREQUENCY GUIDANCE:\n{cost_priors['frequency_guidance']}\n\n"
+                    f"COST AVOIDANCE:\n{cost_priors['cost_avoidance']}\n\n"
+                    f"EDGE REQUIREMENT:\n{cost_priors['edge_requirement']}"
+                )
+                rt_cost_bps = estimate_round_trip_cost(self._asset_class, bps=True)
+                ctx["cost_metrics"] = f"Round-trip cost: {rt_cost_bps:.0f} bps"
+            except Exception as e:
+                logger.warning(f"{self.name}: Cost intelligence fetch failed: {e}")
+                ctx["cost_intelligence"] = "Cost Intelligence UNAVAILABLE"
+                ctx["cost_metrics"] = ""
+        else:
+            ctx["cost_intelligence"] = "Cost Intelligence DISABLED via env"
+            ctx["cost_metrics"] = ""
+
         return ctx
 
     # ─────────────────────────────────────────────────────────
@@ -539,6 +647,15 @@ class IdeatorAgentV2(BaseAgent):
             f"Reason internally. No markdown, no prose outside JSON."
         )
 
+        # Build cost intelligence block if enabled
+        cost_block = ""
+        if self._cost_intelligence_enabled:
+            cost_block = f"""
+\n=== EXECUTION COST INTELLIGENCE (ADVISORY) ===
+{ctx.get("cost_intelligence", "Cost Intelligence DISABLED")}
+{ctx.get("cost_metrics", "")}
+"""
+
         user_prompt = f"""Design ONE {archetype} strategy for 1-minute {asset} data.
 
 Market: {ctx["snapshot_line"] or "no live data"}
@@ -548,6 +665,11 @@ Recent failures: {ctx["failure_summary"]}
 Working strategies: {ctx["success_summary"]}
 Avoid names: {recent}
 
+Structural Intelligence (learned patterns):
+{ctx.get("pattern_intelligence", "No pattern data yet.")}
+
+Mutation Intelligence (proven evolutionary priors):
+{ctx.get("mutation_intelligence", "Mutation Intelligence DISABLED")}{cost_block}
 APPROVED FEATURES (use ONLY these exact names):
   rsi_14, macd, macd_signal, ema_12, ema_26, sma_20,
   bollinger_upper, bollinger_lower, vwap,
@@ -602,7 +724,7 @@ Output ONLY this JSON:
             if f == -1:
                 raise ValueError("No JSON in response")
 
-            spec = json.loads(cleaned[f:l+1])
+            spec = json.loads(cleaned[f : l + 1])
             spec["asset_class"] = asset
             spec = normalize_strategy(spec)
             valid, reason = validate_strategy(spec)
@@ -637,7 +759,17 @@ Output ONLY this JSON:
         key = (asset, archetype)
 
         variants = DIVERSE_TEMPLATES.get(key, DIVERSE_TEMPLATES[("equity", "momentum")])
-        entry, exit_ = random.choice(variants)
+
+        # Pattern-informed template selection: prefer winning feature families
+        pat = ctx.get("pattern_intelligence", "")
+        if "[WIN]" in pat and archetype in pat:
+            # Use first variant (optimized path) when this archetype is winning
+            entry, exit_ = variants[0]
+        elif "[AVOID]" in pat and archetype in pat:
+            # Use last variant (less aggressive) when this archetype is losing
+            entry, exit_ = variants[-1]
+        else:
+            entry, exit_ = random.choice(variants)
 
         # Regime-aware threshold adjustments
         if regime in ("oversold", "oversold/bearish"):

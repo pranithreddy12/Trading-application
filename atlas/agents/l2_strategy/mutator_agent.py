@@ -32,6 +32,11 @@ from atlas.agents.l2_strategy.viability_score import (
     classify_viability,
 )
 
+from atlas.core.execution_cost_intelligence import (
+    cost_efficiency_delta,
+    cost_efficiency_score,
+)
+
 
 # Mutation family taxonomy — governs how we classify and learn from mutations
 class MutationFamily(str, Enum):
@@ -568,6 +573,10 @@ class MutatorAgent(BaseAgent):
             "sharpe": candidate.get("sharpe", candidate.get("holdout_sharpe", 0)),
             "entry_count": entry_c,
             "total_trades": trades,
+            "composite_score": candidate.get("composite_score"),
+            "cost_efficiency_score": cost_efficiency_score(
+                candidate.get("total_return", 0.0), trades
+            ),
         }
         for (
             child_id,
@@ -579,18 +588,34 @@ class MutatorAgent(BaseAgent):
             child_complexity,
             predicted_delta,
         ) in mutated_ids:
+            # Compute cost efficiency delta (NEW)
+            cost_eff_delta = cost_efficiency_delta(
+                parent_net_return=candidate.get("total_return", 0.0),
+                parent_trade_count=trades,
+                child_net_return=0.0,
+                child_trade_count=0,
+            )
+            
+            child_metrics = {
+                "sharpe": 0,
+                "entry_count": 0,
+                "total_trades": 0,
+                "cost_efficiency_delta": cost_eff_delta,
+            }
+            
             await self.db_client.save_mutation_record(
                 parent_id=strategy_id,
                 child_id=child_id,
                 mutation_type=qualified_type,
                 changed_fields=mut_fields,
                 parent_metrics=parent_metrics,
-                child_metrics={"sharpe": 0, "entry_count": 0, "total_trades": 0},
+                child_metrics=child_metrics,
             )
             logger.info(
                 f"  Mutant [{mut_family}] {qualified_type}: "
                 f"complexity {parent_complexity}->{child_complexity}, "
-                f"predicted_entry_delta {predicted_delta:+d}"
+                f"predicted_entry_delta {predicted_delta:+d}, "
+                f"cost_eff_delta={cost_eff_delta:+.6f}"
             )
 
         # Publish signals for new strategies

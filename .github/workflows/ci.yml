@@ -1,0 +1,134 @@
+name: CI — Validation Harness + Governance Checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  DOCKER_COMPOSE_FILE: docker-compose.yml
+  API_PORT: 8000
+
+jobs:
+  validation:
+    runs-on: ubuntu-latest
+    services:
+      timescaledb:
+        image: timescale/timescaledb:latest-pg15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: atlas
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d atlas"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+      redis:
+        image: redis:7
+        ports:
+          - 6380:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r atlas/requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Verify infrastructure connectivity
+        run: |
+          python -c "
+          import asyncio
+          import asyncpg
+          async def check():
+              conn = await asyncpg.connect('postgresql://postgres:password@localhost:5433/atlas')
+              v = await conn.fetchval('SELECT version()')
+              print(f'TimescaleDB: {v.split(\",\")[0]}')
+              await conn.close()
+          asyncio.run(check())
+          "
+
+      - name: Initialize schema and auto-migrate
+        run: |
+          python -c "
+          import asyncio, sys
+          sys.path.insert(0, '.')
+          from atlas.config.settings import settings
+          from atlas.data.storage.timescale_client import TimescaleClient
+          async def init():
+              db = TimescaleClient(settings.database_url)
+              await db.connect()
+              print('Schema initialized + auto-migration applied')
+          asyncio.run(init())
+          "
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5433/atlas
+          REDIS_URL: redis://localhost:6380/0
+
+      - name: Start API server
+        run: |
+          nohup python -m uvicorn atlas.api.day4_api:app --host 0.0.0.0 --port ${{ env.API_PORT }} > api.log 2>&1 &
+          sleep 3
+          python -c "import httpx, asyncio; asyncio.run(httpx.AsyncClient().get('http://localhost:${{ env.API_PORT }}/health'))" && echo "API ready"
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5433/atlas
+          REDIS_URL: redis://localhost:6380/0
+
+      - name: Run ValidationHarness (14 stages)
+        run: |
+          python -m atlas.validation.__main__
+        continue-on-error: false
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5433/atlas
+          REDIS_URL: redis://localhost:6380/0
+
+      - name: Run Contract Governance Check
+        run: |
+          python scripts/contract_governance_check.py --json
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5433/atlas
+          REDIS_URL: redis://localhost:6380/0
+
+      - name: Run Event Lineage Check
+        run: |
+          python scripts/event_lineage_check.py --stats
+        env:
+          DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5433/atlas
+          REDIS_URL: redis://localhost:6380/0
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-output
+          path: validation_output/
+          retention-days: 7
+
+      - name: Upload API logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-logs
+          path: api.log
+          retention-days: 7

@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS backtest_results (
     entry_count INT,
     exit_count INT,
     bars_processed INT,
+    short_window_score NUMERIC,
+    score_7d NUMERIC,
+    score_14d NUMERIC,
+    score_30d NUMERIC,
     PRIMARY KEY (strategy_id, start_date, end_date)
 );
 
@@ -218,3 +222,41 @@ CREATE TABLE IF NOT EXISTS mutation_memory (
 );
 CREATE INDEX IF NOT EXISTS idx_mutation_memory_parent ON mutation_memory (parent_strategy_id);
 CREATE INDEX IF NOT EXISTS idx_mutation_memory_child ON mutation_memory (child_strategy_id);
+
+-- 15. combination_memory — tracks parent-child lineage for L2 combiner
+CREATE TABLE IF NOT EXISTS combination_memory (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_a UUID NOT NULL REFERENCES strategies(id),
+    parent_b UUID NOT NULL REFERENCES strategies(id),
+    child_id UUID REFERENCES strategies(id),
+    combination_type TEXT NOT NULL,
+    parent_a_sharpe NUMERIC,
+    parent_b_sharpe NUMERIC,
+    child_sharpe NUMERIC,
+    sharpe_delta NUMERIC,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(parent_a, parent_b, combination_type)
+);
+CREATE INDEX IF NOT EXISTS idx_combination_memory_parent_a ON combination_memory (parent_a);
+CREATE INDEX IF NOT EXISTS idx_combination_memory_parent_b ON combination_memory (parent_b);
+CREATE INDEX IF NOT EXISTS idx_combination_memory_child ON combination_memory (child_id);
+
+-- 16. lifecycle_events — Event Lineage Layer (Day 7b)
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+    id TEXT PRIMARY KEY,
+    trace_id TEXT NOT NULL,
+    strategy_id TEXT,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    parent_event_id TEXT,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle_events (trace_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_strategy ON lifecycle_events (strategy_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage);
+
+-- Add trace_id to strategies
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id);

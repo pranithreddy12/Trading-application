@@ -14,6 +14,7 @@ from atlas.agents.l3_backtest.short_window_evaluator import (
     compute_short_window_metrics,
     compute_composite_short_window_score,
 )
+from atlas.core.event_lineage import EventLineageClient
 
 
 def clean_metrics(obj):
@@ -137,6 +138,7 @@ class BacktestRunner(BaseAgent):
 
     async def process_strategy(self, strategy_record: dict):
         strategy_id = strategy_record["id"]
+        trace_id = strategy_record.get("trace_id")
 
         try:
             code = strategy_record.get("code", "")
@@ -202,6 +204,13 @@ class BacktestRunner(BaseAgent):
                     },
                 )
 
+                await self._log_lifecycle(
+                    trace_id,
+                    strategy_id,
+                    "backtest",
+                    "failed",
+                    {"error": "code_exec_failed"},
+                )
                 return
 
             # =====================================================
@@ -422,6 +431,13 @@ class BacktestRunner(BaseAgent):
                         "reason": f"high_nan_features: {high_nan}",
                     },
                 )
+                await self._log_lifecycle(
+                    trace_id,
+                    strategy_id,
+                    "backtest",
+                    "failed",
+                    {"error": f"high_nan_features: {high_nan}"},
+                )
                 return
 
             # =====================================================
@@ -469,6 +485,18 @@ class BacktestRunner(BaseAgent):
                 },
             )
 
+            await self._log_lifecycle(
+                trace_id,
+                strategy_id,
+                "backtest",
+                "completed",
+                {
+                    "sharpe": results.get("holdout_sharpe", 0.0),
+                    "trades": results.get("total_trades", 0),
+                    "symbol": symbol,
+                },
+            )
+
             logger.info(
                 f"Backtest complete for {strategy_id} | "
                 f"Entries={results.get('entry_count', '?')} | "
@@ -499,6 +527,30 @@ class BacktestRunner(BaseAgent):
                     "reason": "runtime_backtest_error",
                 },
             )
+
+            await self._log_lifecycle(
+                trace_id,
+                strategy_id,
+                "backtest",
+                "failed",
+                {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+            )
+
+    async def _log_lifecycle(self, trace_id, strategy_id, stage, status, metadata=None):
+        if not trace_id:
+            return
+        try:
+            lineage = EventLineageClient(self.timescale)
+            await lineage.create_event(
+                trace_id=trace_id,
+                stage=stage,
+                status=status,
+                actor=self.name,
+                strategy_id=strategy_id,
+                metadata=metadata or {},
+            )
+        except Exception as exc:
+            logger.warning(f"Lifecycle event log failed ({stage}/{status}): {exc}")
 
     async def _run_backtest(
         self, strategy, df: pd.DataFrame, symbol: str = ""

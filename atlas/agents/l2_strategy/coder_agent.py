@@ -14,6 +14,7 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
     normalize_strategy,
     conditions_to_code,
 )
+from atlas.core.event_lineage import EventLineageClient
 
 
 class CoderAgent(BaseAgent):
@@ -60,6 +61,7 @@ class CoderAgent(BaseAgent):
 
     async def _code_strategy(self, strategy_record: dict):
         strategy_id = strategy_record["id"]
+        trace_id = strategy_record.get("trace_id")
 
         try:
             strategy_name = strategy_record["name"]
@@ -112,6 +114,16 @@ class CoderAgent(BaseAgent):
                 except Exception as field_err:
                     logger.warning(f"Compile error field update failed: {field_err}")
 
+                await self._log_lifecycle(
+                    trace_id,
+                    strategy_id,
+                    "coder",
+                    "failed",
+                    {
+                        "error": f"{type(compile_err).__name__}: {str(compile_err)[:200]}"
+                    },
+                )
+
                 try:
                     await self.db_client.log(
                         agent_id="CoderAgent",
@@ -139,6 +151,14 @@ class CoderAgent(BaseAgent):
                 "pending_backtest",
             )
 
+            await self._log_lifecycle(
+                trace_id,
+                strategy_id,
+                "coder",
+                "completed",
+                {"code_len": len(code), "strategy_name": strategy_name},
+            )
+
             logger.info(f"Successfully coded strategy {strategy_id} ({strategy_name})")
 
         except Exception as e:
@@ -154,6 +174,30 @@ class CoderAgent(BaseAgent):
                 )
             except Exception:
                 pass
+
+            await self._log_lifecycle(
+                trace_id,
+                strategy_id,
+                "coder",
+                "failed",
+                {"error": f"{type(e).__name__}: {str(e)[:200]}"},
+            )
+
+    async def _log_lifecycle(self, trace_id, strategy_id, stage, status, metadata=None):
+        if not trace_id:
+            return
+        try:
+            lineage = EventLineageClient(self.db_client)
+            await lineage.create_event(
+                trace_id=trace_id,
+                stage=stage,
+                status=status,
+                actor=self.name,
+                strategy_id=strategy_id,
+                metadata=metadata or {},
+            )
+        except Exception as exc:
+            logger.warning(f"Lifecycle event log failed ({stage}/{status}): {exc}")
 
     def _sanitize_class_name(self, strategy_name: str) -> str:
         """

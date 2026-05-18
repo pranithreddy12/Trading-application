@@ -3,8 +3,10 @@ import json
 from datetime import datetime, time, timedelta
 import pytz
 
+from loguru import logger
 from atlas.core.agent_base import BaseAgent
 from atlas.core.claude_client import claude as _claude
+from atlas.core.event_lineage import EventLineageClient
 
 
 class IntelligenceBriefAgent(BaseAgent):
@@ -101,7 +103,23 @@ class IntelligenceBriefAgent(BaseAgent):
         if hasattr(self.db_client, "_execute_insert"):
             await self.db_client._execute_insert(query, params)
         else:
-            # Handle mock scenario if execute is provided directly
             pass
+
+        try:
+            lineage = EventLineageClient(self.db_client)
+            await lineage.create_event(
+                trace_id=f"brief_{datetime.utcnow().strftime('%Y%m%d_%H%M')}",
+                stage="brief",
+                status="completed",
+                actor=self.name,
+                strategy_id=None,
+                metadata={
+                    "regime": fetched_data["market_regime"],
+                    "strategies_count": params["strategies_count"],
+                    "claude_success": "brief_text" in dir() or brief_text is not None,
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"Brief lifecycle log failed: {exc}")
 
         return brief_text

@@ -41,7 +41,7 @@ class FeatureAgent:
         cp = getattr(self.settings, "crypto_pairs", "").split(",")
         wl = getattr(self.settings, "watchlist", "").split(",")
         self.symbols = list(set(s.strip().upper() for s in cp + wl if s.strip()))
-        
+
         if not self.symbols:
             self.symbols = ["BTCUSDT", "ETHUSDT", "NVDA", "AAPL", "SPY"]
 
@@ -258,8 +258,12 @@ class FeatureAgent:
             if feature_df.empty:
                 logger.warning(f"Not enough data for features: {symbol}")
                 return
-                
-            generated_keys = [c for c in feature_df.columns if c not in ["timestamp", "open", "high", "low", "close", "volume"]]
+
+            generated_keys = [
+                c
+                for c in feature_df.columns
+                if c not in ["timestamp", "open", "high", "low", "close", "volume"]
+            ]
             logger.info(f"Generated features for {symbol}: {generated_keys}")
 
             await self.insert_features(symbol, feature_df)
@@ -287,7 +291,7 @@ class FeatureAgent:
 
             tasks = [self.process_symbol(symbol) for symbol in self.symbols]
 
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
             logger.info("=== Feature cycle complete ===")
 

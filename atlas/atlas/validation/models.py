@@ -18,6 +18,8 @@ class DefectType(str, Enum):
     HEALTH_FAILURE = "health_failure"
     LATENCY_FAILURE = "latency_failure"
     AUDIT_FAILURE = "audit_failure"
+    CONTRACT_FAILURE = "contract_failure"
+    EVENT_LINEAGE_FAILURE = "event_lineage_failure"
 
 
 class StageStatus(str, Enum):

@@ -1,0 +1,411 @@
+{
+  "timestamp": 1778922952.3867414,
+  "db_url_present": true,
+  "bcrypt_installed": true,
+  "schema_apply": {
+    "executed_statements": 42,
+    "errors": [
+      "COMMENT ON COLUMN api_keys.revoked_at IS 'Soft delete marker... => (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class 'asyncpg.exceptions.PostgresSyntaxError'>: unterminated quoted string at or near \"'Soft delete marker\"\n[SQL: COMMENT ON COLUMN api_keys.revoked_at IS 'Soft delete marker]\n(Background on this error at: https://sqlalche.me/e/20/f405)",
+      "NULL means active'... => (sqlalchemy.dialects.postgresql.asyncpg.ProgrammingError) <class 'asyncpg.exceptions.PostgresSyntaxError'>: syntax error at or near \"NULL\"\n[SQL: NULL means active']\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+    ],
+    "api_keys_count": 7,
+    "api_request_audit_count": 51
+  },
+  "generated_roles": [
+    "admin",
+    "follower",
+    "monitor",
+    "read_only",
+    "revoked_read_only",
+    "stress_read_only",
+    "trader"
+  ],
+  "health": {
+    "status": 200,
+    "headers": {
+      "date": "Sat, 16 May 2026 09:16:03 GMT",
+      "server": "uvicorn",
+      "x-ratelimit-limit": "60",
+      "x-ratelimit-remaining": "59",
+      "x-ratelimit-reset": "1778923020",
+      "content-length": "268",
+      "content-type": "application/json",
+      "Connection": "close"
+    },
+    "body": {
+      "status": "healthy",
+      "timestamp": "2026-05-16T09:16:06.852697",
+      "components": {
+        "api": "operational",
+        "db": "connected",
+        "redis": "connected",
+        "copy_trader": "unknown",
+        "validator": "unknown"
+      },
+      "last_heartbeat": {
+        "copy_trader": null,
+        "validator": null
+      },
+      "latency_ms": 20,
+      "version": "1.0.0"
+    }
+  },
+  "copy_status": {
+    "status": 200,
+    "headers": {
+      "date": "Sat, 16 May 2026 09:16:03 GMT",
+      "server": "uvicorn",
+      "x-ratelimit-limit": "60",
+      "x-ratelimit-remaining": "58",
+      "x-ratelimit-reset": "1778923020",
+      "content-length": "195",
+      "content-type": "application/json",
+      "Connection": "close"
+    },
+    "body": {
+      "timestamp": "2026-05-16T09:16:06.930927",
+      "running_state": "stale",
+      "active_leaders": 1,
+      "active_followers": 1,
+      "last_latency_ms": 96.5,
+      "failures": 0,
+      "filled_orders": 2,
+      "queue_depth": null,
+      "latency_ms": 39
+    }
+  },
+  "route_matrix": {
+    "no_token": {
+      "/portfolio": 401,
+      "/positions": 401,
+      "/copy/logs": 401,
+      "/copy/status": 401,
+      "/risk": 401
+    },
+    "invalid_token": {
+      "/portfolio": 401,
+      "/positions": 401,
+      "/copy/logs": 401,
+      "/copy/status": 401,
+      "/risk": 401
+    },
+    "read_only": {
+      "/portfolio": 200,
+      "/positions": 200,
+      "/copy/logs": 200,
+      "/copy/status": 200,
+      "/risk": 200
+    },
+    "trader": {
+      "/portfolio": 200,
+      "/positions": 200,
+      "/copy/logs": 200,
+      "/copy/status": 200,
+      "/risk": 200
+    },
+    "admin": {
+      "/portfolio": 200,
+      "/positions": 200,
+      "/copy/logs": 200,
+      "/copy/status": 200,
+      "/risk": 200
+    },
+    "revoked": {
+      "/portfolio": 401,
+      "/positions": 401,
+      "/copy/logs": 401,
+      "/copy/status": 401,
+      "/risk": 401
+    },
+    "follower": {
+      "/portfolio": 403,
+      "/positions": 403,
+      "/copy/logs": 200,
+      "/copy/status": 200,
+      "/risk": 403
+    }
+  },
+  "rate_limit_stress": {
+    "statuses": [
+      200,
+      200,
+      200,
+      200,
+      200,
+      429,
+      429,
+      429,
+      429,
+      429,
+      429,
+      429
+    ],
+    "has_429": true,
+    "first_429_headers": {
+      "X-RateLimit-Limit": null,
+      "X-RateLimit-Remaining": null,
+      "X-RateLimit-Reset": null
+    }
+  },
+  "restart_probe": {
+    "pre_restart_status": 200,
+    "post_restart_status": 200
+  },
+  "audit_rows": [
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:59.894192+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:49.157521+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:49.110392+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:49.078262+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:49.033012+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:48.991421+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:48.970627+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:48.934706+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 429,
+      "created_at": "2026-05-16T09:16:48.911355+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:48.873024+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:48.849153+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:48.815643+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:48.770618+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:48.727766+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 403,
+      "created_at": "2026-05-16T09:16:39.347997+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:39.318705+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.289475+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.248689+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.229069+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:39.195903+00:00"
+    },
+    {
+      "endpoint": "/risk",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:39.178644+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.158317+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:39.113271+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.087759+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:39.014895+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.958100+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.861594+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.840581+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.809782+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.747316+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.701513+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.667183+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.611036+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.554175+00:00"
+    },
+    {
+      "endpoint": "/copy/logs",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.533564+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 403,
+      "created_at": "2026-05-16T09:16:38.488568+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.423873+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.400077+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.342292+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:38.293422+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.236231+00:00"
+    },
+    {
+      "endpoint": "/positions",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:38.191963+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 403,
+      "created_at": "2026-05-16T09:16:38.152381+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:30.301446+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:21.217791+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:21.174531+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:16.432325+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:12.607541+00:00"
+    },
+    {
+      "endpoint": "/portfolio",
+      "status_code": 401,
+      "created_at": "2026-05-16T09:16:06.968212+00:00"
+    },
+    {
+      "endpoint": "/copy/status",
+      "status_code": 200,
+      "created_at": "2026-05-16T09:16:06.932351+00:00"
+    }
+  ],
+  "copy_idempotency": {
+    "total_rows": 2,
+    "distinct_leader_follower_pairs": 2,
+    "no_duplicates": true
+  }
+}

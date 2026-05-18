@@ -139,6 +139,51 @@ class TimescaleClient:
         self.db_url = db_url
         self.engine = create_async_engine(self.db_url, echo=False)
 
+    async def get_mutation_leaderboard(self) -> list[dict]:
+        """
+        Retrieves the aggregated mutation intelligence (ranked by conversion rate and average delta).
+        Provides IdeatorAgent with empirical priors of what mutations are currently working.
+        """
+        query = """
+            SELECT
+                mutation_type,
+                COUNT(*)                                                AS total,
+                COUNT(*) FILTER (WHERE improved = TRUE)                 AS improved_count,
+                COUNT(*) FILTER (WHERE improved = FALSE)                AS failed_count,
+                ROUND(AVG(parent_composite_score)::numeric, 2)          AS avg_parent_score,
+                ROUND(AVG(child_composite_score)::numeric, 2)           AS avg_child_score,
+                ROUND(AVG(score_delta)::numeric, 2)                     AS avg_score_delta,
+                ROUND(
+                    100.0 * COUNT(*) FILTER (WHERE improved = TRUE)
+                    / NULLIF(COUNT(*) FILTER (WHERE improved IS NOT NULL), 0),
+                    1
+                )                                                       AS conversion_rate_pct
+            FROM mutation_memory
+            GROUP BY mutation_type
+            ORDER BY conversion_rate_pct DESC NULLS LAST, avg_score_delta DESC NULLS LAST
+        """
+        try:
+            async with self.engine.connect() as conn:
+                res = await conn.execute(text(query))
+                rows = res.fetchall()
+                results = []
+                for r in rows:
+                    results.append({
+                        "mutation_type":      r[0],
+                        "total":              int(r[1]),
+                        "improved":           int(r[2]),
+                        "failed":             int(r[3]),
+                        "avg_parent_score":   float(r[4]) if r[4] is not None else None,
+                        "avg_child_score":    float(r[5]) if r[5] is not None else None,
+                        "avg_score_delta":    float(r[6]) if r[6] is not None else None,
+                        "conversion_rate":    float(r[7]) if r[7] is not None else None,
+                    })
+                return results
+        except Exception as e:
+            from loguru import logger
+            logger.error(f"Error fetching mutation leaderboard: {e}")
+            return []
+
     async def connect(self) -> None:
         """Verify the database connection and apply missing migrations."""
         async with self.engine.begin() as conn:
@@ -254,22 +299,99 @@ class TimescaleClient:
                     GROUP BY time, symbol
                 """)
                 )
-                await conn.execute(
-                    text(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_features_wide_time_symbol ON features_wide (time, symbol)"
-                    )
+            await conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_features_wide_time_symbol ON features_wide (time, symbol)"
                 )
+            )
+            # pattern_memory — PatternAgent storage
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS pattern_memory (
+                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                    pattern_type TEXT NOT NULL,
+                    archetype TEXT,
+                    feature_family TEXT[],
+                    asset_class TEXT,
+                    timeframe TEXT,
+                    regime TEXT,
+                    composite_score_avg NUMERIC,
+                    short_window_score_avg NUMERIC,
+                    sharpe_avg NUMERIC,
+                    win_rate_avg NUMERIC,
+                    total_trades_avg NUMERIC,
+                    cost_burden_avg NUMERIC,
+                    sample_size INT DEFAULT 0,
+                    confidence_score NUMERIC DEFAULT 0.0,
+                    recommendation TEXT,
+                    motif_details JSONB,
+                    detected_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_pattern_memory_type ON pattern_memory (pattern_type)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_pattern_memory_archetype ON pattern_memory (archetype)"
+                )
+            )
+            # lifecycle_events — Event Lineage Layer (Day 7b)
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS lifecycle_events (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    strategy_id TEXT,
+                    stage TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    parent_event_id TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle_events (trace_id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_strategy ON lifecycle_events (strategy_id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage)"
+                )
+            )
+            # trace_id column on strategies
+            await conn.execute(
+                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT")
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id)"
+                )
+            )
 
     async def _execute_insert(self, query: str, params: Dict[str, Any]) -> None:
         async with self.engine.begin() as conn:
             await conn.execute(text(query), params)
 
     async def write_bars(self, symbol: str, data: BarData) -> None:
-        """Insert to market_data_l1"""
+        """Insert to market_data_l1 (idempotent — skips duplicates)"""
         is_crypto = data.asset_class == "crypto"
         query = """
             INSERT INTO market_data_l1 (time, symbol, open, high, low, close, volume, source, interval, asset_class, ingestion_time)
             VALUES (:time, :symbol, :open, :high, :low, :close, :volume, :source, :interval, :asset_class, NOW())
+            ON CONFLICT (time, symbol) DO NOTHING
         """
         params = data.model_dump()
         params["symbol"] = symbol
@@ -585,6 +707,67 @@ class TimescaleClient:
                 )
             return out
 
+    async def get_top_patterns(
+        self,
+        min_confidence: float = 0.0,
+        limit: int = 10,
+    ) -> dict[str, list[dict]]:
+        """Returns pattern intelligence grouped by type.
+        Returns: {winning: [...], losing: [...], cost_traps: [...], neutral: [...]}
+        """
+        query = """
+            SELECT pattern_type, archetype, feature_family, asset_class,
+                   composite_score_avg, short_window_score_avg, sharpe_avg,
+                   win_rate_avg, total_trades_avg, cost_burden_avg,
+                   sample_size, confidence_score, recommendation, motif_details
+            FROM pattern_memory
+            WHERE confidence_score >= :min_conf
+            ORDER BY composite_score_avg DESC
+            LIMIT :lim
+        """
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(query), {"min_conf": min_confidence, "lim": limit}
+            )
+            rows = result.fetchall()
+
+        grouped: dict[str, list[dict]] = {
+            "winning": [],
+            "losing": [],
+            "cost_traps": [],
+            "neutral": [],
+        }
+        for r in rows:
+            motif = {
+                "pattern_type": r[0],
+                "archetype": r[1],
+                "feature_family": r[2]
+                if isinstance(r[2], list)
+                else (list(r[2]) if r[2] else []),
+                "asset_class": r[3],
+                "composite_score_avg": float(r[4]) if r[4] is not None else 0,
+                "short_window_score_avg": float(r[5]) if r[5] is not None else 0,
+                "sharpe_avg": float(r[6]) if r[6] is not None else 0,
+                "win_rate_avg": float(r[7]) if r[7] is not None else 0,
+                "total_trades_avg": float(r[8]) if r[8] is not None else 0,
+                "cost_burden_avg": float(r[9]) if r[9] is not None else 0,
+                "sample_size": int(r[10]) if r[10] is not None else 0,
+                "confidence_score": float(r[11]) if r[11] is not None else 0,
+                "recommendation": r[12] or "",
+                "motif_details": r[13] if isinstance(r[13], dict) else {},
+            }
+            ptype = r[0]
+            if ptype == "winning_motif":
+                grouped["winning"].append(motif)
+            elif ptype == "losing_motif":
+                grouped["losing"].append(motif)
+            elif ptype == "cost_trap":
+                grouped["cost_traps"].append(motif)
+            else:
+                grouped["neutral"].append(motif)
+
+        return grouped
+
     async def get_recent_strategy_names(self, limit: int = 10) -> list[str]:
         """Returns: last N strategy names to avoid duplicates"""
         query = """
@@ -649,6 +832,7 @@ class TimescaleClient:
         prompt: Optional[str] = None,
         raw_response: Optional[str] = None,
         strategy_signature: Optional[str] = None,
+        generation_batch: Optional[str] = None,
     ) -> str:
         """Inserts to strategies table, returns strategy_id (uuid)."""
         import uuid
@@ -675,9 +859,10 @@ class TimescaleClient:
             )
 
         strategy_id = str(uuid.uuid4())
+        trace_id = uuid.uuid4().hex[:16]
         query = """
-            INSERT INTO strategies (id, name, code, parameters, status, created_at, author_agent, prompt, raw_response, normalized_strategy, strategy_signature)
-            VALUES (:id, :name, :code, :parameters, :status, :created_at, :author_agent, :prompt, :raw_response, :normalized_strategy, :strategy_signature)
+            INSERT INTO strategies (id, name, code, parameters, status, created_at, author_agent, prompt, raw_response, normalized_strategy, strategy_signature, trace_id, generation_batch)
+            VALUES (:id, :name, :code, :parameters, :status, :created_at, :author_agent, :prompt, :raw_response, :normalized_strategy, :strategy_signature, :trace_id, :generation_batch)
         """
         params = {
             "id": strategy_id,
@@ -691,8 +876,31 @@ class TimescaleClient:
             "raw_response": raw_response,
             "normalized_strategy": json.dumps(spec),
             "strategy_signature": strategy_signature,
+            "trace_id": trace_id,
+            "generation_batch": generation_batch,
         }
         await self._execute_insert(query, params)
+
+        # Log first lifecycle event
+        try:
+            from atlas.core.event_lineage import EventLineageClient
+
+            lineage = EventLineageClient(self)
+            await lineage.create_event(
+                trace_id=trace_id,
+                stage="ideator",
+                status="completed",
+                actor=author_agent,
+                strategy_id=strategy_id,
+                metadata={
+                    "strategy_name": strategy_name,
+                    "status": status,
+                    "mode": spec.get("mode", "unknown"),
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to log lifecycle event: {exc}")
+
         return strategy_id
 
     async def update_strategy_status(
@@ -774,7 +982,7 @@ class TimescaleClient:
     async def get_strategies_by_status(self, status: str) -> list[dict]:
         """Returns all strategies matching status"""
         query = """
-            SELECT id, name, code, parameters, status, created_at, author_agent
+            SELECT id, name, code, parameters, status, created_at, author_agent, trace_id
             FROM strategies
             WHERE status = :status
         """
@@ -794,6 +1002,7 @@ class TimescaleClient:
                         "status": r[4],
                         "created_at": r[5],
                         "author_agent": r[6],
+                        "trace_id": str(r[7]) if r[7] else None,
                     }
                 )
             return out
@@ -1191,12 +1400,16 @@ class TimescaleClient:
                 (parent_strategy_id, child_strategy_id, mutation_type, changed_fields,
                  parent_sharpe, child_sharpe, sharpe_delta,
                  parent_entry_count, child_entry_count,
-                 parent_trades, child_trades)
+                 parent_trades, child_trades,
+                 parent_composite_score, child_composite_score,
+                 score_delta, improved)
             VALUES
                 (:parent_id, :child_id, :mutation_type, :changed_fields,
                  :parent_sharpe, :child_sharpe, :sharpe_delta,
                  :parent_entry_count, :child_entry_count,
-                 :parent_trades, :child_trades)
+                 :parent_trades, :child_trades,
+                 :parent_composite_score, :child_composite_score,
+                 :score_delta, :improved)
         """
         p_sharpe = float(
             parent_metrics.get("sharpe", parent_metrics.get("holdout_sharpe", 0))
@@ -1204,6 +1417,17 @@ class TimescaleClient:
         c_sharpe = float(
             child_metrics.get("sharpe", child_metrics.get("holdout_sharpe", 0))
         )
+        import json
+        if isinstance(changed_fields, (dict, list)):
+            changed_fields = json.dumps(changed_fields)
+
+        p_composite = parent_metrics.get("composite_score") or parent_metrics.get("composite_score_avg")
+        c_composite = child_metrics.get("composite_score") or child_metrics.get("composite_score_avg")
+        p_composite = float(p_composite) if p_composite is not None else None
+        c_composite = float(c_composite) if c_composite is not None else None
+        score_delta = (c_composite - p_composite) if (p_composite is not None and c_composite is not None) else None
+        improved = (score_delta > 0) if score_delta is not None else None
+
         params = {
             "parent_id": parent_id,
             "child_id": child_id,
@@ -1216,6 +1440,10 @@ class TimescaleClient:
             "child_entry_count": int(child_metrics.get("entry_count", 0)),
             "parent_trades": int(parent_metrics.get("total_trades", 0)),
             "child_trades": int(child_metrics.get("total_trades", 0)),
+            "parent_composite_score": p_composite,
+            "child_composite_score": c_composite,
+            "score_delta": score_delta,
+            "improved": improved,
         }
         await self._execute_insert(query, params)
 

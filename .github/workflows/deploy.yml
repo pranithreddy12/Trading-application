@@ -1,0 +1,79 @@
+name: Deploy — Governance-Gated Deployment
+
+on:
+  workflow_run:
+    workflows: [CI — Validation Harness + Governance Checks]
+    types: [completed]
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  governance-gate:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deployment tools
+        run: |
+          pip install httpx
+
+      - name: Gate 1 — Contract Governance (Route ↔ Auth ↔ Scope)
+        run: |
+          echo "Checking route contract compliance..."
+          python scripts/contract_governance_check.py --json
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+
+      - name: Gate 2 — Event Lineage Integrity
+        run: |
+          echo "Checking lifecycle trace integrity..."
+          python scripts/event_lineage_check.py --stats --json
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+
+      - name: Gate 3 — Health + Liveness (Production API)
+        run: |
+          python -c "
+          import httpx, asyncio, sys
+          async def check():
+              async with httpx.AsyncClient(timeout=10) as c:
+                  r = await c.get('https://${{ vars.API_HOST }}/health')
+                  data = r.json()
+                  assert data.get('status') == 'ok', f'Health check failed: {data}'
+                  print(f'Production health OK: {data}')
+          asyncio.run(check())
+          "
+
+      - name: Deploy (Terraform apply or rsync)
+        run: |
+          echo "All governance gates passed. Proceeding with deployment..."
+          echo "Deploy step would go here — rsync, docker deploy, or terraform apply"
+          # Uncomment for Terraform:
+          # cd atlas/infrastructure/terraform && terraform init && terraform apply -auto-approve
+
+  governance-failed-notification:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify deployment blocked
+        run: |
+          echo "==============================================="
+          echo "  DEPLOYMENT BLOCKED — Governance Gate Failed"
+          echo "  Workflow: ${{ github.event.workflow_run.name }}"
+          echo "  Run #${{ github.event.workflow_run.run_number }}"
+          echo "  Conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "==============================================="
+          exit 1

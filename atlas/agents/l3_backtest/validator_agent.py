@@ -8,6 +8,15 @@ from atlas.agents.l3_backtest.short_window_evaluator import (
     compute_composite_short_window_score,
     is_short_window,
 )
+from atlas.core.execution_cost_intelligence import (
+    cost_efficiency_score,
+    friction_burden_pct,
+    expected_edge_per_trade,
+    classify_cost_profile,
+    get_cost_governance_thresholds,
+    estimate_round_trip_cost,
+    is_cost_trap,
+)
 
 
 class ValidatorAgent(BaseAgent):
@@ -42,6 +51,10 @@ class ValidatorAgent(BaseAgent):
         "max_entry_pct": 0.50,  # entries must not exceed 50% of bars
         "max_exit_pct": 0.95,  # exits must not exceed 95% of bars
     }
+    
+    # Cost Governance Rules (NEW) — applied based on trade frequency
+    # These enforce economic viability, not just statistical viability
+    COST_GOVERNANCE_ENABLED = True  # Can be set via env var later
 
     @property
     def RULES(self):
@@ -133,6 +146,30 @@ class ValidatorAgent(BaseAgent):
                     metrics["pass_rate_pct"] = pass_rate
             except Exception:
                 metrics["pass_rate_pct"] = None
+
+            # ─────────────────────────────────────────────────────────
+            # COST GOVERNANCE METRICS (NEW)
+            # ─────────────────────────────────────────────────────────
+            try:
+                net_return = float(self._safe(self._extract(result, "total_return"), 0.0))
+                gross_return = float(self._safe(self._extract(result, "total_return_gross"), net_return))
+                asset_class = result.get("asset_class", "crypto")
+                
+                ce_score = cost_efficiency_score(net_return, trades)
+                friction = friction_burden_pct(gross_return, net_return)
+                edge_per_trade_bps = expected_edge_per_trade(net_return, trades, asset_class)
+                
+                cost_profile = classify_cost_profile(net_return, trades, gross_return, asset_class)
+                
+                metrics["cost_efficiency_score"] = round(ce_score, 6)
+                metrics["friction_burden_pct"] = round(friction * 100, 1)
+                metrics["expected_edge_per_trade_bps"] = round(edge_per_trade_bps, 1)
+                metrics["cost_profile_classification"] = cost_profile.classification.value
+                metrics["cost_governance_status"] = "PASS" if not is_cost_trap(net_return, trades, asset_class) else "ALERT"
+                
+            except Exception as e:
+                logger.warning(f"Failed to compute cost governance metrics for {strategy_id}: {e}")
+                metrics["cost_governance_status"] = "ERROR"
 
             # Log and persist
             try:
@@ -228,7 +265,7 @@ class ValidatorAgent(BaseAgent):
 
     def _diagnose(self, score: float, result: dict) -> list[str]:
         diag = []
-        eval_mode = result.get("evaluation_mode", "institutional")
+        eval_mode = self._extract(result, "evaluation_mode") or "institutional"
         trades = int(self._safe(self._extract(result, "total_trades")))
         win_rate = self._safe(self._extract(result, "win_rate"))
         pf = self._safe(self._extract(result, "profit_factor"), 1.0)
@@ -315,11 +352,13 @@ class ValidatorAgent(BaseAgent):
     def _run_tests(self, result: dict) -> tuple[bool, list[str]]:
         failed = []
 
-        eval_mode = result.get("evaluation_mode", "institutional")
+        eval_mode = self._extract(result, "evaluation_mode") or "institutional"
         drawdown = self._safe(self._extract(result, "max_drawdown"))
         trades = int(self._safe(self._extract(result, "total_trades")))
         win_rate = self._safe(self._extract(result, "win_rate"))
         pf = self._safe(self._extract(result, "profit_factor"), 1.0)
+        net_return = self._safe(self._extract(result, "total_return"), 0.0)
+        asset_class = result.get("asset_class", "crypto")
 
         if eval_mode == "short_window":
             composite = self._safe(self._extract(result, "composite_score"))
@@ -333,6 +372,44 @@ class ValidatorAgent(BaseAgent):
                 failed.append(f"win_rate {win_rate:.2f} < 0.20")
             if pf < 0.60:
                 failed.append(f"profit_factor {pf:.2f} < 0.60")
+            
+            # ─────────────────────────────────────────────────────────
+            # COST GOVERNANCE GATE (NEW)
+            # ─────────────────────────────────────────────────────────
+            if self.COST_GOVERNANCE_ENABLED and trades >= 3:
+                try:
+                    # Get cost governance thresholds for this frequency
+                    thresholds = get_cost_governance_thresholds(trades, asset_class)
+                    edge_per_trade_bps = expected_edge_per_trade(net_return, trades, asset_class)
+                    rt_cost_bps = estimate_round_trip_cost(asset_class, bps=True)
+                    
+                    # Check if edge survives costs
+                    min_edge_bps = thresholds["min_edge_per_trade_bps"]
+                    if edge_per_trade_bps < min_edge_bps:
+                        failed.append(
+                            f"cost_trap: edge {edge_per_trade_bps:.1f} bps < "
+                            f"min {min_edge_bps:.1f} bps for {trades} trades"
+                        )
+                    
+                    # Check win rate threshold
+                    min_wr = thresholds["min_win_rate"]
+                    if win_rate < min_wr:
+                        failed.append(
+                            f"cost_fragile: win_rate {win_rate:.2f} < "
+                            f"min {min_wr:.2f} for {trades} trades"
+                        )
+                    
+                    # Check profit factor threshold
+                    min_pf = thresholds["min_profit_factor"]
+                    if pf < min_pf:
+                        failed.append(
+                            f"cost_margin: profit_factor {pf:.2f} < "
+                            f"min {min_pf:.2f} for {trades} trades"
+                        )
+                        
+                except Exception as e:
+                    logger.warning(f"Cost governance check failed: {e}")
+            
             return len(failed) == 0, failed
 
         # INSTITUTIONAL MODE
@@ -350,6 +427,23 @@ class ValidatorAgent(BaseAgent):
             failed.append(f"win_rate {win_rate:.2f} < {self.RULES['min_win_rate']}")
         if pf < self.RULES["min_profit_factor"]:
             failed.append(f"profit_factor {pf:.2f} < {self.RULES['min_profit_factor']}")
+        
+        # ─────────────────────────────────────────────────────────
+        # COST GOVERNANCE GATE FOR INSTITUTIONAL (NEW)
+        # ─────────────────────────────────────────────────────────
+        if self.COST_GOVERNANCE_ENABLED and trades >= 30:
+            try:
+                thresholds = get_cost_governance_thresholds(trades, asset_class)
+                edge_per_trade_bps = expected_edge_per_trade(net_return, trades, asset_class)
+                
+                min_edge_bps = thresholds["min_edge_per_trade_bps"]
+                if edge_per_trade_bps < min_edge_bps:
+                    failed.append(
+                        f"cost_trap: edge {edge_per_trade_bps:.1f} bps < "
+                        f"min {min_edge_bps:.1f} bps for {trades} trades"
+                    )
+            except Exception as e:
+                logger.warning(f"Cost governance check failed (institutional): {e}")
 
         # Overfitting guard
         ratio = self.RULES["overfit_ratio"]
@@ -386,61 +480,9 @@ class ValidatorAgent(BaseAgent):
         return stability
 
     def _compute_composite_score(self, result: dict) -> tuple[float, str]:
-        eval_mode = result.get("evaluation_mode", "institutional")
-
-        if eval_mode == "short_window":
-            raw_score = self._safe(self._extract(result, "composite_score"))
-            if raw_score > 0:
-                score = raw_score
-            else:
-                score = compute_composite_short_window_score(
-                    {
-                        "total_return": self._safe(
-                            self._extract(result, "total_return")
-                        ),
-                        "profit_factor": self._safe(
-                            self._extract(result, "profit_factor"), 1.0
-                        ),
-                        "win_rate": self._safe(self._extract(result, "win_rate")),
-                        "max_drawdown": self._safe(
-                            self._extract(result, "max_drawdown")
-                        )
-                        / 100.0,
-                        "total_trades": int(
-                            self._safe(self._extract(result, "total_trades"))
-                        ),
-                        "cost_burden": self._safe(self._extract(result, "cost_burden")),
-                    }
-                )
-            score = round(score, 1)
-            grade = (
-                "A"
-                if score >= 70
-                else "B"
-                if score >= 50
-                else "C"
-                if score >= 30
-                else "F"
-            )
-            return score, grade
-
-        # INSTITUTIONAL MODE — Sharpe-based composite
-        sharpe = self._safe(self._extract(result, "sharpe_ratio", "sharpe"))
-        win_rate = self._safe(self._extract(result, "win_rate"))
-        trades = int(self._safe(self._extract(result, "total_trades")))
-        drawdown = self._safe(self._extract(result, "max_drawdown"))  # negative %
-        pf = self._safe(self._extract(result, "profit_factor"), 1.0)
-        stab = self._compute_stability(result)
-
-        s = min(max(sharpe / 2.5, 0.0), 1.0)  # 2.5 Sharpe  → 1.0
-        w = min(max((win_rate - 0.4) / 0.3, 0.0), 1.0)  # 70% WR      → 1.0
-        t = min(max((trades - 5) / 95.0, 0.0), 1.0)  # 100 trades  → 1.0
-        d = min(max(1.0 + drawdown / 30.0, 0.0), 1.0)  # -30% DD     → 0.0
-        p = min(max((pf - 0.8) / 2.2, 0.0), 1.0)  # PF 3.0      → 1.0
-
-        score = (
-            s * 0.30 + w * 0.15 + t * 0.10 + d * 0.10 + p * 0.15 + stab * 0.20
-        ) * 100
+        from atlas.core.score_contract import compute_institutional_score
+        
+        score = compute_institutional_score(result)
         score = round(score, 1)
         grade = (
             "A" if score >= 70 else "B" if score >= 50 else "C" if score >= 30 else "F"

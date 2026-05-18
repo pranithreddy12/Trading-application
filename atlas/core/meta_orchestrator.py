@@ -20,7 +20,7 @@ class MetaOrchestrator:
             for a in self.agents
             if a.name in ["EquityIngestorAgent", "CryptoIngestorAgent"]
         ]
-        await asyncio.gather(*(a.start() for a in l1_agents))
+        await asyncio.gather(*(a.start() for a in l1_agents), return_exceptions=True)
 
         # 2. Wait 5s, then FeatureAgent
         await asyncio.sleep(5)
@@ -36,7 +36,9 @@ class MetaOrchestrator:
 
         ideator_agents = [a for a in self.agents if "IdeatorAgent" in a.name]
         if ideator_agents:
-            await asyncio.gather(*(a.start() for a in ideator_agents))
+            await asyncio.gather(
+                *(a.start() for a in ideator_agents), return_exceptions=True
+            )
 
         asyncio.create_task(self._monitor_loop())
 

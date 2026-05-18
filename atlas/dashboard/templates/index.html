@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATLAS Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: #0f1117; color: #e1e4e8; line-height: 1.5; padding: 20px; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
+  header h1 { font-size: 20px; font-weight: 600; color: #58a6ff; }
+  header .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: 500; }
+  header .status-badge.ok { background: #0d4429; color: #3fb950; }
+  header .status-badge.err { background: #441a1a; color: #f85149; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #8b949e; margin-bottom: 12px; }
+  .card .value { font-size: 28px; font-weight: 700; color: #e1e4e8; }
+  .card .sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
+  .card .bar { display: flex; gap: 4px; margin-top: 8px; }
+  .card .bar .seg { height: 6px; border-radius: 3px; min-width: 2px; }
+  .section-title { font-size: 16px; font-weight: 600; color: #e1e4e8; margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 1px solid #30363d; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 10px; color: #8b949e; font-weight: 600; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 8px 10px; border-bottom: 1px solid #21262d; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+  .chip.green { background: #0d4429; color: #3fb950; }
+  .chip.yellow { background: #3d2e00; color: #d29922; }
+  .chip.red { background: #441a1a; color: #f85149; }
+  .chip.blue { background: #0c2d6b; color: #58a6ff; }
+  .chip.gray { background: #21262d; color: #8b949e; }
+  .flex { display: flex; gap: 12px; flex-wrap: wrap; }
+  .flex-grow { flex: 1; min-width: 0; }
+  .mt-8 { margin-top: 8px; }
+  .mb-8 { margin-bottom: 8px; }
+  .text-right { text-align: right; }
+  .text-center { text-align: center; }
+  .error-banner { background: #441a1a; border: 1px solid #f85149; border-radius: 6px; padding: 12px 16px; margin-bottom: 16px; color: #f85149; font-size: 13px; }
+  .loading { text-align: center; padding: 40px; color: #8b949e; }
+  .loading::after { content: ''; display: inline-block; width: 20px; height: 20px; border: 2px solid #30363d; border-top-color: #58a6ff; border-radius: 50%; animation: spin .8s linear infinite; margin-left: 8px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: #21262d; color: #8b949e; margin-right: 4px; }
+  .scroll-x { overflow-x: auto; }
+  .last-updated { text-align: right; font-size: 12px; color: #484f58; padding: 4px 0; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="container" id="app">
+  <header>
+    <h1>ATLAS Operator Dashboard</h1>
+    <div>
+      <span class="status-badge" id="statusBadge">--</span>
+      <span style="color:#484f58;font-size:12px;margin-left:12px" id="lastUpdate"></span>
+    </div>
+  </header>
+  <div id="errors"></div>
+  <div id="content" class="loading">Loading dashboard data...</div>
+</div>
+<script>
+const API = '';
+const REFRESH_MS = 30000;
+let refreshTimer = null;
+
+function statusChip(s) {
+  if (!s) return '<span class="chip gray">unknown</span>';
+  const lo = s.toLowerCase();
+  if (lo.includes('completed') || lo.includes('pass') || lo.includes('healthy') || lo.includes('active') || lo.includes('filled') || lo.includes('validated')) return '<span class="chip green">'+s+'</span>';
+  if (lo.includes('failed') || lo.includes('error') || lo.includes('unhealthy') || lo.includes('stale')) return '<span class="chip red">'+s+'</span>';
+  if (lo.includes('pending') || lo.includes('running') || lo.includes('skipped')) return '<span class="chip yellow">'+s+'</span>';
+  return '<span class="chip blue">'+s+'</span>';
+}
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(url+' returned '+r.status);
+  return r.json();
+}
+
+function renderOverview(data) {
+  const { system, strategies, backtests, lineage, patterns, briefs, execution, auth } = data;
+  const badges = [];
+  if (system) { badges.push({ label: 'Status', val: system.status || '?', cls: system.status==='ok'?'green':'red' }); }
+  document.getElementById('statusBadge').className = 'status-badge '+(system&&system.status==='ok'?'ok':'err');
+  document.getElementById('statusBadge').textContent = system ? system.status : 'UNKNOWN';
+
+  const cards = [
+    { label: 'Strategies', val: (strategies&&strategies.total)||0, sub: strategies&&strategies.by_status?Object.keys(strategies.by_status).length+' statuses':'--' },
+    { label: 'Backtests', val: (backtests&&backtests.total)||0, sub: 'completed' },
+    { label: 'Lineage Events', val: (lineage&&lineage.total_events)||0, sub: ((lineage&&lineage.total_traces)||0)+' traces' },
+    { label: 'Patterns', val: (patterns&&patterns.total)||0, sub: 'extracted' },
+    { label: 'Briefs', val: (briefs&&briefs.total)||0, sub: 'generated' },
+    { label: 'Paper Trades', val: (execution&&execution.total_paper_trades)||0, sub: 'executed' },
+    { label: 'Active API Keys', val: (auth&&auth.active_api_keys)||0, sub: 'authenticated' },
+  ];
+
+  let html = '<div class="grid">';
+  for (const c of cards) {
+    html += '<div class="card"><h3>'+c.label+'</h3><div class="value">'+c.val+'</div><div class="sub">'+c.sub+'</div></div>';
+  }
+  html += '</div>';
+
+  if (strategies && strategies.by_status) {
+    html += '<div class="card"><h3>Strategy Status Distribution</h3><div class="bar">';
+    const entries = Object.entries(strategies.by_status);
+    const total = entries.reduce((s, [,v]) => s+v, 0) || 1;
+    const colors = ['#3fb950','#d29922','#f85149','#58a6ff','#8b949e','#bc8cff'];
+    entries.forEach(([k,v], i) => {
+      const pct = (v/total*100).toFixed(1);
+      html += '<div class="seg" style="flex:'+v+';background:'+colors[i%colors.length]+'" title="'+k+': '+v+' ('+pct+'%)"></div>';
+    });
+    html += '</div><div class="sub" style="margin-top:6px">';
+    entries.forEach(([k,v], i) => {
+      html += '<span style="display:inline-block;margin-right:12px;font-size:11px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+colors[i%colors.length]+';margin-right:4px"></span>'+k+': '+v+'</span>';
+    });
+    html += '</div></div>';
+  }
+
+  document.getElementById('overview').innerHTML = html;
+}
+
+function renderPipeline(data) {
+  const { strategy_statuses, lifecycle_events, recent_strategies } = data;
+  let html = '<div class="flex">';
+  html += '<div class="card flex-grow"><h3>Strategy Statuses</h3>';
+  if (strategy_statuses && Object.keys(strategy_statuses).length) {
+    html += '<table><tr><th>Status</th><th class="text-right">Count</th></tr>';
+    for (const [k,v] of Object.entries(strategy_statuses)) {
+      html += '<tr><td>'+statusChip(k)+'</td><td class="text-right">'+v+'</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<div class="sub">No strategies found</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="card flex-grow"><h3>Lifecycle Funnel</h3>';
+  if (lifecycle_events && Object.keys(lifecycle_events).length) {
+    html += '<table><tr><th>Stage</th><th class="text-right">Completed</th><th class="text-right">Failed</th></tr>';
+    for (const [stage, statuses] of Object.entries(lifecycle_events)) {
+      const ok = statuses['completed']||0;
+      const fail = statuses['failed']||0;
+      html += '<tr><td><span class="tag">'+stage+'</span></td><td class="text-right">'+ok+'</td><td class="text-right">'+fail+'</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<div class="sub">No lifecycle data</div>';
+  }
+  html += '</div>';
+  html += '</div>';
+
+  html += '<div class="card mt-8"><h3>Recent Strategies</h3>';
+  if (recent_strategies && recent_strategies.length) {
+    html += '<div class="scroll-x"><table><tr><th>Name</th><th>Status</th><th>Author</th><th>Created</th></tr>';
+    for (const s of recent_strategies) {
+      html += '<tr><td><strong>'+esc(s.name||s.id.slice(0,8))+'</strong></td><td>'+statusChip(s.status)+'</td><td>'+(s.author||'--')+'</td><td style="color:#8b949e;font-size:12px">'+fmtTime(s.created_at)+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class="sub">No recent strategies</div>';
+  }
+  html += '</div>';
+
+  document.getElementById('pipeline').innerHTML = html;
+}
+
+function renderTraces(data) {
+  const { recent_events, most_active_traces } = data;
+  let html = '<div class="flex"><div class="card flex-grow"><h3>Recent Lifecycle Events</h3>';
+  if (recent_events && recent_events.length) {
+    html += '<div class="scroll-x"><table><tr><th>Trace</th><th>Stage</th><th>Status</th><th>Actor</th><th>Strategy</th><th>Time</th></tr>';
+    for (const e of recent_events) {
+      html += '<tr><td style="font-family:monospace;font-size:11px">'+(e.trace_id||'').slice(0,12)+'</td>'
+        + '<td><span class="tag">'+esc(e.stage)+'</span></td>'
+        + '<td>'+statusChip(e.status)+'</td>'
+        + '<td>'+(e.actor||'--')+'</td>'
+        + '<td style="font-family:monospace;font-size:11px;color:#8b949e">'+(e.strategy_id?e.strategy_id.slice(0,8):'--')+'</td>'
+        + '<td style="color:#8b949e;font-size:12px">'+fmtTime(e.created_at)+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class="sub">No events recorded</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="card flex-grow"><h3>Most Active Traces</h3>';
+  if (most_active_traces && Object.keys(most_active_traces).length) {
+    html += '<table><tr><th>Trace ID</th><th class="text-right">Events</th></tr>';
+    for (const [id, cnt] of Object.entries(most_active_traces)) {
+      html += '<tr><td style="font-family:monospace;font-size:11px">'+(id||'').slice(0,16)+'</td><td class="text-right">'+cnt+'</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<div class="sub">No trace data</div>';
+  }
+  html += '</div></div>';
+  document.getElementById('traces').innerHTML = html;
+}
+
+function renderPatterns(data) {
+  const { by_type, patterns } = data;
+  let html = '<div class="flex"><div class="card flex-grow"><h3>Patterns by Type</h3>';
+  if (by_type && Object.keys(by_type).length) {
+    const total = Object.values(by_type).reduce((s,v) => s+v, 0) || 1;
+    html += '<table><tr><th>Type</th><th class="text-right">Count</th><th>%</th></tr>';
+    for (const [k,v] of Object.entries(by_type)) {
+      html += '<tr><td><span class="chip blue">'+esc(k)+'</span></td><td class="text-right">'+v+'</td><td style="color:#8b949e;font-size:12px">'+(v/total*100).toFixed(1)+'%</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<div class="sub">No patterns recorded</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="card flex-grow"><h3>Top Patterns by Confidence</h3>';
+  if (patterns && patterns.length) {
+    html += '<div class="scroll-x"><table><tr><th>Type</th><th>Archetype</th><th class="text-right">Score</th><th class="text-right">Confidence</th><th>Recommendation</th></tr>';
+    for (const p of patterns) {
+      html += '<tr><td><span class="chip blue">'+esc(p.type)+'</span></td>'
+        + '<td>'+esc(p.archetype)+'</td>'
+        + '<td class="text-right">'+(p.composite_score||0).toFixed(1)+'</td>'
+        + '<td class="text-right">'+(p.confidence||0).toFixed(2)+'</td>'
+        + '<td style="font-size:12px;color:#8b949e">'+(p.recommendation?esc(p.recommendation).slice(0,40):'--')+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class="sub">No patterns data</div>';
+  }
+  html += '</div></div>';
+  document.getElementById('patterns').innerHTML = html;
+}
+
+function renderRisk(data) {
+  const { copy_trader, positions, pnl, kill_switch } = data;
+  let html = '<div class="grid">';
+
+  html += '<div class="card"><h3>Copy Executions</h3><div class="value">'+(copy_trader?.total_executions||0)+'</div>';
+  if (copy_trader?.by_status) {
+    html += '<div class="sub" style="margin-top:6px">';
+    for (const [k,v] of Object.entries(copy_trader.by_status)) {
+      html += '<span style="margin-right:8px;font-size:11px">'+k+': '+v+'</span>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="card"><h3>Active Leaders</h3><div class="value">'+(copy_trader?.active_leaders||0)+'</div><div class="sub">followers: '+(copy_trader?.active_followers||0)+'</div></div>';
+  html += '<div class="card"><h3>Open Positions</h3><div class="value">'+(positions?.open||0)+'</div><div class="sub">paper trades</div></div>';
+  html += '<div class="card"><h3>Total PnL</h3><div class="value" style="color:'+((pnl?.total||0)>=0?'#3fb950':'#f85149')+'">$'+(pnl?.total||0).toLocaleString(undefined,{minimumFractionDigits:2})+'</div><div class="sub">all paper trades</div></div>';
+  html += '<div class="card"><h3>Kill Switch</h3><div class="value" style="color:'+(kill_switch?.active?'#f85149':'#3fb950')+'">'+(kill_switch?.active?'ACTIVE':'INACTIVE')+'</div>';
+  if (kill_switch?.active) {
+    html += '<div class="sub" style="color:#f85149">SYSTEM HALTED</div>';
+  }
+  html += '</div>';
+
+  html += '</div>';
+  document.getElementById('risk').innerHTML = html;
+}
+
+function esc(s) {
+  if (typeof s !== 'string') s = String(s||'');
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function fmtTime(t) {
+  if (!t) return '--';
+  try { return new Date(t).toLocaleString(); } catch(_) { return t; }
+}
+
+async function refreshAll() {
+  try {
+    const [overview, pipeline, traces, patterns, risk] = await Promise.all([
+      fetchJSON(API+'/dashboard/api/overview'),
+      fetchJSON(API+'/dashboard/api/pipeline'),
+      fetchJSON(API+'/dashboard/api/traces?limit=20'),
+      fetchJSON(API+'/dashboard/api/patterns'),
+      fetchJSON(API+'/dashboard/api/risk'),
+    ]);
+    document.getElementById('errors').innerHTML = '';
+    renderOverview(overview);
+    renderPipeline(pipeline);
+    renderTraces(traces);
+    renderPatterns(patterns);
+    renderRisk(risk);
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+    document.getElementById('content').classList.remove('loading');
+  } catch (err) {
+    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString()+' (error)';
+    document.getElementById('errors').innerHTML = '<div class="error-banner">Failed to load dashboard: '+esc(err.message)+'</div>';
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('content').innerHTML = ''
+    + '<div id="overview"></div>'
+    + '<div class="section-title">Pipeline</div><div id="pipeline"></div>'
+    + '<div class="section-title">Lifecycle Traces</div><div id="traces"></div>'
+    + '<div class="section-title">Pattern Intelligence</div><div id="patterns"></div>'
+    + '<div class="section-title">Risk & CopyTrader</div><div id="risk"></div>'
+    + '<div class="last-updated">Auto-refreshes every 30s</div>';
+  refreshAll();
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refreshAll, REFRESH_MS);
+});
+</script>
+</body>
+</html>

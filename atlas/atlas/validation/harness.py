@@ -30,6 +30,8 @@ from atlas.validation.stages.audit_stage import AuditStage
 from atlas.validation.stages.restart_stage import RestartStage
 from atlas.validation.stages.latency_stage import LatencyStage
 from atlas.validation.stages.mutator_check import MutatorCheckStage
+from atlas.validation.stages.contract_stage import ContractStage
+from atlas.validation.stages.event_lineage_stage import EventLineageStage
 
 
 class ValidationContext:
@@ -63,6 +65,8 @@ class ValidationHarness:
             AuditStage(),
             RestartStage(),
             MutatorCheckStage(),
+            ContractStage(),
+            EventLineageStage(),
             LatencyStage(),
         ]
 
