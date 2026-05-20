@@ -151,6 +151,22 @@ class AuthService:
     
     def __init__(self, db: TimescaleClient):
         self.db = db
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _track_background_task(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+        self._background_tasks.add(task)
+
+        def _finalize(done_task: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("AuthService background task failed")
+
+        task.add_done_callback(_finalize)
+        return task
     
     async def generate_api_key(self,
                                user_id: str,
@@ -294,7 +310,7 @@ class AuthService:
                 return None
             
             # Touch last_used_at (asynchronous, don't block)
-            asyncio.create_task(self.touch_last_used(key.id))
+            self._track_background_task(asyncio.create_task(self.touch_last_used(key.id)))
             
             return key
             

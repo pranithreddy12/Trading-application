@@ -142,6 +142,10 @@ class TimescaleClient:
         self.db_url = db_url
         self.engine = create_async_engine(self.db_url, echo=False)
 
+    async def close(self) -> None:
+        """Dispose the SQLAlchemy engine and release pooled connections."""
+        await self.engine.dispose()
+
     async def get_mutation_leaderboard(self) -> list[dict]:
         """
         Retrieves the aggregated mutation intelligence (ranked by conversion rate and average delta).

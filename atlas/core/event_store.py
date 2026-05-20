@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -67,8 +68,10 @@ class EventStore:
 
     def __init__(self, db):
         self.db = db
-        self._cache: dict[str, list[StoredEvent]] = {}
-        self._snapshot_cache: dict[str, dict] = {}
+        self._cache: OrderedDict[str, list[StoredEvent]] = OrderedDict()
+        self._snapshot_cache: OrderedDict[str, dict] = OrderedDict()
+        self._max_cache_entries = 1024
+        self._max_snapshot_entries = 256
         self._lock = asyncio.Lock()
 
     # ───────────────────────────────────────────────
@@ -168,6 +171,7 @@ class EventStore:
         """Get all events for an aggregate, ordered by sequence."""
         if aggregate_id in self._cache:
             events = self._cache[aggregate_id]
+            self._cache.move_to_end(aggregate_id)
             if from_sequence > 0:
                 events = [e for e in events if e.sequence >= from_sequence]
             return events[:limit]
@@ -187,7 +191,7 @@ class EventStore:
             )
             events = self._rows_to_events(result.fetchall())
 
-        self._cache[aggregate_id] = events
+        self._store_cached_events(aggregate_id, events)
         if from_sequence > 0:
             events = [e for e in events if e.sequence >= from_sequence]
         return events
@@ -288,12 +292,13 @@ class EventStore:
                 "version": version,
             },
         )
-        self._snapshot_cache[aggregate_id] = state
+        self._store_cached_snapshot(aggregate_id, state)
         return snapshot_id
 
     async def get_snapshot(self, aggregate_id: str) -> Optional[dict]:
         """Get the latest snapshot for an aggregate."""
         if aggregate_id in self._snapshot_cache:
+            self._snapshot_cache.move_to_end(aggregate_id)
             return self._snapshot_cache[aggregate_id]
 
         async with self.db.engine.connect() as conn:
@@ -312,7 +317,7 @@ class EventStore:
                 state = row[0]
                 if isinstance(state, str):
                     state = json.loads(state)
-                self._snapshot_cache[aggregate_id] = state
+                self._store_cached_snapshot(aggregate_id, state)
                 return state
         return None
 
@@ -514,3 +519,15 @@ class EventStore:
                 )
             )
         return out
+
+    def _store_cached_events(self, aggregate_id: str, events: list[StoredEvent]) -> None:
+        self._cache[aggregate_id] = events
+        self._cache.move_to_end(aggregate_id)
+        while len(self._cache) > self._max_cache_entries:
+            self._cache.popitem(last=False)
+
+    def _store_cached_snapshot(self, aggregate_id: str, state: dict) -> None:
+        self._snapshot_cache[aggregate_id] = state
+        self._snapshot_cache.move_to_end(aggregate_id)
+        while len(self._snapshot_cache) > self._max_snapshot_entries:
+            self._snapshot_cache.popitem(last=False)

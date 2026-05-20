@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 from datetime import datetime
+from collections import OrderedDict
 from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,12 +29,30 @@ redis_client = redis.from_url(REDIS_URL)
 db_client = TimescaleClient(DB_URL)
 auth_service = None
 
-_rate_buckets: dict[str, list[tuple[str, float]]] = {}
+_rate_buckets: OrderedDict[str, list[tuple[str, float]]] = OrderedDict()
+_RATE_BUCKET_WINDOW_SECONDS = 60.0
+_RATE_BUCKET_MAX_KEYS = 5000
+
+
+def _prune_rate_buckets(now: float) -> None:
+    stale_keys = [
+        bucket_key
+        for bucket_key, bucket in _rate_buckets.items()
+        if not bucket or now - bucket[-1][1] >= _RATE_BUCKET_WINDOW_SECONDS
+    ]
+    for bucket_key in stale_keys:
+        _rate_buckets.pop(bucket_key, None)
+
+    while len(_rate_buckets) > _RATE_BUCKET_MAX_KEYS:
+        _rate_buckets.popitem(last=False)
 
 
 @app.middleware("http")
 async def auth_and_rate_limit_middleware(request: Request, call_next):
     try:
+        now = time.time()
+        _prune_rate_buckets(now)
+
         if request.url.path.startswith("/ws/") or request.url.path.startswith(
             "/dashboard"
         ):
@@ -68,14 +87,21 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
                 bucket_key = f"rl:{key_data.get('id', 'unknown')}"
                 if bucket_key not in _rate_buckets:
                     _rate_buckets[bucket_key] = []
+                else:
+                    _rate_buckets.move_to_end(bucket_key)
                 bucket = _rate_buckets[bucket_key]
-                bucket[:] = [(r, t) for r, t in bucket if now - t < 60]
+                bucket[:] = [
+                    (r, t)
+                    for r, t in bucket
+                    if now - t < _RATE_BUCKET_WINDOW_SECONDS
+                ]
                 if len(bucket) >= rate_limit:
                     return JSONResponse(
                         status_code=429,
-                        content={"error": "rate_limit_exceeded", "retry_after": 60},
+                        content={"error": "rate_limit_exceeded", "retry_after": _RATE_BUCKET_WINDOW_SECONDS},
                     )
                 bucket.append((key_data.get("role", ""), now))
+                _prune_rate_buckets(now)
                 response = await call_next(request)
                 return response
 
@@ -108,7 +134,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await redis_client.close()
+    await redis_client.aclose()
+    await db_client.close()
 
 
 @app.get("/health")

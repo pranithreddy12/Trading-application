@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -36,7 +36,7 @@ class MonitoringFabric:
         self.db = db
         self.redis = redis_client
         self._counters: dict[str, int] = defaultdict(int)
-        self._latencies: dict[str, list[float]] = defaultdict(list)
+        self._latencies: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=1000))
         self._lock = asyncio.Lock()
         self._flush_interval = 60  # Flush to DB every 60 seconds
         self._flush_task: Optional[asyncio.Task] = None
@@ -90,13 +90,14 @@ class MonitoringFabric:
 
             for metric, values in self._latencies.items():
                 if values:
+                    sample_values = list(values)
                     snapshot["latencies"][metric] = {
-                        "count": len(values),
-                        "min": round(min(values), 2),
-                        "max": round(max(values), 2),
-                        "avg": round(sum(values) / len(values), 2),
-                        "p50": round(sorted(values)[len(values) // 2], 2),
-                        "p95": round(sorted(values)[int(len(values) * 0.95)], 2),
+                        "count": len(sample_values),
+                        "min": round(min(sample_values), 2),
+                        "max": round(max(sample_values), 2),
+                        "avg": round(sum(sample_values) / len(sample_values), 2),
+                        "p50": round(sorted(sample_values)[len(sample_values) // 2], 2),
+                        "p95": round(sorted(sample_values)[int(len(sample_values) * 0.95)], 2),
                     }
 
             # Persist to DB

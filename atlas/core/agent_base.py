@@ -81,11 +81,20 @@ class BaseAgent(ABC):
         if self.status != AgentStatus.ERROR.value:
             self.status = AgentStatus.STOPPED.value
 
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
+        pending_tasks = [
+            task
+            for task in (self._heartbeat_task, self._main_task)
+            if task and not task.done()
+        ]
 
-        if self._main_task:
-            self._main_task.cancel()
+        for task in pending_tasks:
+            task.cancel()
+
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        self._heartbeat_task = None
+        self._main_task = None
 
         logger.info(f"Agent {self.name} stopped.")
 

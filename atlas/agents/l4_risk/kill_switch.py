@@ -246,7 +246,13 @@ class KillSwitch(BaseAgent):
                 LIMIT 1
                 """
             )
-            return bool(halted)
+            if isinstance(halted, bool):
+                return halted
+            if isinstance(halted, (int, float)):
+                return halted == 1
+            if isinstance(halted, str):
+                return halted.lower() in ("1", "true", "t", "yes", "y")
+            return False
 
         result = await client.hget("kill_switch:state", "active")
         return result == b"1"

@@ -66,33 +66,73 @@ class CopyTraderAgent(BaseAgent):
         self.allocator = CopyCapitalAllocator(redis_client, db_client)
         self._processed_set_key = "copy:processed_leader_orders"
         self._poll_interval = 1.0
+        self._background_tasks: set[asyncio.Task] = set()
+        self._allocator_started = False
+
+    def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+
+        def _finalize(done_task: asyncio.Task) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("CopyTrader background task failed")
+
+        task.add_done_callback(_finalize)
+        return task
+
+    async def _shutdown_background_tasks(self) -> None:
+        pending = [task for task in self._background_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_tasks.clear()
+
+        if self._allocator_started:
+            try:
+                await self.allocator.stop()
+            except Exception:
+                logger.exception("Failed to stop copy capital allocator")
+            finally:
+                self._allocator_started = False
 
     async def run(self):
         logger.info("CopyTraderV1 starting")
-
-        # Load follower mappings into memory (refreshed periodically)
-        followers = await self._load_followers()
-
-        # Subscribe to execution fills for leader signals
-        async def _callback(msg: dict):
-            await self._handle_leader_fill(msg, followers)
-
-        # Start Capital Allocator
-        await self.allocator.start()
-
-        # Start a background refresher for followers
-        asyncio.create_task(self._refresh_followers_loop())
-        
-        # Start polling loop as background task (in addition to subscribe)
-        asyncio.create_task(self._polling_loop(followers))
-
-        # Subscribe to Redis pubsub; if fails, polling will still work
         try:
-            await self.messaging.subscribe(Channel.EXECUTION_FILLS, _callback)
-        except Exception as e:
-            logger.warning(f"PubSub subscribe failed, but polling is active: {e}")
-            # Keep running with polling
-            await asyncio.Event().wait()
+            # Load follower mappings into memory (refreshed periodically)
+            followers = await self._load_followers()
+
+            # Subscribe to execution fills for leader signals
+            async def _callback(msg: dict):
+                await self._handle_leader_fill(msg, followers)
+
+            # Start Capital Allocator
+            await self.allocator.start()
+            self._allocator_started = True
+
+            # Start a background refresher for followers
+            self._track_background_task(asyncio.create_task(self._refresh_followers_loop()))
+
+            # Start polling loop as background task (in addition to subscribe)
+            self._track_background_task(asyncio.create_task(self._polling_loop(followers)))
+
+            # Subscribe to Redis pubsub; if fails, polling will still work
+            try:
+                await self.messaging.subscribe(Channel.EXECUTION_FILLS, _callback)
+            except Exception as e:
+                logger.warning(f"PubSub subscribe failed, but polling is active: {e}")
+                # Keep running with polling
+                await asyncio.Event().wait()
+        finally:
+            await self._shutdown_background_tasks()
+
+    async def stop(self):
+        await super().stop()
+        await self._shutdown_background_tasks()
 
     async def _polling_loop(self, followers_map: Dict[str, List[Dict[str, Any]]]):
         """Background polling loop for leader_orders table"""

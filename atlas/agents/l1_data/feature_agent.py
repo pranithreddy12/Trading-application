@@ -37,6 +37,7 @@ class FeatureAgent:
     def __init__(self):
         self.settings = get_settings()
         self.db_pool = None
+        self._stop_event = asyncio.Event()
         # Combine both crypto and equity lists
         cp = getattr(self.settings, "crypto_pairs", "").split(",")
         wl = getattr(self.settings, "watchlist", "").split(",")
@@ -49,12 +50,21 @@ class FeatureAgent:
     # DB
     # ============================================================
     async def connect(self):
+        if self.db_pool is not None:
+            return
+
         db_url = self.settings.database_url.replace(
             "postgresql+asyncpg://", "postgresql://"
         )
 
         self.db_pool = await asyncpg.create_pool(db_url)
         logger.info("✓ FeatureAgent connected to TimescaleDB")
+
+    async def stop(self):
+        self._stop_event.set()
+        if self.db_pool is not None:
+            await self.db_pool.close()
+            self.db_pool = None
 
     # ============================================================
     # Data Fetch
@@ -284,23 +294,30 @@ class FeatureAgent:
 
         logger.info(f"✓ FeatureAgent running for symbols: {self.symbols}")
 
-        while True:
-            cycle_start = datetime.now(timezone.utc)
+        try:
+            while not self._stop_event.is_set():
+                cycle_start = datetime.now(timezone.utc)
 
-            logger.info("=== Feature cycle start ===")
+                logger.info("=== Feature cycle start ===")
 
-            tasks = [self.process_symbol(symbol) for symbol in self.symbols]
+                tasks = [self.process_symbol(symbol) for symbol in self.symbols]
 
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-            logger.info("=== Feature cycle complete ===")
+                logger.info("=== Feature cycle complete ===")
 
-            # Align roughly to 60s bars
-            elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+                # Align roughly to 60s bars, but remain responsive to stop()
+                elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()
+                sleep_time = max(5, 60 - elapsed)
 
-            sleep_time = max(5, 60 - elapsed)
-
-            await asyncio.sleep(sleep_time)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_time)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if self.db_pool is not None:
+                await self.db_pool.close()
+                self.db_pool = None
 
 
 # ============================================================

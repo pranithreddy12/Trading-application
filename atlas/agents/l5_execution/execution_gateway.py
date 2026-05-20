@@ -79,6 +79,7 @@ class ExecutionGateway(BaseAgent):
         self._recovery_complete = False
         self._active_lease_order_keys: set[str] = set()
         self._lease_maintenance_task: Optional[asyncio.Task] = None
+        self._background_tasks: set[asyncio.Task] = set()
 
         # Scout intelligence cache for dynamic execution adaptation
         self._scout_liquidity_regime = ""
@@ -104,6 +105,29 @@ class ExecutionGateway(BaseAgent):
                 logger.debug(f"Lease maintenance cycle failed: {e}")
                 await asyncio.sleep(5)
 
+    def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+
+        def _finalize(done_task: asyncio.Task) -> None:
+            self._background_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception(f"{self.name}: background task failed")
+
+        task.add_done_callback(_finalize)
+        return task
+
+    async def _shutdown_background_tasks(self) -> None:
+        pending = [task for task in self._background_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._background_tasks.clear()
+
     async def run(self):
         logger.info(f"{self.name} starting up.")
 
@@ -114,7 +138,9 @@ class ExecutionGateway(BaseAgent):
             logger.warning("Recovery reconciliation did not complete; execution remains locked.")
 
         # 1b. Start lease maintenance background task (distributed governance)
-        self._lease_maintenance_task = asyncio.create_task(self._lease_maintenance())
+        self._lease_maintenance_task = self._track_background_task(
+            asyncio.create_task(self._lease_maintenance())
+        )
 
         # 1c. Detect and recover lost orders from this instance
         try:
@@ -156,13 +182,16 @@ class ExecutionGateway(BaseAgent):
                                 strategy = await self._get_strategy_by_id(strategy_id)
                                 if strategy:
                                     # Create a task so we don't block the pubsub loop
-                                    asyncio.create_task(self.execute(strategy))
+                                    self._track_background_task(
+                                        asyncio.create_task(self.execute(strategy))
+                                    )
                     except Exception as e:
                         logger.error(f"Error processing signal: {e}")
 
                 await asyncio.sleep(0.1)
         finally:
             await pubsub.unsubscribe()
+            await self._shutdown_background_tasks()
 
     async def _get_strategy_by_id(self, strategy_id: str) -> Optional[dict]:
         from sqlalchemy.sql import text
@@ -236,7 +265,7 @@ class ExecutionGateway(BaseAgent):
                 LIMIT 1
                 """
             )
-            if halted:
+            if halted in (True, 1, "1", "true", "TRUE"):
                 raise Exception("KILL_SWITCH_ACTIVE")
         except Exception as exc:
             if str(exc) == "KILL_SWITCH_ACTIVE":
@@ -395,6 +424,8 @@ class ExecutionGateway(BaseAgent):
             return
         try:
             scout = await self.db.get_latest_scout_intelligence()
+            if not isinstance(scout, dict):
+                return
             self._scout_liquidity_regime = scout.get("liquidity", {}).get("regime", "")
             self._scout_execution_regime = scout.get("execution", {}).get("regime", "")
             self._scout_cache_time = now

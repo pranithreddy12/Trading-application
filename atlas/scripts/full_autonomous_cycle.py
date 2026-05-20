@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import suppress
 
 from loguru import logger
 from redis.asyncio import Redis
@@ -131,9 +130,13 @@ async def _start_agents(agents: list) -> list[asyncio.Task]:
 
 
 async def _stop_agents(agents: list) -> None:
-    for agent in reversed(agents):
-        with suppress(Exception):
-            await agent.stop()
+    stop_results = await asyncio.gather(
+        *(agent.stop() for agent in reversed(agents)),
+        return_exceptions=True,
+    )
+    for agent, result in zip(reversed(agents), stop_results):
+        if isinstance(result, Exception):
+            logger.warning(f"Agent stop failed — {getattr(agent, 'name', agent)}: {result}")
 
 
 async def main() -> None:
@@ -233,8 +236,15 @@ async def main() -> None:
             await asyncio.sleep(5)
     finally:
         await _stop_agents(agents)
-        with suppress(Exception):
+        try:
             await redis_client.aclose()
+        except Exception as exc:
+            logger.warning(f"Redis close failed: {exc}")
+
+        try:
+            await db_client.close()
+        except Exception as exc:
+            logger.warning(f"Database close failed: {exc}")
 
 
 if __name__ == "__main__":
