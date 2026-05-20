@@ -31,7 +31,7 @@ async def main():
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
-    from atlas.validation.harness import ValidationHarness
+    from .harness import ValidationHarness
 
     harness = ValidationHarness(output_dir=output_dir)
     harness.set_api_base(args.api_base)

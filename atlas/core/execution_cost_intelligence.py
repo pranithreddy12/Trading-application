@@ -479,45 +479,44 @@ def generate_cost_priors(
     round_trip_cost_bps = estimate_round_trip_cost(asset_class, bps=True)
     
     archetype_frequency = {
-        "momentum": (50, 150),        # Typically 50-150 trades
-        "mean_reversion": (30, 80),   # 30-80 trades
-        "breakout": (20, 60),         # 20-60 trades
-        "trend_following": (10, 40),  # 10-40 trades
-        "volatility_regime": (15, 50),  # 15-50 trades
+        "momentum": (25, 80),        # Slower, higher-conviction momentum
+        "mean_reversion": (20, 60),   # Less reactive mean reversion
+        "breakout": (12, 40),         # Avoid noisy breakout churn
+        "trend_following": (8, 30),   # Lower turnover trend capture
+        "volatility_regime": (10, 35),  # Fewer regime flips
     }
     
     freq_range = archetype_frequency.get(archetype, (20, 100))
-    ideal_edge_per_trade_bps = round_trip_cost_bps * 2.5  # Edge should be 2.5x cost
+    ideal_edge_per_trade_bps = round_trip_cost_bps * 3.5  # Edge should be well above cost
     
     priors = {
         "cost_principle":
-            f"Avoid hyperactive {archetype} strategies with weak expected edge per trade. "
-            f"Target: {ideal_edge_per_trade_bps:.0f} bps edge per trade (cost={round_trip_cost_bps:.0f} bps).",
+            f"Prefer slower {archetype} strategies with durable edge per trade. "
+            f"Target: {ideal_edge_per_trade_bps:.0f}+ bps edge per trade (cost={round_trip_cost_bps:.0f} bps).",
         
         "frequency_guidance":
-            f"{archetype.title()} typically trades {freq_range[0]}-{freq_range[1]} times over backtest. "
-            f"{'Tighter thresholds → fewer trades → better cost absorption' if archetype in ['trend_following', 'breakout'] else 'Looser triggers → more trades → weaker edges per trade'}.",
+            f"{archetype.title()} should usually trade {freq_range[0]}-{freq_range[1]} times over backtest. "
+            f"Bias toward fewer, higher-confidence entries rather than broad trigger coverage.",
         
         "cost_avoidance":
-            f"Penalize strategies with >0.2% total return but >100 trades "
-            f"(indicates {round(0.002/100*10000, 0):.0f} bps edge per trade = cost trap).",
+            "Avoid excessive crossover frequency, hyper-reactive RSI bands, and ultra-tight exits that collapse after fees/slippage.",
         
         "edge_requirement":
-            f"Prefer setups with wider margins per trade ({ideal_edge_per_trade_bps:.0f}+ bps), "
-            f"even if less frequent. Robust under realistic friction.",
+            f"Prefer setups with wider margins per trade ({ideal_edge_per_trade_bps:.0f}+ bps) and lower turnover. "
+            f"Robust under realistic friction.",
         
         "bias_rules":
             f"• Bias toward lower churn (fewer but stronger signals)\n"
-            f"• Require conviction in entries (tighter conditions)\n"
+            f"• Require conviction in entries without overfitting noise\n"
             f"• Penalize micro-edge systems likely to fail after fees\n"
-            f"• Favor asymmetric reward:risk (not just frequency).",
+            f"• Favor asymmetric reward:risk and slower exit logic.",
     }
     
     if trade_frequency_target:
-        min_edge_bps = (round_trip_cost_bps * 100 * 1.5) / trade_frequency_target
+        min_edge_bps = (round_trip_cost_bps * 100 * 2.0) / trade_frequency_target
         priors["specific_target"] = (
             f"Target: {trade_frequency_target} trades requires >={min_edge_bps:.0f} bps "
-            f"average edge per trade to survive costs with 50% margin of safety."
+            f"average edge per trade to survive costs with a stronger margin of safety."
         )
     
     return priors

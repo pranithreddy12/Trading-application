@@ -5,7 +5,7 @@ import traceback
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
-from atlas.validation.models import StageResult, StageStatus, DefectType
+from .models import StageResult, StageStatus, DefectType
 
 
 class BaseStage(ABC):

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import traceback
 
-from atlas.validation.base_stage import BaseStage
-from atlas.validation.models import StageResult, StageStatus, DefectType, Evidence
+from ..base_stage import BaseStage
+from ..models import StageResult, StageStatus, DefectType, Evidence
 
 
 class AuditStage(BaseStage):

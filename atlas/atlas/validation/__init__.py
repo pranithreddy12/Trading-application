@@ -1,5 +1,5 @@
-from atlas.validation.harness import ValidationHarness
-from atlas.validation.models import (
+from .harness import ValidationHarness
+from .models import (
     StageResult,
     Evidence,
     DefectType,

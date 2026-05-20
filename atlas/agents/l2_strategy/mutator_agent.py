@@ -3,7 +3,7 @@ MutatorAgent v2 — Controlled Evolutionary Optimizer.
 
 Transforms from "LLM rewrites strategy" to "controlled evolutionary optimizer":
   1. Hard-constrained mutation types (threshold, period, condition, exit)
-  2. Expanded candidate pool: failed_validation (with entries) + research_candidate + validated_B
+  2. Targeted candidate pool: repair_candidate + research_candidate only (no failed_validation garbage)
   3. Structural filter: reject dead strategies (entry_count=0, trades<3)
   4. JSON extraction hardening (strip fences, extract block)
   5. Failure memory passed to prompt (entry_count, trades, validator notes)
@@ -54,6 +54,10 @@ ALLOWED_MUTATION_TYPES = [
     "condition_removal",
     "condition_addition",
     "exit_refinement",
+    # --- Economic mutation types (Phase 5) ---
+    "hold_time_adjustment",
+    "cooldown_adjustment",
+    "regime_filter_adjustment",
 ]
 
 # Allowed mutation types -> family mapping
@@ -64,6 +68,10 @@ MUTATION_TYPE_FAMILY = {
     "condition_addition": MutationFamily.EXPLORATION,
     "exit_refinement": MutationFamily.AGGRESSION,
     "claude_refinement": MutationFamily.REFINEMENT,
+    # --- Economic mutation families (Phase 5) ---
+    "hold_time_adjustment": MutationFamily.REFINEMENT,
+    "cooldown_adjustment": MutationFamily.REFINEMENT,
+    "regime_filter_adjustment": MutationFamily.REPAIR,
 }
 
 # Structural minimums — strategies below these are rejected
@@ -71,7 +79,7 @@ MIN_ENTRY_COUNT = 3
 MIN_TRADES = 3
 
 # Candidate pool Sharpe bands
-REPAIR_SHARPE_MIN = 0.0  # failed_validation with entries, any sharpe
+REPAIR_SHARPE_MIN = 0.0  # repair_candidate with entries, any sharpe
 RESEARCH_SHARPE_MIN = 0.0
 VALIDATED_B_SHARPE_MIN = 0.0
 
@@ -123,10 +131,12 @@ def standardized_similarity(a: dict, b: dict) -> float:
     return jaccard_distance
 
 
-def deterministic_micro_mutations(spec: dict, max_variants: int = 3) -> list[dict]:
+def deterministic_micro_mutations(spec: dict, max_variants: int = 7) -> list[dict]:
     """
     Generate rule-based micro-mutations from a strategy spec.
     Cheaper + more reliable than Claude for simple threshold adjustments.
+    Economic mutations (hold_time, cooldown, regimes) are generated first
+    since they don't require entry-condition changes and unblock stalled candidates.
     """
     variants = []
     params = spec.get("parameters", spec)
@@ -139,6 +149,72 @@ def deterministic_micro_mutations(spec: dict, max_variants: int = 3) -> list[dic
     entry_conds = params.get("entry_conditions", []) or []
     exit_conds = params.get("exit_conditions", []) or []
 
+    # --- Economic mutations first (Phase 5) — these bypass entry-condition limits ---
+    current_hold_min = params.get("hold_time_min", 3)
+    current_hold_max = params.get("hold_time_max", 40)
+    current_cooldown = params.get("cooldown_bars", 5)
+    current_regimes = params.get("valid_regimes", [])
+
+    # Economic: Reduce hold time (tighten)
+    if current_hold_min >= 2:
+        v_e1 = deepcopy(spec)
+        v_e1["hold_time_min"] = max(1, current_hold_min - 1)
+        v_e1["hold_time_max"] = max(10, current_hold_max - 5)
+        v_e1["_mutation_type"] = "hold_time_adjustment"
+        v_e1["_mutation_fields"] = ["hold_time_min", "hold_time_max"]
+        variants.append(v_e1)
+
+    # Economic: Increase hold time (relax)
+    if current_hold_max <= 80:
+        v_e2 = deepcopy(spec)
+        v_e2["hold_time_min"] = min(10, current_hold_min + 1)
+        v_e2["hold_time_max"] = min(100, current_hold_max + 8)
+        v_e2["_mutation_type"] = "hold_time_adjustment"
+        v_e2["_mutation_fields"] = ["hold_time_min", "hold_time_max"]
+        variants.append(v_e2)
+
+    # Economic: Expand cooldown
+    if current_cooldown <= 3:
+        v_e3 = deepcopy(spec)
+        v_e3["cooldown_bars"] = current_cooldown + 3
+        v_e3["_mutation_type"] = "cooldown_adjustment"
+        v_e3["_mutation_fields"] = ["cooldown_bars"]
+        variants.append(v_e3)
+
+    # Economic: Reduce cooldown
+    if current_cooldown >= 4:
+        v_e4 = deepcopy(spec)
+        v_e4["cooldown_bars"] = max(0, current_cooldown - 2)
+        v_e4["_mutation_type"] = "cooldown_adjustment"
+        v_e4["_mutation_fields"] = ["cooldown_bars"]
+        variants.append(v_e4)
+
+    # Economic: Set valid_regimes from empty
+    if not current_regimes:
+        has_rsi = any("rsi" in cond.lower() for cond in entry_conds)
+        has_bollinger = any("bollinger" in cond.lower() for cond in entry_conds)
+        if has_rsi and has_bollinger:
+            regimes_subset = ["oversold", "overbought", "ranging"]
+        elif has_rsi:
+            regimes_subset = ["oversold", "overbought"]
+        elif has_bollinger:
+            regimes_subset = ["ranging", "normal_vol"]
+        else:
+            regimes_subset = ["bullish", "bearish", "ranging"]
+        v_e5 = deepcopy(spec)
+        v_e5["valid_regimes"] = regimes_subset
+        v_e5["_mutation_type"] = "regime_filter_adjustment"
+        v_e5["_mutation_fields"] = ["valid_regimes"]
+        variants.append(v_e5)
+    # Economic: Prune a regime (narrower specialization)
+    elif len(current_regimes) >= 2:
+        v_e6 = deepcopy(spec)
+        v_e6["valid_regimes"] = current_regimes[:-1]
+        v_e6["_mutation_type"] = "regime_filter_adjustment"
+        v_e6["_mutation_fields"] = ["valid_regimes"]
+        variants.append(v_e6)
+
+    # --- Structural mutations second (cloned from original) ---
     # --- Mutation 1: Relax the most restrictive threshold ---
     # Find numeric thresholds and loosen them by 20%
     new_entry = []
@@ -321,8 +397,22 @@ def _normalize_mutation_spec(spec: dict, parent_name: str, source: str) -> dict:
     return out
 
 
-def _validate_mutation(spec: dict, parent_params: dict) -> str | None:
-    """Hard structural validation before saving a mutation. Returns error string or None."""
+def _validate_mutation(
+    spec: dict, parent_params: dict, mutation_type: str = ""
+) -> str | None:
+    """
+    Hard structural validation before saving a mutation.
+    Economic mutations (hold_time, cooldown, valid_regimes) bypass entry-condition
+    checks since they modify non-signal parameters.
+    Returns error string or None.
+    """
+    economic_types = {
+        "hold_time_adjustment",
+        "cooldown_adjustment",
+        "regime_filter_adjustment",
+    }
+    is_economic = mutation_type in economic_types
+
     entry = spec.get("entry_conditions", [])
     exit_ = spec.get("exit_conditions", [])
     parent_entry = (
@@ -332,7 +422,17 @@ def _validate_mutation(spec: dict, parent_params: dict) -> str | None:
     )
 
     if not entry and not exit_:
-        return "No entry or exit conditions"
+        if not is_economic:
+            return "No entry or exit conditions"
+        # Economic mutations may not set entry/exit at all, which is fine
+        return None
+
+    if is_economic:
+        # Economic mutations preserve parent entry/exit — only check they exist
+        if len(entry) == 0:
+            return "Zero entry conditions — economic mutation impossible"
+        return None
+
     if len(entry) == 0:
         return "Zero entry conditions — mutation invalid"
     if len(entry) > 3:
@@ -391,7 +491,7 @@ class MutatorAgent(BaseAgent):
             layer="L2",
             redis_client=redis_client,
         )
-        self.RUN_INTERVAL_SECONDS = 900  # 15 minutes in demo mode
+        self.RUN_INTERVAL_SECONDS = 300  # 5 minutes — accelerated evolutionary pressure
         self.db_client = db_client
 
     async def run(self):
@@ -452,6 +552,41 @@ class MutatorAgent(BaseAgent):
             f"Processing candidate: {name} (entries={entry_c}, trades={trades})"
         )
 
+        # ------------------------------------------------------------------
+        # SCOUT-AWARE MUTATION BIAS (Phase 10.8)
+        # Fetch current market conditions to bias mutation selection.
+        # ------------------------------------------------------------------
+        scout_regime_vol = ""
+        scout_liquidity_regime = ""
+        scout_execution_regime = ""
+        scout_corr_risk = ""
+        try:
+            scout = await self.db_client.get_latest_scout_intelligence()
+            if "regime" in scout:
+                scout_regime_vol = scout["regime"].get("volatility", "")
+            if "liquidity" in scout:
+                scout_liquidity_regime = scout["liquidity"].get("regime", "")
+            if "execution" in scout:
+                scout_execution_regime = scout["execution"].get("regime", "")
+            if "correlation" in scout:
+                scout_corr_risk = scout["correlation"].get("risk_state", "")
+        except Exception:
+            pass
+
+        # Economic mutation bias: favor hold_time/cooldown adjustments in stressed conditions
+        favor_economic = (
+            scout_liquidity_regime in ("thin", "dangerous") or
+            scout_execution_regime in ("degraded", "stressed", "unstable") or
+            scout_regime_vol in ("panic_vol", "high_vol") or
+            scout_corr_risk in ("panic_correlation", "regime_break")
+        )
+        # Adjust max_variants based on scout intelligence
+        original_max_variants = 7
+        used_max_variants = original_max_variants + 3 if favor_economic else original_max_variants
+
+        # --- Phase 1: Deterministic micro-mutations ---
+        deterministic_variants = deterministic_micro_mutations(params, max_variants=used_max_variants)
+
         # --- Phase 1: Deterministic micro-mutations ---
         deterministic_variants = deterministic_micro_mutations(params)
         mutated_ids = []
@@ -461,8 +596,8 @@ class MutatorAgent(BaseAgent):
             mut_fields = variant.pop("_mutation_fields", [])
             spec_to_save = _normalize_mutation_spec(variant, name, mut_type)
 
-            # Structural validation
-            validation_error = _validate_mutation(spec_to_save, params)
+            # Structural validation (pass mutation_type for economic bypass)
+            validation_error = _validate_mutation(spec_to_save, params, mutation_type=mut_type)
             if validation_error:
                 logger.info(f"Skipping deterministic {mut_type}: {validation_error}")
                 continue
@@ -520,7 +655,7 @@ class MutatorAgent(BaseAgent):
             claude_mut_fields = claude_raw.get("_mutation_fields", ["unknown"])
             claude_spec = _normalize_mutation_spec(claude_raw, name, "claude")
 
-            claude_validation_error = _validate_mutation(claude_spec, params)
+            claude_validation_error = _validate_mutation(claude_spec, params, mutation_type=claude_mut_type)
             claude_viability = compute_viability_score(
                 claude_spec,
                 parent_params=params,
@@ -648,7 +783,8 @@ CRITICAL RULES — VIOLATION WILL INVALIDATE YOUR OUTPUT:
 5. Prioritize increasing trigger realism — if conditions never triggered, relax thresholds.
 6. If the parent has zero entries, a zero-entry mutation is INVALID.
 7. Respond ONLY with a valid JSON object. No markdown, no commentary.
-8. Allowed mutation types (pick ONE): {", ".join(ALLOWED_MUTATION_TYPES)}"""
+8. Allowed mutation types (pick ONE): {", ".join(ALLOWED_MUTATION_TYPES)}
+9. ECONOMIC MUTATIONS are encouraged: adjust hold_time_min, hold_time_max, cooldown_bars, valid_regimes instead of adding more entry conditions. These modify position discipline and regime filters, not signal generation."""
 
         user_prompt = self._build_claude_prompt(candidate, diagnostic)
 
@@ -714,12 +850,20 @@ CRITICAL RULES — VIOLATION WILL INVALIDATE YOUR OUTPUT:
         sharpe = candidate.get("sharpe", candidate.get("holdout_sharpe", 0))
         entry_c = candidate.get("entry_count", 0)
         trades = candidate.get("total_trades", 0)
+        hold_min = params.get("hold_time_min", 3)
+        hold_max = params.get("hold_time_max", 40)
+        cooldown = params.get("cooldown_bars", 5)
+        regimes = params.get("valid_regimes", [])
 
         # Send only essential fields, not the full nested spec
         minimal_spec = json.dumps(
             {
                 "entry_conditions": params.get("entry_conditions", []),
                 "exit_conditions": params.get("exit_conditions", []),
+                "hold_time_min": hold_min,
+                "hold_time_max": hold_max,
+                "cooldown_bars": cooldown,
+                "valid_regimes": regimes,
                 "sharpe": sharpe,
                 "entry_count": entry_c,
             },
@@ -727,13 +871,13 @@ CRITICAL RULES — VIOLATION WILL INVALIDATE YOUR OUTPUT:
         )
 
         return f"""Strategy: {name}
-Sharpe: {sharpe:.2f} | Entries: {entry_c} | Trades: {trades}
+Sharpe: {sharpe:.2f} | Entries: {entry_c} | Trades: {trades} | Hold: {hold_min}-{hold_max} | Cooldown: {cooldown} | Regimes: {regimes}
 DIAGNOSTIC: {diagnostic[:200] if diagnostic else "None"}
 
 Current Spec:
 {minimal_spec}
 
-Mutate conservatively. Output valid JSON: strategy_name, entry_conditions, exit_conditions, mutation_type, changed_fields"""
+Mutate conservatively. Output valid JSON: strategy_name, entry_conditions, exit_conditions, mutation_type, changed_fields, hold_time_min, hold_time_max, cooldown_bars, valid_regimes (include economic params if relevant)."""
 
     async def _get_recent_mutants(self, limit: int = 50) -> list[dict]:
         """Get recently-created strategies for anti-clone comparison."""

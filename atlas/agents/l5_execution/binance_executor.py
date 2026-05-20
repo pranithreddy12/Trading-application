@@ -51,7 +51,7 @@ class BinanceExecutor(BaseAgent):
     async def _process_signal(self, data: dict):
         """Legacy compatibility for old tests."""
         warnings.warn("Use ExecutionGateway.execute() instead.", DeprecationWarning)
-        if await KillSwitch.is_active(self._redis):
+        if self.db_client and await KillSwitch.is_active(self.db_client):
             return
 
         trade_req = {

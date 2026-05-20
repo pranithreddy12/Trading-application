@@ -37,19 +37,102 @@ class KillSwitch(BaseAgent):
         self._api_task = None
         KillSwitch._instance = self
 
-    async def start(self):
-        # FIRST: read persisted state from Redis AND DB
-        # If either shows active=True, restore _is_active=True
-        redis_active = await self.is_active(self._redis)
-        db_meta = await self.db_client.get_agent_metadata(self.name)
-        db_active = db_meta.get("active", False) if db_meta else False
+    async def _ensure_portfolio_risk_state(self) -> None:
+        await self.db_client._execute_insert(
+            """
+            INSERT INTO risk_state (scope, halted, reason)
+            VALUES ('portfolio', FALSE, 'initial_state')
+            ON CONFLICT DO NOTHING
+            """,
+            {},
+        )
 
-        if redis_active or db_active:
+    async def _load_portfolio_risk_state(self) -> dict:
+        await self._ensure_portfolio_risk_state()
+        from sqlalchemy.sql import text
+
+        query = """
+            SELECT halted, reason, activated_at, released_at
+            FROM risk_state
+            WHERE scope = 'portfolio'
+            LIMIT 1
+        """
+        async with self.db_client.engine.connect() as conn:
+            result = await conn.execute(text(query))
+            row = result.fetchone()
+            if not row:
+                return {
+                    "halted": False,
+                    "reason": "initial_state",
+                    "activated_at": None,
+                    "released_at": None,
+                }
+            data = row._mapping
+            return {
+                "halted": bool(data["halted"]),
+                "reason": data["reason"] or "initial_state",
+                "activated_at": data["activated_at"],
+                "released_at": data["released_at"],
+            }
+
+    async def _persist_portfolio_risk_state(
+        self,
+        halted: bool,
+        reason: str | None = None,
+        triggered_by: str | None = None,
+    ) -> None:
+        await self._ensure_portfolio_risk_state()
+        from sqlalchemy.sql import text
+
+        if halted:
+            query = """
+                UPDATE risk_state
+                SET
+                    halted = TRUE,
+                    reason = :reason,
+                    triggered_by = :triggered_by,
+                    activated_at = NOW(),
+                    released_at = NULL,
+                    updated_at = NOW()
+                WHERE scope = 'portfolio'
+            """
+        else:
+            query = """
+                UPDATE risk_state
+                SET
+                    halted = FALSE,
+                    reason = COALESCE(:reason, reason),
+                    triggered_by = :triggered_by,
+                    released_at = NOW(),
+                    updated_at = NOW()
+                WHERE scope = 'portfolio'
+            """
+
+        async with self.db_client.engine.begin() as conn:
+            await conn.execute(
+                text(query),
+                {
+                    "reason": reason,
+                    "triggered_by": triggered_by or self.name,
+                },
+            )
+
+    async def start(self):
+        state = await self._load_portfolio_risk_state()
+        db_active = bool(state["halted"])
+
+        if db_active:
             self._is_active = True
-            self._activated_at = datetime.utcnow()
+            self._activated_at = state["activated_at"] or datetime.utcnow()
             reason_redis = await self._redis.hget("kill_switch:state", "reason")
-            self._reason = reason_redis.decode('utf-8') if reason_redis else "restored from DB"
+            self._reason = reason_redis.decode('utf-8') if reason_redis else state["reason"]
+            await self._redis.hset(
+                "kill_switch:state",
+                mapping={"active": "1", "reason": self._reason},
+            )
             logger.warning(f"Kill Switch restored as ACTIVE: {self._reason}")
+        else:
+            await self._redis.delete("kill_switch:state")
 
         await super().start()
 
@@ -80,10 +163,11 @@ class KillSwitch(BaseAgent):
             self._api_task.cancel()
         await super().stop()
 
-    async def activate(self, reason: str = "automated"):
+    async def activate_kill_switch(self, reason: str = "automated"):
         self._is_active = True
         self._reason = reason
         self._activated_at = datetime.utcnow()
+        await self._persist_portfolio_risk_state(True, reason=reason, triggered_by=self.name)
         
         # 2. HSET kill_switch:state
         await self._redis.hset("kill_switch:state", mapping={
@@ -114,10 +198,14 @@ class KillSwitch(BaseAgent):
         # 6. POST Slack
         await self._post_slack(f"🚨 KILL SWITCH ACTIVATED — Reason: {reason}")
 
-    async def deactivate(self):
+    async def activate(self, reason: str = "automated"):
+        return await self.activate_kill_switch(reason)
+
+    async def deactivate_kill_switch(self):
         self._is_active = False
         self._reason = ""
         self._activated_at = None
+        await self._persist_portfolio_risk_state(False, reason="resume", triggered_by=self.name)
         
         # 2. Clear Redis kill_switch:state
         await self._redis.delete("kill_switch:state")
@@ -134,6 +222,9 @@ class KillSwitch(BaseAgent):
         await self._post_slack("✅ Kill switch deactivated — trading resumed")
         logger.info("Kill switch deactivated")
 
+    async def deactivate(self):
+        return await self.deactivate_kill_switch()
+
     async def _post_slack(self, text: str):
         url = settings.slack_webhook_url
         if not url:
@@ -145,8 +236,19 @@ class KillSwitch(BaseAgent):
             logger.error(f"Slack post error: {e}")
 
     @staticmethod
-    async def is_active(redis: Redis) -> bool:
-        result = await redis.hget("kill_switch:state", "active")
+    async def is_active(client) -> bool:
+        if hasattr(client, "fetchval"):
+            halted = await client.fetchval(
+                """
+                SELECT halted
+                FROM risk_state
+                WHERE scope = 'portfolio'
+                LIMIT 1
+                """
+            )
+            return bool(halted)
+
+        result = await client.hget("kill_switch:state", "active")
         return result == b"1"
 
 

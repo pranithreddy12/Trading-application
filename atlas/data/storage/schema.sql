@@ -257,6 +257,46 @@ CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle_events (trace_id);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_strategy ON lifecycle_events (strategy_id);
 CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage);
 
+-- 17. risk_state — Persistent kill-switch governance layer
+CREATE TABLE IF NOT EXISTS risk_state (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope TEXT NOT NULL,
+    strategy_id UUID NULL,
+    halted BOOLEAN NOT NULL DEFAULT FALSE,
+    reason TEXT,
+    triggered_by TEXT,
+    activated_at TIMESTAMPTZ,
+    released_at TIMESTAMPTZ,
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_state_scope ON risk_state (scope);
+
+INSERT INTO risk_state (
+    scope,
+    halted,
+    reason
+)
+VALUES (
+    'portfolio',
+    FALSE,
+    'initial_state'
+)
+ON CONFLICT DO NOTHING;
+
+-- 18. scout_quarantine — invalid scout payloads are logged, not propagated
+CREATE TABLE IF NOT EXISTS scout_quarantine (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source TEXT,
+    source_sub TEXT,
+    reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+    raw_payload JSONB NOT NULL,
+    quarantined_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_scout_quarantine_source ON scout_quarantine (source);
+CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quarantined_at DESC);
+
 -- Add trace_id to strategies
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id);

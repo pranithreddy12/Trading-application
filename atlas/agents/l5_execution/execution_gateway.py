@@ -32,11 +32,21 @@ class ExecutionGateway(BaseAgent):
     - The ONLY code path that calls broker APIs.
     - Every order passes through idempotency → risk → kill switch → broker → tracker.
     - Recovery lock blocks execution until startup reconciliation completes.
+
+    Distributed Execution Governance (Phase 12.7):
+    - Redis distributed locking with lease TTL
+    - Multi-instance ownership tracking via instance_id
+    - Failover-safe order handling with lease renewal
+    - Periodic heartbeat-based lease maintenance
+    - All in-memory execution locks removed (fully distributed)
     """
 
     name = "ExecutionGateway"
     agent_type = "executor"
     layer = "L5"
+
+    # Lease maintenance interval
+    LEASE_RENEWAL_INTERVAL = 15  # seconds
 
     def __init__(
         self,
@@ -45,6 +55,7 @@ class ExecutionGateway(BaseAgent):
         broker: BrokerAdapter,
         risk: RiskController,
         lineage: EventLineageClient,
+        instance_id: Optional[str] = None,
     ):
         super().__init__(
             name=self.name,
@@ -56,8 +67,9 @@ class ExecutionGateway(BaseAgent):
         self.broker = broker
         self.risk = risk
         self.lineage = lineage
+        self.instance_id = instance_id or ""
 
-        self.tracker = OrderTracker(redis_client, db_client)
+        self.tracker = OrderTracker(redis_client, db_client, instance_id=instance_id)
         self.positions = PositionManager(redis_client, db_client, broker)
         self.dead_letter = DeadLetterManager(redis_client, db_client)
         self.recovery = RecoveryManager(
@@ -65,13 +77,57 @@ class ExecutionGateway(BaseAgent):
         )
 
         self._recovery_complete = False
+        self._active_lease_order_keys: set[str] = set()
+        self._lease_maintenance_task: Optional[asyncio.Task] = None
+
+        # Scout intelligence cache for dynamic execution adaptation
+        self._scout_liquidity_regime = ""
+        self._scout_execution_regime = ""
+        self._scout_cache_time = 0.0
+        self._scout_cache_ttl = 60.0  # refresh every minute
+
+    async def _lease_maintenance(self):
+        """
+        Background task that periodically renews active execution leases.
+        Ensures failover-safety: if this instance dies, leases expire and
+        another instance can pick them up.
+        """
+        while self.status == "running":
+            try:
+                for order_key in list(self._active_lease_order_keys):
+                    renewed = await self.tracker.renew_lease(order_key)
+                    if not renewed:
+                        logger.warning(f"Lease lost for {order_key} — removing from active set")
+                        self._active_lease_order_keys.discard(order_key)
+                await asyncio.sleep(self.LEASE_RENEWAL_INTERVAL)
+            except Exception as e:
+                logger.debug(f"Lease maintenance cycle failed: {e}")
+                await asyncio.sleep(5)
 
     async def run(self):
         logger.info(f"{self.name} starting up.")
 
         # 1. Recovery lock — block until reconciliation passes
-        await self.recovery.run_startup_reconciliation()
-        self._recovery_complete = True
+        recovery_ok = await self.recovery.run_startup_reconciliation()
+        self._recovery_complete = recovery_ok
+        if not recovery_ok:
+            logger.warning("Recovery reconciliation did not complete; execution remains locked.")
+
+        # 1b. Start lease maintenance background task (distributed governance)
+        self._lease_maintenance_task = asyncio.create_task(self._lease_maintenance())
+
+        # 1c. Detect and recover lost orders from this instance
+        try:
+            lost_orders = await self.tracker.get_lost_orders()
+            if lost_orders:
+                logger.warning(f"Found {len(lost_orders)} lost orders from this instance — marking for recovery")
+                for lost_key in lost_orders:
+                    await self.tracker.transition(
+                        lost_key, OrderState.DEAD_LETTER,
+                        error_message="lease_expired_failover_recovery"
+                    )
+        except Exception as e:
+            logger.warning(f"Lost order recovery failed: {e}")
 
         # 2. Poll for validated strategies (in a real system this might be pub/sub driven)
         # We will subscribe to pubsub for signals
@@ -171,6 +227,24 @@ class ExecutionGateway(BaseAgent):
         side = trade_req["side"]
         qty = trade_req["qty"]
 
+        try:
+            halted = await self.db.fetchval(
+                """
+                SELECT halted
+                FROM risk_state
+                WHERE scope = 'portfolio'
+                LIMIT 1
+                """
+            )
+            if halted:
+                raise Exception("KILL_SWITCH_ACTIVE")
+        except Exception as exc:
+            if str(exc) == "KILL_SWITCH_ACTIVE":
+                await self.tracker.transition(order_key, OrderState.KILL_SWITCH_BLOCKED)
+                logger.warning("Execution blocked by persisted kill switch.")
+                return False
+            raise
+
         # Track base state
         await self.tracker.transition(
             order_key, OrderState.SIGNAL_RECEIVED, 
@@ -178,9 +252,24 @@ class ExecutionGateway(BaseAgent):
             client_order_id=client_order_id, broker_name=self.broker.broker_name
         )
 
+        # Track lease for distributed governance
+        self._active_lease_order_keys.add(order_key)
+
         try:
-            # 2. Kill switch check
-            if await KillSwitch.is_active(self._redis):
+            # 2. Scout-aware dynamic adaptation (Phase 10.10)
+            await self._refresh_scout_intelligence()
+
+            # 2b. Reject execution if liquidity is dangerous
+            if self._scout_liquidity_regime == "dangerous":
+                await self.tracker.transition(
+                    order_key, OrderState.RISK_REJECTED,
+                    metadata={"reason": f"dangerous_liquidity_regime"}
+                )
+                logger.warning(f"Execution blocked: dangerous liquidity regime")
+                return False
+
+            # 2c. Kill switch check
+            if await KillSwitch.is_active(self.db):
                 await self.tracker.transition(order_key, OrderState.KILL_SWITCH_BLOCKED)
                 return False
 
@@ -194,7 +283,7 @@ class ExecutionGateway(BaseAgent):
 
             await self.tracker.transition(order_key, OrderState.RISK_APPROVED)
 
-            # 4. Submit with retry
+            # 4. Submit with retry (lease-renewal during long operations)
             order = await self._submit_with_retry(client_order_id, sym, side, qty)
             if not order:
                 # Exhausted retries
@@ -295,7 +384,43 @@ class ExecutionGateway(BaseAgent):
             )
             return False
         finally:
+            self._active_lease_order_keys.discard(order_key)
             await self.tracker.release_lock(order_key)
+
+    async def _refresh_scout_intelligence(self):
+        """Refresh scout intelligence cache for dynamic adaptation."""
+        import time
+        now = time.time()
+        if now - self._scout_cache_time < self._scout_cache_ttl:
+            return
+        try:
+            scout = await self.db.get_latest_scout_intelligence()
+            self._scout_liquidity_regime = scout.get("liquidity", {}).get("regime", "")
+            self._scout_execution_regime = scout.get("execution", {}).get("regime", "")
+            self._scout_cache_time = now
+        except Exception:
+            pass
+
+    def _scout_adjusted_qty(self, base_qty: float) -> float:
+        """Reduce order size in stressed market conditions."""
+        if self._scout_liquidity_regime == "thin":
+            return base_qty * 0.5
+        if self._scout_execution_regime in ("degraded", "stressed"):
+            return base_qty * 0.75
+        if self._scout_execution_regime == "unstable":
+            return base_qty * 0.25
+        return base_qty
+
+    def _scout_adjusted_slippage(self) -> float:
+        """Return widened slippage buffer in stressed conditions."""
+        base_slippage = 10.0  # default 10 bps
+        if self._scout_liquidity_regime == "thin":
+            return base_slippage * 3.0
+        if self._scout_execution_regime in ("degraded", "stressed"):
+            return base_slippage * 2.0
+        if self._scout_execution_regime == "unstable":
+            return base_slippage * 5.0
+        return base_slippage
 
     async def _submit_with_retry(self, client_order_id: str, symbol: str, side: str, qty: float, max_retries=3) -> Optional[dict]:
         for attempt in range(max_retries):

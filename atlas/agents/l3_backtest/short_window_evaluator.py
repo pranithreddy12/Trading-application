@@ -30,6 +30,7 @@ def compute_short_window_metrics(
     commission_pct: float = 0.001,
     slippage_pct: float = 0.0005,
     spread_cost_pct: float = 0.0005,
+    dynamic_slippage: np.ndarray | None = None,
 ) -> dict:
     if len(sub_df) == 0:
         return _zero_metrics()
@@ -38,10 +39,22 @@ def compute_short_window_metrics(
     sub["market_return"] = market_return
     sub["position"] = position_series
 
-    total_roundtrip_cost = commission_pct + slippage_pct + spread_cost_pct
+    per_side_base = commission_pct + slippage_pct + spread_cost_pct
+
+    if dynamic_slippage is not None and len(dynamic_slippage) == len(sub):
+        per_side_cost = per_side_base * dynamic_slippage
+        total_roundtrip = per_side_cost * 2
+    else:
+        if dynamic_slippage is not None:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Dynamic slippage length mismatch: {len(dynamic_slippage)} vs {len(sub)}, falling back to flat cost"
+            )
+        total_flat = per_side_base * 2
+        total_roundtrip = np.full(len(sub), total_flat)
 
     sub["trade_cost"] = np.where(
-        sub["position"].diff().fillna(0) != 0, total_roundtrip_cost, 0.0
+        sub["position"].diff().fillna(0) != 0, total_roundtrip, 0.0
     )
 
     sub["strategy_return"] = (

@@ -15,6 +15,8 @@ from atlas.data.storage.timescale_client import TimescaleClient
 from atlas.agents.l4_risk.kill_switch import KillSwitch
 from atlas.api.services.auth_service import AuthService
 from atlas.dashboard.router import router as dashboard_router
+from atlas.dashboard.control_plane.router import control_plane_router
+from atlas.dashboard.system_visualization.router import system_viz_router
 
 REDIS_URL = settings.redis_url
 DB_URL = settings.database_url
@@ -112,7 +114,7 @@ async def shutdown_event():
 @app.get("/health")
 async def get_health():
     start = time.time()
-    kill_switch = await KillSwitch.is_active(redis_client)
+    kill_switch = await KillSwitch.is_active(db_client)
     elapsed_ms = int((time.time() - start) * 1000)
     db_ok = False
     try:
@@ -330,13 +332,19 @@ async def get_brief():
 
 @app.post("/kill_switch/activate")
 async def activate_kill_switch():
-    await KillSwitch.activate(redis_client, "manual")
+    if KillSwitch._instance:
+        await KillSwitch._instance.activate_kill_switch("manual")
+    else:
+        return {"status": "error", "message": "KillSwitch not running"}
     return {"status": "activated"}
 
 
 @app.post("/kill_switch/deactivate")
 async def deactivate_kill_switch():
-    await KillSwitch.deactivate(redis_client)
+    if KillSwitch._instance:
+        await KillSwitch._instance.deactivate_kill_switch()
+    else:
+        return {"status": "error", "message": "KillSwitch not running"}
     return {"status": "deactivated"}
 
 
@@ -366,6 +374,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 app.include_router(dashboard_router)
+app.include_router(control_plane_router)
+app.include_router(system_viz_router)
 
 
 if __name__ == "__main__":

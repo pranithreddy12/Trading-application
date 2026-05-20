@@ -4,8 +4,8 @@ import time
 import traceback
 from typing import Optional
 
-from atlas.validation.base_stage import BaseStage
-from atlas.validation.models import StageResult, StageStatus, DefectType, Evidence
+from ..base_stage import BaseStage
+from ..models import StageResult, StageStatus, DefectType, Evidence
 
 ENDPOINTS = [
     {"label": "GET /health", "method": "GET", "path": "/health"},

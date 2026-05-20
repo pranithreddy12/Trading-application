@@ -14,6 +14,7 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
     normalize_strategy,
     conditions_to_code,
 )
+from atlas.core.code_sanitizer import sanitize_python_code
 from atlas.core.event_lineage import EventLineageClient
 
 
@@ -81,10 +82,25 @@ class CoderAgent(BaseAgent):
             if not entry:
                 raise ValueError("No valid entry conditions after normalization")
 
+            # Extract economic parameters from normalized strategy
+            if isinstance(params, dict):
+                valid_regimes = params.get("valid_regimes", [])
+                hold_min = params.get("hold_time_min", 3)
+                hold_max = params.get("hold_time_max", 40)
+                cooldown_bars = params.get("cooldown_bars", 5)
+            else:
+                valid_regimes = []
+                hold_min = 3
+                hold_max = 40
+                cooldown_bars = 5
+
             # =====================================================
             # GENERATE CODE
             # =====================================================
-            code = self._generate_code(strategy_name, entry, exit_)
+            code = self._generate_code(
+                strategy_name, entry, exit_, valid_regimes,
+                hold_min=hold_min, hold_max=hold_max, cooldown_bars=cooldown_bars,
+            )
 
             # =====================================================
             # STRICT COMPILE VALIDATION
@@ -145,6 +161,7 @@ class CoderAgent(BaseAgent):
             # =====================================================
             # SAVE ONLY VALID CODE
             # =====================================================
+            code = sanitize_python_code(code).code
             await self.db_client.update_strategy_code(
                 strategy_id,
                 code,
@@ -223,9 +240,16 @@ class CoderAgent(BaseAgent):
         strategy_name: str,
         entry: list,
         exit_: list,
+        valid_regimes: list | None = None,
+        hold_min: int = 3,
+        hold_max: int = 40,
+        cooldown_bars: int = 5,
     ) -> str:
         class_name = self._sanitize_class_name(strategy_name)
         condition_block = conditions_to_code(entry, exit_)
+
+        # Generate regime classification code block
+        regime_block = self._generate_regime_classification_code(valid_regimes)
 
         # Build code with no leading indentation on the template
         # textwrap.dedent removes any accidental indentation from
@@ -237,6 +261,7 @@ import numpy as np
 
 class {class_name}:
     \"\"\"Auto-generated from normalized strategy spec.\"\"\"
+{regime_block}
 
     def generate_signals(self, df):
         if df is None or df.empty:
@@ -246,25 +271,83 @@ class {class_name}:
 
 {condition_block}
 
-        # Edge-trigger entries — fire only on transition False→True
-        buy = entry.fillna(False) & ~entry.fillna(False).shift(1).fillna(False)
+        # Regime classification — determines which market states are tradeable
+{self._indent_condition_block(self._regime_computation_code)}
 
-        # Edge-trigger exits — fire only on transition False→True
-        sell = exit_.fillna(False) & ~exit_.fillna(False).shift(1).fillna(False)
+        # Position state machine — prevents exit spam, enforces holding discipline
+        in_position = False
+        bars_held = 0
+        cooldown = 0
+        MIN_HOLD_BARS = {hold_min}
+        MAX_HOLD_BARS = {hold_max}
+        entry_clean = entry.fillna(False)
+        exit_clean = exit_.fillna(False)
 
-        # Apply entries
-        signals.loc[buy] = 1
+        for i in range(len(df)):
+            if cooldown > 0:
+                cooldown -= 1
+                continue
 
-        # Apply exits
-        signals.loc[sell] = -1
-
-        # Neutralize overlaps
-        overlap = buy & sell
-        signals.loc[overlap.fillna(False)] = 0
+            if not in_position:
+                if entry_clean.iloc[i]:
+                    # Regime gate — skip entry if current regime not in valid set
+                    if VALID_REGIMES and df['_regime'].iloc[i] not in VALID_REGIMES:
+                        continue
+                    signals.iloc[i] = 1
+                    in_position = True
+                    bars_held = 1
+            else:
+                bars_held += 1
+                if bars_held >= MAX_HOLD_BARS or (bars_held >= MIN_HOLD_BARS and exit_clean.iloc[i]):
+                    signals.iloc[i] = -1
+                    in_position = False
+                    bars_held = 0
+                    cooldown = {cooldown_bars}
 
         return signals
 """)
         return generated_code
+
+    # Registry of regime classification code that runs inside generate_signals()
+    _regime_computation_code = """\
+        df['_regime'] = 'unknown'
+        df.loc[df['volatility_regime'] > 1.4, '_vol_regime'] = 'high_vol'
+        df.loc[df['volatility_regime'] < 0.7, '_vol_regime'] = 'low_vol'
+        df.loc[(df['volatility_regime'] >= 0.7) & (df['volatility_regime'] <= 1.4), '_vol_regime'] = 'normal_vol'
+        df.loc[df['trend_strength'] > 0.002, '_trend_regime'] = 'trending'
+        df.loc[df['trend_strength'] <= 0.002, '_trend_regime'] = 'ranging'
+        df.loc[df['ema_spread_pct'] > 0.001, '_direction'] = 'bullish'
+        df.loc[df['ema_spread_pct'] < -0.001, '_direction'] = 'bearish'
+        df.loc[(df['ema_spread_pct'] >= -0.001) & (df['ema_spread_pct'] <= 0.001), '_direction'] = 'neutral'
+        df.loc[df['bollinger_band_position'] > 0.8, '_bb_regime'] = 'overbought'
+        df.loc[df['bollinger_band_position'] < 0.2, '_bb_regime'] = 'oversold'
+        df.loc[(df['bollinger_band_position'] >= 0.2) & (df['bollinger_band_position'] <= 0.8), '_bb_regime'] = 'normal'
+        # Composite regime — combine volatility + trend for meaningful classification
+        df.loc[df['_vol_regime'] == 'high_vol', '_regime'] = 'high_vol'
+        df.loc[df['_vol_regime'] == 'low_vol', '_regime'] = 'low_vol'
+        df.loc[(df['_direction'] == 'bullish') & (df['_trend_regime'] == 'trending'), '_regime'] = 'bullish'
+        df.loc[(df['_direction'] == 'bearish') & (df['_trend_regime'] == 'trending'), '_regime'] = 'bearish'
+        df.loc[(df['_trend_regime'] == 'ranging') & (df['_vol_regime'] == 'normal_vol'), '_regime'] = 'ranging'
+        df.loc[df['_bb_regime'] == 'overbought', '_regime'] = 'overbought'
+        df.loc[df['_bb_regime'] == 'oversold', '_regime'] = 'oversold'
+"""
+
+    def _generate_regime_classification_code(self, valid_regimes: list | None = None) -> str:
+        """
+        Generate the VALID_REGIMES class constant based on strategy spec.
+        If no valid_regimes specified, defaults to all regimes (no restriction).
+        """
+        if not valid_regimes:
+            # Default: all regimes allowed — no restriction
+            return f"""
+    # Market regimes this strategy is designed for (empty = all allowed)
+    VALID_REGIMES: list = []
+"""
+        regimes_str = ", ".join(repr(r) for r in valid_regimes)
+        return f"""
+    # Market regimes this strategy is designed for
+    VALID_REGIMES: list = [{regimes_str}]
+"""
 
 
 async def main():

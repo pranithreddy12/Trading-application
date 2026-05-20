@@ -3,8 +3,8 @@ from __future__ import annotations
 import importlib
 import sys
 
-from atlas.validation.base_stage import BaseStage
-from atlas.validation.models import StageResult, StageStatus, DefectType, Evidence
+from ..base_stage import BaseStage
+from ..models import StageResult, StageStatus, DefectType, Evidence
 from atlas.api.contracts.manifest import get_contract_manifest
 from atlas.api.contracts.validator import validate_app_routes, format_report
 

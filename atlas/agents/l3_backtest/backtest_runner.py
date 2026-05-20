@@ -54,6 +54,14 @@ class BacktestRunner(BaseAgent):
         self.spread_cost_pct = 0.0005
         self.position_size = 0.10
 
+        # Dynamic slippage config
+        self.DYN_SLIPPAGE_MIN_MULT = 0.5
+        self.DYN_SLIPPAGE_MAX_MULT = 3.0
+        self.DYN_SLIPPAGE_VOL_CAP = 3.0
+        self.DYN_SLIPPAGE_VOL_FLOOR = 0.3
+        self.DYN_SLIPPAGE_VOLUME_CAP = 3.0
+        self.DYN_SLIPPAGE_VOLUME_FLOOR = 0.5
+
     async def run(self):
         print("=== BACKTEST RUN LOOP ENTERED ===", flush=True)
         logger.info("BacktestRunner DB polling started")
@@ -446,6 +454,15 @@ class BacktestRunner(BaseAgent):
             results, trades = await self._run_backtest(strategy_instance, df, symbol)
             results = clean_metrics(results)
 
+            # Log dynamic slippage stats
+            if "_dyn_slippage_mult" in df.columns:
+                mult = df["_dyn_slippage_mult"].values
+                logger.info(
+                    f"{strategy_id}: Dynamic slippage mult — "
+                    f"min={mult.min():.2f}x median={np.nanmedian(mult):.2f}x "
+                    f"max={mult.max():.2f}x"
+                )
+
             # =====================================================
             # SAVE RESULTS
             # =====================================================
@@ -535,6 +552,102 @@ class BacktestRunner(BaseAgent):
                 "failed",
                 {"error": f"{type(e).__name__}: {str(e)[:200]}"},
             )
+
+    def _compute_regime_score(self, df: pd.DataFrame, signals: pd.Series) -> float:
+        """
+        Compute regime robustness score [0.0, 1.0].
+
+        Measures how many distinct market regimes the strategy entered trades in.
+        Single-regime strategies (overfit to specific conditions) score 0.0.
+        Multi-regime strategies (robust across market states) score higher.
+
+        Regimes classified using same feature logic as generated code:
+        - high_vol / low_vol: based on volatility_regime
+        - bullish / bearish / neutral: based on ema_spread_pct
+        - trending / ranging: based on trend_strength
+        - overbought / oversold: based on bollinger_band_position
+        """
+        entry_signals = signals[signals == 1]
+        if entry_signals.empty:
+            return 0.0
+
+        # Classify each bar into a regime bucket
+        # NOTE: This is a lightweight approximation of the full regime classification
+        # in coder_agent._regime_computation_code. The generated strategy code uses
+        # compound criteria (e.g., bullish = trending + ema > threshold), while this
+        # scoring uses simpler single-field thresholds. Scores are directional but
+        # not exact matches to the strategy's internal regime gate logic.
+        regimes = pd.Series('unknown', index=df.index, dtype=str)
+
+        vol = df.get('volatility_regime', pd.Series(1.0, index=df.index))
+        ema = df.get('ema_spread_pct', pd.Series(0.0, index=df.index))
+        trend = df.get('trend_strength', pd.Series(0.0, index=df.index))
+        bb = df.get('bollinger_band_position', pd.Series(0.5, index=df.index))
+
+        # Volatility regimes
+        regimes.loc[vol > 1.4] = 'high_vol'
+        regimes.loc[(vol >= 0.7) & (vol <= 1.4)] = 'normal_vol'
+        regimes.loc[vol < 0.7] = 'low_vol'
+
+        # Directional regimes (override vol-only if trending)
+        trending_mask = trend > 0.002
+        regimes.loc[trending_mask & (ema > 0.001)] = 'bullish'
+        regimes.loc[trending_mask & (ema < -0.001)] = 'bearish'
+        regimes.loc[~trending_mask & (vol >= 0.7) & (vol <= 1.4)] = 'ranging'
+
+        # Bollinger regimes (override if extreme)
+        regimes.loc[bb > 0.8] = 'overbought'
+        regimes.loc[bb < 0.2] = 'oversold'
+
+        # Get distinct regimes at entry points
+        entry_regimes = regimes.loc[entry_signals.index]
+        distinct = entry_regimes.unique()
+        distinct = [r for r in distinct if r != 'unknown']
+
+        n = len(distinct)
+        # Score: single regime = 0.0, 2 regimes = 0.5, 3+ = 1.0
+        if n >= 3:
+            return 1.0
+        elif n == 2:
+            return 0.5
+        return 0.0
+
+    def _compute_dynamic_slippage(self, df: pd.DataFrame) -> np.ndarray:
+        """
+        Compute per-bar dynamic slippage multiplier based on market conditions.
+
+        Uses rolling_volatility and relative_volume to estimate liquidity regime:
+        - Higher volatility  -> wider spreads        -> higher slippage (up to DYN_SLIPPAGE_MAX_MULT)
+        - Lower volume       -> less liquidity       -> higher slippage (up to DYN_SLIPPAGE_MAX_MULT)
+        - Calm, liquid conditions -> lower slippage  (down to DYN_SLIPPAGE_MIN_MULT)
+        """
+        vol = df["rolling_volatility"].values
+        rel_vol = df["relative_volume"].values
+
+        # Volatility multiplier: normalized by median
+        median_vol = np.nanmedian(vol)
+        if not np.isfinite(median_vol) or median_vol <= 0:
+            median_vol = 1.0
+        vol_mult = np.where(np.isfinite(vol) & (vol > 0), vol / median_vol, 1.0)
+        vol_mult = np.clip(vol_mult, self.DYN_SLIPPAGE_VOL_FLOOR, self.DYN_SLIPPAGE_VOL_CAP)
+
+        # Volume multiplier: lower relative volume -> less liquidity -> higher cost
+        rel_vol_safe = np.where(
+            np.isfinite(rel_vol) & (rel_vol > 0.01), rel_vol, 1.0
+        )
+        volume_mult = np.clip(
+            1.0 / rel_vol_safe,
+            self.DYN_SLIPPAGE_VOLUME_FLOOR,
+            self.DYN_SLIPPAGE_VOLUME_CAP,
+        )
+
+        # Combine via geometric mean
+        combined = np.sqrt(vol_mult * volume_mult)
+        combined = np.clip(
+            combined, self.DYN_SLIPPAGE_MIN_MULT, self.DYN_SLIPPAGE_MAX_MULT
+        )
+
+        return combined
 
     async def _log_lifecycle(self, trace_id, strategy_id, stage, status, metadata=None):
         if not trace_id:
@@ -646,7 +759,7 @@ class BacktestRunner(BaseAgent):
         train_end = int(n * 0.6)
         test_end = int(n * 0.8)
 
-        def calc_metrics_institutional(sub_df):
+        def calc_metrics_institutional(sub_df, dyn_mult=None):
             if len(sub_df) == 0:
                 return (0.0, 0.0, 0.0, 0.0, 0.0, 0, 1.0)
 
@@ -654,13 +767,18 @@ class BacktestRunner(BaseAgent):
 
             sub_df["market_return"] = sub_df["close"].pct_change().fillna(0)
 
-            entry_cost = self.commission_pct + self.slippage_pct + self.spread_cost_pct
-            exit_cost = self.commission_pct + self.slippage_pct + self.spread_cost_pct
-            total_roundtrip_cost = entry_cost + exit_cost
+            per_side_base = self.commission_pct + self.slippage_pct + self.spread_cost_pct
+
+            if dyn_mult is not None and len(dyn_mult) == len(sub_df):
+                per_side_cost = per_side_base * dyn_mult
+                total_roundtrip = per_side_cost * 2
+            else:
+                total_flat = per_side_base * 2
+                total_roundtrip = np.full(len(sub_df), total_flat)
 
             sub_df["trade_cost"] = np.where(
                 sub_df["position"].diff().fillna(0) != 0,
-                total_roundtrip_cost,
+                total_roundtrip,
                 0.0,
             )
 
@@ -736,6 +854,14 @@ class BacktestRunner(BaseAgent):
         test_df = df.iloc[train_end:test_end]
         holdout_df = df.iloc[test_end:]
 
+        # Compute dynamic slippage multipliers
+        dyn_mult = self._compute_dynamic_slippage(df)
+        df["_dyn_slippage_mult"] = dyn_mult
+
+        train_mult = dyn_mult[:train_end]
+        test_mult = dyn_mult[train_end:test_end]
+        holdout_mult = dyn_mult[test_end:]
+
         if is_short_window(df):
             sw_train = compute_short_window_metrics(
                 train_df,
@@ -745,6 +871,7 @@ class BacktestRunner(BaseAgent):
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
+                dynamic_slippage=train_mult,
             )
             sw_test = compute_short_window_metrics(
                 test_df,
@@ -754,6 +881,7 @@ class BacktestRunner(BaseAgent):
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
+                dynamic_slippage=test_mult,
             )
             sw_holdout = compute_short_window_metrics(
                 holdout_df,
@@ -763,6 +891,7 @@ class BacktestRunner(BaseAgent):
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
+                dynamic_slippage=holdout_mult,
             )
 
             composite = compute_composite_short_window_score(sw_holdout)
@@ -777,6 +906,8 @@ class BacktestRunner(BaseAgent):
                 f"WR={sw_holdout['win_rate']:.1%} | "
                 f"Composite={composite}"
             )
+
+            regime_score = self._compute_regime_score(df, signals)
 
             results = {
                 "total_return": float(sw_holdout["total_return"]),
@@ -800,12 +931,13 @@ class BacktestRunner(BaseAgent):
                 "gross_edge": float(sw_holdout["gross_edge"]),
                 "cost_burden": float(sw_holdout["cost_burden"]),
                 "avg_return_per_trade": float(sw_holdout["avg_return_per_trade"]),
+                "regime_score": float(regime_score),
             }
             return results, trades
 
         # INSTITUTIONAL MODE — full annualized Sharpe (requires >20k bars)
-        _, _, train_sharpe, _, _, _, _ = calc_metrics_institutional(train_df)
-        _, _, test_sharpe, _, _, _, _ = calc_metrics_institutional(test_df)
+        _, _, train_sharpe, _, _, _, _ = calc_metrics_institutional(train_df, train_mult)
+        _, _, test_sharpe, _, _, _, _ = calc_metrics_institutional(test_df, test_mult)
 
         (
             h_ret,
@@ -815,9 +947,11 @@ class BacktestRunner(BaseAgent):
             h_win_rate,
             h_total_trades,
             h_profit_factor,
-        ) = calc_metrics_institutional(holdout_df)
+        ) = calc_metrics_institutional(holdout_df, holdout_mult)
 
         calmar_ratio = h_cagr / abs(h_max_drawdown) if h_max_drawdown < 0 else 0.0
+
+        regime_score = self._compute_regime_score(df, signals)
 
         return {
             "total_return": float(h_ret),
@@ -840,6 +974,7 @@ class BacktestRunner(BaseAgent):
             "gross_edge": 0.0,
             "cost_burden": 0.0,
             "avg_return_per_trade": 0.0,
+            "regime_score": float(regime_score),
         }, trades
 
 

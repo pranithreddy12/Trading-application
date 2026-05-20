@@ -11,27 +11,27 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from atlas.validation.base_stage import BaseStage
-from atlas.validation.models import (
+from .base_stage import BaseStage
+from .models import (
     DefectType,
     Evidence,
     StageResult,
     StageStatus,
     ValidationOutput,
 )
-from atlas.validation.stages.schema_stage import SchemaStage
-from atlas.validation.stages.key_gen_stage import KeyGenStage
-from atlas.validation.stages.route_stage import RouteStage
-from atlas.validation.stages.rate_limit_stage import RateLimitStage
-from atlas.validation.stages.health_stage import HealthStage
-from atlas.validation.stages.copy_stage import CopyStage
-from atlas.validation.stages.security_matrix_stage import SecurityMatrixStage
-from atlas.validation.stages.audit_stage import AuditStage
-from atlas.validation.stages.restart_stage import RestartStage
-from atlas.validation.stages.latency_stage import LatencyStage
-from atlas.validation.stages.mutator_check import MutatorCheckStage
-from atlas.validation.stages.contract_stage import ContractStage
-from atlas.validation.stages.event_lineage_stage import EventLineageStage
+from .stages.schema_stage import SchemaStage
+from .stages.key_gen_stage import KeyGenStage
+from .stages.route_stage import RouteStage
+from .stages.rate_limit_stage import RateLimitStage
+from .stages.health_stage import HealthStage
+from .stages.copy_stage import CopyStage
+from .stages.security_matrix_stage import SecurityMatrixStage
+from .stages.audit_stage import AuditStage
+from .stages.restart_stage import RestartStage
+from .stages.latency_stage import LatencyStage
+from .stages.mutator_check import MutatorCheckStage
+from .stages.contract_stage import ContractStage
+from .stages.event_lineage_stage import EventLineageStage
 
 
 class ValidationContext:

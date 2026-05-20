@@ -8,7 +8,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from atlas.validation.harness import ValidationHarness
+from .harness import ValidationHarness
 
 
 async def main():

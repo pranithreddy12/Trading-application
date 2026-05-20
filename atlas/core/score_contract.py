@@ -3,17 +3,71 @@ score_contract.py — Single Source of Truth for Institutional Strategy Scoring.
 
 This contract normalizes scoring logic across the entire ATLAS ecosystem (Validators, Mutators, Ideators, Meta-Agents).
 It resolves schema drift by strictly mapping physical backtest result fields to a unified 'institutional_score'.
+
+Phase 11 Extension — Advanced Validation & Pattern Intelligence Scoring:
+
+New weighted score inputs (optional, additive):
+- walk_forward_score      — temporal robustness from Walk-Forward Analyzer
+- monte_carlo_survival    — survival rate from Monte Carlo Simulator
+- robustness_score        — overfitting resistance from Overfitting Detector
+- regime_survival_score   — regime count from Regime Validator
+- cost_survival_score     — cost stress survival from Cost Stress Tester
+- feature_quality_score   — feature ranking quality from Feature Importance Engine
+
+Final scoring formula:
+  composite = base_score × regime_adjustment
+            + walk_forward_bonus
+            + monte_carlo_bonus
+            + robustness_bonus
+            + regime_survival_bonus
+            + cost_survival_bonus
+            + feature_quality_bonus
+  clamped to [0, 100]
 """
 
 PRIMARY_SCORE_FIELD = "institutional_score"
 
+# Phase 11 — Advanced validation weights (each contributes up to its max_bonus)
+ADVANCED_WEIGHTS = {
+    "walk_forward_score": {"weight": 0.15, "max_bonus": 15.0},
+    "monte_carlo_survival": {"weight": 0.12, "max_bonus": 12.0},
+    "robustness_score": {"weight": 0.10, "max_bonus": 10.0},
+    "regime_survival_score": {"weight": 0.10, "max_bonus": 10.0},
+    "cost_survival_score": {"weight": 0.08, "max_bonus": 8.0},
+    "feature_quality_score": {"weight": 0.05, "max_bonus": 5.0},
+}
+
+
+def compute_regime_adjustment(results: dict) -> float:
+    """
+    Compute a regime-based score adjustment [0.0, 0.3].
+
+    reward_scheme:
+      - regime_score >= 0.5 (multi-regime): multi_regime_bonus = +0.2
+      - regime_score < 0.5 (single-regime): no bonus, slight penalty = -0.05
+      - No data: neutral adjustment = 0.0
+    """
+    regime_score = float(results.get("regime_score", 0.0))
+    if regime_score >= 0.5:
+        return 0.2  # bonus for multi-regime robustness
+    elif regime_score > 0.0:
+        return -0.05  # slight penalty for single-regime overfit
+    return 0.0  # no data adjustment
+
+
 def compute_institutional_score(results: dict) -> float:
     """
     Computes the canonical institutional score for a strategy based on its backtest results.
-    
-    If temporal scores are available (e.g., score_7d, score_14d), it can weight them.
-    Currently defaults to 'short_window_score' as the provisional composite baseline, 
-    ensuring continuity while supporting future structural upgrades without breaking agents.
+
+    Scoring formula:
+      1. Base score = max(composite_score, short_window_score, 0)
+      2. Regime adjustment = compute_regime_adjustment(results)
+      3. Final = clamp(base_score * (1.0 + regime_adjustment), 0, 100)
+
+    This ensures:
+      - Multi-regime strategies get a boost (reward robustness)
+      - Single-regime strategies are slightly penalized (overfit risk)
+      - Regime_score of 0 (no trades) has no effect
     """
     if not results:
         return 0.0
@@ -21,14 +75,59 @@ def compute_institutional_score(results: dict) -> float:
     # If the system has migrated to explicitly passing 'institutional_score'
     if "institutional_score" in results:
         return float(results["institutional_score"])
-        
-    # If the legacy composite_score is present (and we want to honor it as truth for older runs)
-    if "composite_score" in results:
-        return float(results["composite_score"])
-        
-    # The current standard: short_window_score
-    if "short_window_score" in results:
-        return float(results["short_window_score"])
 
-    # Fallback zero
-    return 0.0
+    # Determine base score
+    base_score = 0.0
+    if "composite_score" in results:
+        base_score = float(results["composite_score"])
+    elif "short_window_score" in results:
+        base_score = float(results["short_window_score"])
+
+    base_score = max(base_score, 0.0)
+
+    # Apply regime adjustment
+    adjustment = compute_regime_adjustment(results)
+    adjusted = base_score * (1.0 + adjustment)
+
+    # Clamp to [0, 100]
+    return max(0.0, min(100.0, adjusted))
+
+
+def compute_advanced_institutional_score(results: dict) -> float:
+    """
+    Phase 11 — Advanced institutional score incorporating walk-forward, Monte Carlo,
+    overfit detection, regime validation, cost stress, and feature importance.
+
+    Formula:
+      composite = base_score × regime_adjustment
+                + ∑(advanced_score × weight × scale_factor)
+
+    where each advanced_score is normalized [0, 1] and multiplied by its max_bonus.
+    """
+    if not results:
+        return 0.0
+
+    base_score = 0.0
+    if "composite_score" in results:
+        base_score = float(results["composite_score"])
+    elif "short_window_score" in results:
+        base_score = float(results["short_window_score"])
+    base_score = max(base_score, 0.0)
+
+    # Regime adjustment on base
+    adjustment = compute_regime_adjustment(results)
+    composite = base_score * (1.0 + adjustment)
+
+    # Add advanced validation bonuses
+    for field, cfg in ADVANCED_WEIGHTS.items():
+        raw = results.get(field)
+        if raw is not None:
+            try:
+                val = float(raw)
+                # Normalize: most are [0, 1] but clamp to be safe
+                normalized = max(0.0, min(1.0, val))
+                composite += normalized * cfg["max_bonus"]
+            except (ValueError, TypeError):
+                pass
+
+    return max(0.0, min(100.0, composite))

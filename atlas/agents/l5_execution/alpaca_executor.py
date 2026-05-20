@@ -54,7 +54,7 @@ class AlpacaExecutor(BaseAgent):
     async def _process_signal(self, data: dict):
         """Legacy compatibility for old tests."""
         warnings.warn("Use ExecutionGateway.execute() instead.", DeprecationWarning)
-        if await KillSwitch.is_active(self.redis):
+        if await KillSwitch.is_active(self.db):
             return
 
         trade_req = {

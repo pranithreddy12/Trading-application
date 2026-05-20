@@ -18,11 +18,14 @@ from atlas.agents.l2_strategy.strategy_normalizer import (
     normalize_strategy,
     validate_strategy,
     compute_strategy_signature,
+    _known_features_in,
+    _FEATURE_FAMILIES,
 )
 from atlas.core.execution_cost_intelligence import (
     generate_cost_priors,
     estimate_round_trip_cost,
     classify_cost_profile,
+    get_cost_governance_thresholds,
 )
 
 ARCHETYPES = [
@@ -258,11 +261,119 @@ DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
 }
 
 
+# =====================================================
+# STRATEGY GRAMMAR — Phase 19A deterministic generation
+# =====================================================
+STRATEGY_GRAMMAR = {
+    "momentum": {
+        "families": ["momentum", "volume"],
+        "secondary": ["trend"],
+        "entry_templates": [
+            ("ema_spread_pct", ">", (0.001, 0.005)),
+            ("relative_volume", ">", (1.2, 2.5)),
+            ("price_vs_vwap_pct", ">", (0.001, 0.005)),
+            ("trend_strength", ">", (0.001, 0.004)),
+        ],
+        "exit_templates": [
+            ("ema_spread_pct", "<", (-0.001, 0.0)),
+            ("rsi_14", ">", (65, 75)),
+        ],
+        "valid_regimes": ["bullish", "trending", "high_vol"],
+    },
+    "mean_reversion": {
+        "families": ["oscillator", "volatility"],
+        "secondary": ["volume"],
+        "entry_templates": [
+            ("rsi_14", "<", (28, 38)),
+            ("bollinger_band_position", "<", (0.1, 0.2)),
+            ("price_vs_vwap_pct", "<", (-0.005, -0.002)),
+        ],
+        "exit_templates": [
+            ("rsi_14", ">", (55, 65)),
+            ("bollinger_band_position", ">", (0.65, 0.8)),
+        ],
+        "valid_regimes": ["oversold", "ranging", "normal_vol"],
+    },
+    "breakout": {
+        "families": ["volatility", "volume"],
+        "secondary": ["momentum"],
+        "entry_templates": [
+            ("bollinger_band_position", ">", (0.85, 0.95)),
+            ("relative_volume", ">", (1.5, 2.5)),
+            ("volatility_regime", ">", (1.3, 1.8)),
+        ],
+        "exit_templates": [
+            ("rsi_14", ">", (70, 80)),
+            ("bollinger_band_position", "<", (0.5, 0.7)),
+        ],
+        "valid_regimes": ["high_vol", "bullish", "trending"],
+    },
+    "volatility_expansion": {
+        "families": ["volatility", "momentum"],
+        "secondary": ["oscillator"],
+        "entry_templates": [
+            ("volatility_regime", ">", (1.3, 1.8)),
+            ("rsi_14", "<", (35, 42)),
+            ("bollinger_band_position", "<", (0.15, 0.3)),
+        ],
+        "exit_templates": [
+            ("volatility_regime", "<", (0.8, 1.0)),
+            ("rsi_14", ">", (50, 60)),
+        ],
+        "valid_regimes": ["high_vol", "low_vol"],
+    },
+    "trend_following": {
+        "families": ["trend", "momentum"],
+        "secondary": ["volume"],
+        "entry_templates": [
+            ("ema_12", ">", "ema_26"),
+            ("trend_strength", ">", (0.001, 0.004)),
+            ("price_vs_vwap_pct", ">", (0.001, 0.003)),
+        ],
+        "exit_templates": [
+            ("ema_12", "<", "ema_26"),
+            ("trend_strength", "<", (-0.001, 0.0)),
+        ],
+        "valid_regimes": ["bullish", "bearish", "trending"],
+    },
+    "volatility_regime": {
+        "families": ["volatility", "oscillator"],
+        "secondary": ["volume"],
+        "entry_templates": [
+            ("volatility_regime", ">", (1.3, 1.8)),
+            ("rsi_14", "<", (35, 42)),
+            ("bollinger_band_position", "<", (0.15, 0.3)),
+        ],
+        "exit_templates": [
+            ("volatility_regime", "<", (0.8, 1.0)),
+            ("rsi_14", ">", (50, 60)),
+        ],
+        "valid_regimes": ["high_vol", "low_vol"],
+    },
+    "liquidity_absorption": {
+        "families": ["volume", "price"],
+        "secondary": ["oscillator"],
+        "entry_templates": [
+            ("relative_volume", ">", (1.8, 3.0)),
+            ("price_vs_vwap_pct", "<", (-0.003, -0.001)),
+            ("rsi_14", "<", (30, 40)),
+        ],
+        "exit_templates": [
+            ("relative_volume", "<", (1.0, 1.3)),
+            ("price_vs_vwap_pct", ">", (0.0, 0.002)),
+        ],
+        "valid_regimes": ["ranging", "normal_vol", "oversold"],
+    },
+}
+
+
 class IdeatorAgentV2(BaseAgent):
     """
     Optimized ideator — real context, compressed prompts, cached DB.
     max_tokens=1500, context refreshed every 10 cycles.
     NOW WITH: Execution Cost Intelligence Layer integration for cost-aware generation.
+    Phase 19A: Deterministic grammar-based generation as DEFAULT path.
+              Claude repositioned as optional meta-advisor (USE_LLM_META_ADVISOR).
     """
 
     def __init__(
@@ -294,11 +405,23 @@ class IdeatorAgentV2(BaseAgent):
         self._CACHE_TTL: int = 10
         self._failure_warned: bool = False
         self._context_enabled: bool = True
+
+        # Diversity governance — reject strategies with >70% feature overlap
+        # 55-70% zone: soft penalty (feature variety encouraged but not rigidly enforced)
+        self.DIVERSITY_SIMILARITY_THRESHOLD = 0.70
+        self.DIVERSITY_SOFT_PENALTY_START = 0.55
         
         # Cost Intelligence Feature Flag
         self._cost_intelligence_enabled = os.environ.get(
             "EXECUTION_COST_INTELLIGENCE", "ADVISORY"
         ) in ("ADVISORY", "ENFORCED", "FULL", "ON")
+
+        # Phase 19A: LLM Meta-Advisor flag
+        # When False: ALL generation is deterministic (grammar + templates)
+        # When True: deterministic generation + optional Claude advisory enrichment
+        self._llm_meta_advisor = os.environ.get(
+            "USE_LLM_META_ADVISOR", "false"
+        ).lower() == "true"
 
     async def run(self):
         logger.info(
@@ -319,11 +442,26 @@ class IdeatorAgentV2(BaseAgent):
                     await asyncio.sleep(15)
                     continue
 
-                # Dedup
+                # Dedup — exact signature match
                 sig = compute_strategy_signature(spec)
                 existing = await self.db_client.get_strategy_signatures(limit=500)
                 if sig in existing:
                     logger.info(f"{self.name}: Duplicate — skip")
+                    await asyncio.sleep(5)
+                    continue
+
+                # Diversity governance — reject if too similar to recent strategies
+                existing_combos = await self.db_client.get_recent_feature_combos(limit=50)
+                accepted, div_reason = self._check_diversity(spec, existing_combos)
+                if not accepted:
+                    logger.info(f"{self.name}: Diversity reject — {div_reason}")
+                    await asyncio.sleep(5)
+                    continue
+
+                # Economic constraint governance — reject over-trading strategies
+                econ_ok, econ_reason = self._check_economic_constraints(spec)
+                if not econ_ok:
+                    logger.info(f"{self.name}: Economic reject — {econ_reason}")
                     await asyncio.sleep(5)
                     continue
 
@@ -359,11 +497,9 @@ class IdeatorAgentV2(BaseAgent):
 
             except Exception as e:
                 logger.error(f"{self.name}: {e}", exc_info=True)
-                await asyncio.sleep(10)
-
-    # ─────────────────────────────────────────────────────────
-    # CONTEXT — cached, compressed
-    # ─────────────────────────────────────────────────────────
+                await asyncio.sleep(10)        # ─────────────────────────────────────────────────────────
+        # CONTEXT — cached, compressed
+        # ─────────────────────────────────────────────────────────
     async def _build_context(self) -> dict:
         if not self._context_enabled:
             return {
@@ -375,6 +511,7 @@ class IdeatorAgentV2(BaseAgent):
                 "success_summary": "Context enrichment disabled.",
                 "recent_names": [],
                 "pattern_intelligence": "Context enrichment disabled.",
+                "diversity_intelligence": "Context enrichment disabled.",
             }
         ctx = {
             "archetype": self._archetype,
@@ -385,6 +522,7 @@ class IdeatorAgentV2(BaseAgent):
             "success_summary": "No validated strategies yet.",
             "recent_names": [],
             "pattern_intelligence": "No pattern data yet.",
+            "diversity_intelligence": "No data on feature usage.",
         }
 
         try:
@@ -563,6 +701,37 @@ class IdeatorAgentV2(BaseAgent):
         except Exception as e:
             ctx["pattern_intelligence"] = f"Pattern fetch failed: {e}"
 
+        # ─────────────────────────────────────────────────────────
+        # DIVERSITY INTELLIGENCE CONTEXT (NEW)
+        # ─────────────────────────────────────────────────────────
+        try:
+            combos = await self.db_client.get_recent_feature_combos(limit=50)
+            if combos:
+                # Aggregate overrepresented feature families per archetype
+                from collections import Counter
+                arch_counter: dict[str, Counter] = {}
+                for features, archetype in combos:
+                    if archetype not in arch_counter:
+                        arch_counter[archetype] = Counter()
+                    for feat in features:
+                        arch_counter[archetype][feat] += 1
+                
+                lines = []
+                for archetype, counter in sorted(arch_counter.items()):
+                    # Print top-5 most overused features for this archetype
+                    top = counter.most_common(5)
+                    feat_list = ", ".join(f"{f} ({c}x)" for f, c in top)
+                    lines.append(f"{archetype}: {feat_list}")
+                
+                ctx["diversity_intelligence"] = (
+                    "OVERUSED FEATURES BY ARCHETYPE (avoid these combos):\n"
+                    + "\n".join(lines)
+                )
+            else:
+                ctx["diversity_intelligence"] = "No data on feature usage."
+        except Exception as e:
+            ctx["diversity_intelligence"] = f"Diversity fetch failed: {e}"
+
         try:
             import os
             mutation_enabled = os.environ.get("MUTATION_INTELLIGENCE", "OFF") == "ON"
@@ -588,24 +757,80 @@ class IdeatorAgentV2(BaseAgent):
             ctx["mutation_intelligence"] = f"Mutation fetch failed: {e}"
 
         # ─────────────────────────────────────────────────────────
+        # SCOUT INTELLIGENCE CONTEXT (Phase 10)
+        # ─────────────────────────────────────────────────────────
+        try:
+            scout = await self.db_client.get_latest_scout_intelligence()
+            scout_lines = []
+            if "regime" in scout:
+                r = scout["regime"]
+                scout_lines.append(
+                    f"Market: vol={r.get('volatility','?')}, trend={r.get('trend','?')}, "
+                    f"liq={r.get('liquidity','?')}, corr={r.get('correlation','?')}"
+                )
+            if "liquidity" in scout:
+                liq = scout["liquidity"]
+                scout_lines.append(
+                    f"Liquidity: regime={liq.get('regime','?')}, "
+                    f"score={liq.get('score',0):.0f}, risk={liq.get('risk',0):.1f}"
+                )
+            if "correlation" in scout:
+                c = scout["correlation"]
+                scout_lines.append(
+                    f"Correlation: cluster={c.get('cluster','?')}, "
+                    f"avg_corr={c.get('avg_corr',0):.2f}, state={c.get('risk_state','?')}"
+                )
+            if "execution" in scout:
+                e = scout["execution"]
+                scout_lines.append(
+                    f"Execution: regime={e.get('regime','?')}, "
+                    f"fill_score={e.get('fill_score',0):.0f}, slippage={e.get('slippage_bps',0):.1f}bps"
+                )
+            ctx["scout_intelligence"] = (
+                "\n".join(scout_lines) if scout_lines else "Scout intelligence not yet available."
+            )
+        except Exception as e:
+            ctx["scout_intelligence"] = f"Scout fetch failed: {e}"
+
+        # ─────────────────────────────────────────────────────────
         # COST INTELLIGENCE CONTEXT (NEW)
         # ─────────────────────────────────────────────────────────
         if self._cost_intelligence_enabled:
             try:
+                target_frequency = {
+                    "momentum": 45,
+                    "mean_reversion": 35,
+                    "breakout": 25,
+                    "trend_following": 18,
+                    "volatility_regime": 20,
+                }.get(self._archetype, 30)
                 cost_priors = generate_cost_priors(
                     asset_class=self._asset_class,
                     archetype=self._archetype,
-                    trade_frequency_target=None,  # Let ECIL use archetype defaults
+                    trade_frequency_target=target_frequency,
+                )
+                governance = get_cost_governance_thresholds(
+                    target_frequency,
+                    self._asset_class,
                 )
                 ctx["cost_intelligence"] = (
                     f"EXECUTION COST AWARENESS (Advisory):\n"
                     f"{cost_priors['cost_principle']}\n\n"
                     f"FREQUENCY GUIDANCE:\n{cost_priors['frequency_guidance']}\n\n"
                     f"COST AVOIDANCE:\n{cost_priors['cost_avoidance']}\n\n"
-                    f"EDGE REQUIREMENT:\n{cost_priors['edge_requirement']}"
+                    f"EDGE REQUIREMENT:\n{cost_priors['edge_requirement']}\n\n"
+                    f"GOVERNANCE THRESHOLDS:\n"
+                    f"min_edge_per_trade_bps={governance['min_edge_per_trade_bps']:.1f}, "
+                    f"min_win_rate={governance['min_win_rate']:.2f}, "
+                    f"min_profit_factor={governance['min_profit_factor']:.2f}, "
+                    f"risk_category={governance['risk_category']}"
                 )
                 rt_cost_bps = estimate_round_trip_cost(self._asset_class, bps=True)
-                ctx["cost_metrics"] = f"Round-trip cost: {rt_cost_bps:.0f} bps"
+                ctx["cost_metrics"] = (
+                    f"Round-trip cost: {rt_cost_bps:.0f} bps | "
+                    f"Target frequency: {target_frequency} | "
+                    f"Avoid: excessive crossover frequency, hyper-reactive RSI bands, ultra-tight exits"
+                )
             except Exception as e:
                 logger.warning(f"{self.name}: Cost intelligence fetch failed: {e}")
                 ctx["cost_intelligence"] = "Cost Intelligence UNAVAILABLE"
@@ -617,15 +842,424 @@ class IdeatorAgentV2(BaseAgent):
         return ctx
 
     # ─────────────────────────────────────────────────────────
-    # GENERATE — routes by mode
+    # DIVERSITY GOVERNANCE
     # ─────────────────────────────────────────────────────────
-    async def _generate(self, ctx: dict) -> tuple[dict | None, str | None, str | None]:
+    def _check_diversity(
+        self,
+        spec: dict,
+        recent_combos: list[tuple[set[str], str]],
+    ) -> tuple[bool, str]:
+        """
+        Two-tier diversity governance:
+        - >= 70% overlap: HARD REJECT (too similar, collapses search space)
+        - 55-70% overlap: SOFT PENALTY (allowed but logged for monitoring)
+        - < 55%: PASS freely
+
+        Compares feature sets using Jaccard similarity.
+        Guards against Claude collapsing into 100 variants of RSI+Bollinger.
+        """
+        entry = spec.get("entry_conditions", [])
+        exit_ = spec.get("exit_conditions", [])
+
+        # Extract all feature names used in this strategy's conditions
+        new_features: set[str] = set()
+        for cond in entry + exit_:
+            if isinstance(cond, str):
+                new_features |= _known_features_in(cond)
+
+        if not new_features:
+            return True, "no features to compare"
+
+        # Compute feature families for family-level diversity check
+        new_families: set[str] = set()
+        for feat in new_features:
+            family = _FEATURE_FAMILIES.get(feat)
+            if family:
+                new_families.add(family)
+
+        # Check for single-family collapse (e.g. ONLY oscillators)
+        if len(new_families) == 1:
+            return False, (
+                f"single feature family only ({list(new_families)[0]}) — "
+                f"diverse families required"
+            )
+
+        max_overlap = 0.0
+        worst_match = ""
+        soft_penalty_logged = False
+
+        for existing_features, archetype in recent_combos:
+            if not existing_features:
+                continue
+            # Jaccard similarity: |intersection| / |union|
+            intersection = new_features & existing_features
+            union = new_features | existing_features
+            jaccard = len(intersection) / len(union) if union else 0.0
+
+            if jaccard > max_overlap:
+                max_overlap = jaccard
+                worst_match = archetype
+
+            # HARD REJECT: overlap >= 70%
+            if jaccard >= self.DIVERSITY_SIMILARITY_THRESHOLD:
+                shared = ", ".join(sorted(intersection)[:5])
+                return False, (
+                    f"feature overlap {jaccard:.0%} with recent {archetype} strategy "
+                    f"(shared: {shared}) — above {self.DIVERSITY_SIMILARITY_THRESHOLD:.0%} hard reject threshold"
+                )
+
+        # Log soft penalty ONCE after loop (not per-comparison to avoid spam)
+        if not soft_penalty_logged and max_overlap >= self.DIVERSITY_SOFT_PENALTY_START:
+            soft_penalty_logged = True
+            logger.info(
+                f"{self.name}: Diversity soft penalty — {max_overlap:.0%} max overlap "
+                f"(archetype={worst_match}) — throughput allowed"
+            )
+
+        # Log the best match for monitoring
+        if max_overlap > 0:
+            logger.debug(
+                f"Diversity: closest match = {max_overlap:.0%} (archetype={worst_match}), "
+                f"features={sorted(new_features)}"
+            )
+
+        return True, f"diverse (max_overlap={max_overlap:.0%})"
+
+    # ─────────────────────────────────────────────────────────
+    # ECONOMIC CONSTRAINT GOVERNANCE
+    # ─────────────────────────────────────────────────────────
+
+    _LOOSE_THRESHOLD_RULES: dict[str, list[tuple[str, float, str]]] = {
+        # feature: [(op, limit, direction)]
+        # direction "above" = value > limit triggers looseness warning
+        # direction "below" = value < limit triggers looseness warning
+        "rsi_14": [("<", 40, "below"), (">", 60, "below")],
+        "bollinger_band_position": [("<", 0.3, "below")],
+        "relative_volume": [(">", 1.2, "below")],
+        "ema_spread_pct": [(">", 0.0005, "below")],
+        "price_vs_vwap_pct": [(">", 0.001, "below")],
+    }
+
+    def _estimate_trade_risk(self, spec: dict) -> tuple[str, str]:
+        """
+        Heuristically estimate whether a strategy would generate excessive trades
+        by analyzing condition threshold tightness and pattern risk factors.
+
+        Returns ("low"|"medium"|"high", detailed_reason).
+        """
+        import re
+        entry = spec.get("entry_conditions", [])
+        exit_ = spec.get("exit_conditions", [])
+        all_conds = entry + exit_
+
+        if not all_conds:
+            return "low", "no conditions to evaluate"
+
+        loose_count = 0
+        loose_details: list[str] = []
+
+        for cond in all_conds:
+            if not isinstance(cond, str):
+                continue
+            cond_lower = cond.lower()
+            for feature, rules in self._LOOSE_THRESHOLD_RULES.items():
+                if feature not in cond_lower:
+                    continue
+                for op, limit, direction in rules:
+                    # Extract numeric threshold after the operator
+                    pattern = re.escape(op) + r"\s*([\d.]+)"
+                    m = re.search(re.escape(feature) + r"\s*" + pattern, cond_lower)
+                    if not m:
+                        continue
+                    try:
+                        val = float(m.group(1))
+                    except (ValueError, IndexError):
+                        continue
+
+                    is_loose = False
+                    if op == "<" and val > limit:
+                        is_loose = True
+                    elif op == ">" and val < limit:
+                        is_loose = True
+
+                    if is_loose:
+                        loose_count += 1
+                        loose_details.append(
+                            f"{feature} {op} {val} (should be {op} {limit})"
+                        )
+
+        # Check for micro-scalping: oscillator-only with no trend/volume filter
+        features: set[str] = set()
+        for cond in all_conds:
+            if isinstance(cond, str):
+                features |= _known_features_in(cond)
+        families: set[str] = set()
+        for f in features:
+            fam = _FEATURE_FAMILIES.get(f)
+            if fam:
+                families.add(fam)
+
+        oscillator_only = (
+            len(families) <= 2
+            and "oscillator" in families
+            and "trend" not in families
+            and "volume" not in families
+        )
+
+        # Check for ultra-tight exit patterns
+        tight_exit = False
+        for cond in exit_:
+            if isinstance(cond, str):
+                c = cond.lower()
+                # Exits that would trigger on almost every bar
+                if "rsi_14 > 55" in c or "rsi_14 > 50" in c:
+                    tight_exit = True
+                if "bollinger_band_position > 0.6" in c or "bollinger_band_position > 0.5" in c:
+                    tight_exit = True
+                if "ema_spread_pct < 0.0" in c:
+                    tight_exit = True
+                if "price_vs_vwap_pct > 0.0" in c or "price_vs_vwap_pct < 0.0" in c:
+                    tight_exit = True
+
+        # Score risk
+        risk_score = loose_count * 2
+        reasons: list[str] = []
+
+        if oscillator_only:
+            risk_score += 3
+            reasons.append("oscillator-only with no trend/volume filter")
+
+        if tight_exit:
+            risk_score += 2
+            reasons.append("ultra-tight exit pattern (fires on most bars)")
+
+        if loose_count > 0:
+            reasons.append(f"{loose_count} loose threshold(s)")
+
+        if risk_score >= 5:
+            return "high", "; ".join(reasons) + " → likely >150 trades"
+        elif risk_score >= 3:
+            return "medium", "; ".join(reasons)
+        return "low", "; ".join(reasons) if reasons else "acceptable"
+
+    def _check_economic_constraints(self, spec: dict) -> tuple[bool, str]:
+        """
+        Hard gateway that rejects strategies likely to fail economic survivability.
+        Checks:
+        1. Trade frequency risk (threshold looseness)
+        2. Micro-scalping patterns (oscillator-only, no trend/volume filter)
+        3. Minimum edge implied by entry/exit asymmetry
+
+        Returns (accepted: bool, reason: str).
+        """
+        # Trade frequency check
+        risk, risk_reason = self._estimate_trade_risk(spec)
+
+        if risk == "high":
+            return False, (
+                f"HIGH TRADE FREQUENCY RISK: {risk_reason}. "
+                f"Rejected — strategies with >150 estimated trades on 1m data "
+                f"will not survive execution costs."
+            )
+
+        # Check for asymmetric reward:risk
+        entry = spec.get("entry_conditions", [])
+        exit_ = spec.get("exit_conditions", [])
+
+        # Simple check: if exit has more conditions than entry, it's more restrictive
+        # which means exits may not fire often enough → holding losers too long
+        if len(exit_) > len(entry) + 1:
+            logger.debug(f"Economic: exit ({len(exit_)}) >> entry ({len(entry)}) conditions — monitor")
+
+        # Check for missing stop/take profit
+        sl = spec.get("stop_loss", "")
+        tp = spec.get("take_profit", "")
+        if not sl or not tp:
+            logger.debug(f"Economic: missing stop_loss or take_profit for {spec.get('strategy_name')}")
+
+        return True, f"economic_ok (risk={risk}: {risk_reason})"
+
+    # ─────────────────────────────────────────────────────────
+    # GENERATE DISPATCHER — Phase 19A: Deterministic-first
+    # ─────────────────────────────────────────────────────────
+    async def _generate(self, ctx: dict):
         if self.mode == "local":
             return await self._generate_local(ctx)
-        elif self.mode == "lean":
-            return await self._call_claude(ctx, max_tokens=800)
-        else:  # rich
-            return await self._call_claude(ctx, max_tokens=1500)
+
+        # Phase 19A: ALL modes now default to deterministic grammar generation
+        spec, prompt, raw = await self._generate_deterministic_candidates(ctx)
+
+        if spec and self._llm_meta_advisor:
+            # Optional: Claude enriches metadata (name, hypothesis, reasoning)
+            # but NEVER modifies entry/exit conditions or thresholds
+            spec = await self._llm_advisory_enrichment(spec, ctx)
+
+        if spec:
+            return spec, prompt, raw
+
+        # Fallback chain: deterministic failed → try Claude if enabled → template
+        if self._llm_meta_advisor:
+            try:
+                max_tokens = 800 if self.mode == "lean" else 1500
+                result = await self._call_claude(ctx, max_tokens=max_tokens)
+                if result and result[0]:
+                    return result
+            except Exception as e:
+                logger.warning(f"{self.name}: Claude fallback failed: {e}")
+
+        # Ultimate fallback: proven templates
+        return await self._generate_local(ctx)
+
+    # ─────────────────────────────────────────────────────────
+    # DETERMINISTIC GRAMMAR ENGINE — Phase 19A
+    # ─────────────────────────────────────────────────────────
+    async def _generate_deterministic_candidates(
+        self, ctx: dict
+    ) -> tuple[dict | None, str | None, str | None]:
+        """
+        Generate strategy candidates using structured grammar + probabilistic
+        feature selection + regime awareness. No LLM calls.
+        """
+        asset = ctx["asset_class"]
+        archetype = ctx["archetype"]
+        regime = ctx.get("regime", "neutral")
+
+        grammar = STRATEGY_GRAMMAR.get(archetype)
+        if not grammar:
+            # Unknown archetype — fall back to template
+            return None, None, None
+
+        # Select entry conditions from grammar templates
+        entry_pool = list(grammar["entry_templates"])
+        exit_pool = list(grammar["exit_templates"])
+
+        # Shuffle for diversity
+        random.shuffle(entry_pool)
+        random.shuffle(exit_pool)
+
+        # Pick 2-3 entry conditions, 1-2 exit conditions
+        n_entry = random.choice([2, 2, 3])
+        n_exit = random.choice([1, 1, 2])
+
+        entry_conditions = []
+        for tmpl in entry_pool[:n_entry]:
+            cond = self._resolve_grammar_template(tmpl, asset)
+            if cond:
+                entry_conditions.append(cond)
+
+        exit_conditions = []
+        for tmpl in exit_pool[:n_exit]:
+            cond = self._resolve_grammar_template(tmpl, asset)
+            if cond:
+                exit_conditions.append(cond)
+
+        if not entry_conditions or not exit_conditions:
+            return None, None, None
+
+        # Build valid_regimes from grammar + regime context
+        valid_regimes = list(grammar.get("valid_regimes", []))
+
+        # Construct spec
+        suffix = datetime.utcnow().strftime("%H%M%S") + f"_{random.randint(10, 99)}"
+        spec = {
+            "strategy_name": f"{archetype}_{asset}_det_{suffix}",
+            "hypothesis": f"Deterministic {archetype} on {asset} 1m — grammar-generated",
+            "reasoning": f"Grammar engine: {archetype} archetype with {', '.join(grammar['families'])} families",
+            "entry_conditions": entry_conditions,
+            "exit_conditions": exit_conditions,
+            "valid_regimes": valid_regimes,
+            "stop_loss": "0.5% below entry",
+            "take_profit": "1.0% above entry",
+            "position_sizing": "10% of portfolio",
+            "timeframe": "1m",
+            "asset_class": asset,
+            "expected_sharpe": 1.0,
+            "expected_win_rate": 0.50,
+            "risk_level": "medium",
+            "tags": [archetype, asset, "deterministic", "grammar"],
+        }
+
+        spec = normalize_strategy(spec)
+        valid, reason = validate_strategy(spec)
+        if not valid:
+            logger.debug(f"{self.name}: Grammar spec invalid: {reason}")
+            return None, None, None
+
+        return spec, "deterministic_grammar", None
+
+    def _resolve_grammar_template(
+        self, tmpl: tuple, asset: str
+    ) -> str | None:
+        """Resolve a grammar template to a concrete condition string."""
+        feature, op, threshold = tmpl
+
+        # Cross-feature comparison (e.g., ema_12 > ema_26)
+        if isinstance(threshold, str):
+            return f"{feature} {op} {threshold}"
+
+        # Numeric range — sample uniformly
+        if isinstance(threshold, tuple) and len(threshold) == 2:
+            lo, hi = threshold
+            # Asset-class adjustment for crypto (wider thresholds)
+            if asset == "crypto":
+                if feature in ("ema_spread_pct", "price_vs_vwap_pct", "trend_strength"):
+                    lo *= 1.5
+                    hi *= 1.5
+                elif feature == "relative_volume":
+                    lo = max(lo, 1.3)
+                    hi = max(hi, lo + 0.5)
+
+            val = round(random.uniform(lo, hi), 4)
+            return f"{feature} {op} {val}"
+
+        return None
+
+    async def _llm_advisory_enrichment(
+        self, spec: dict, ctx: dict
+    ) -> dict:
+        """
+        Phase 19A: Optional Claude enrichment for deterministic strategies.
+        ONLY enriches metadata (name, hypothesis, reasoning).
+        NEVER modifies entry_conditions, exit_conditions, or thresholds.
+        """
+        try:
+            entry_str = ", ".join(spec.get("entry_conditions", []))
+            exit_str = ", ".join(spec.get("exit_conditions", []))
+
+            raw = await self._claude.complete(
+                user=(
+                    f"Given this {spec.get('asset_class')} {spec.get('tags', [''])[0]} strategy:\n"
+                    f"Entry: {entry_str}\nExit: {exit_str}\n"
+                    f"Regime: {ctx.get('regime', 'neutral')}\n\n"
+                    f"Provide ONLY a JSON object with:\n"
+                    f'{{"strategy_name": "creative_name", '
+                    f'"hypothesis": "one sentence hypothesis", '
+                    f'"reasoning": "why this could work"}}\n'
+                    f"Do NOT modify conditions or thresholds."
+                ),
+                system="You label trading strategies with creative names and hypotheses. Output ONLY JSON.",
+                max_tokens=200,
+                temperature=0.6,
+            )
+
+            cleaned = raw.strip()
+            f = cleaned.find("{")
+            l = cleaned.rfind("}")
+            if f != -1 and l != -1:
+                enrichment = json.loads(cleaned[f:l + 1])
+                # ONLY overwrite metadata fields, NEVER conditions
+                if "strategy_name" in enrichment:
+                    spec["strategy_name"] = enrichment["strategy_name"]
+                if "hypothesis" in enrichment:
+                    spec["hypothesis"] = enrichment["hypothesis"]
+                if "reasoning" in enrichment:
+                    spec["reasoning"] = enrichment["reasoning"]
+                spec.setdefault("tags", []).append("llm_enriched")
+
+        except Exception as e:
+            logger.debug(f"{self.name}: LLM enrichment skipped: {e}")
+
+        return spec
 
     # ─────────────────────────────────────────────────────────
     # CLAUDE CALL — 800 or 1500 tokens
@@ -654,6 +1288,10 @@ class IdeatorAgentV2(BaseAgent):
 \n=== EXECUTION COST INTELLIGENCE (ADVISORY) ===
 {ctx.get("cost_intelligence", "Cost Intelligence DISABLED")}
 {ctx.get("cost_metrics", "")}
+    AVOID LIST:
+    - excessive crossover frequency
+    - hyper-reactive RSI bands
+    - ultra-tight exits
 """
 
         user_prompt = f"""Design ONE {archetype} strategy for 1-minute {asset} data.
@@ -669,7 +1307,23 @@ Structural Intelligence (learned patterns):
 {ctx.get("pattern_intelligence", "No pattern data yet.")}
 
 Mutation Intelligence (proven evolutionary priors):
-{ctx.get("mutation_intelligence", "Mutation Intelligence DISABLED")}{cost_block}
+{ctx.get("mutation_intelligence", "Mutation Intelligence DISABLED")}
+
+Diversity Intelligence (overused features to avoid):
+{ctx.get("diversity_intelligence", "No data on feature usage.")}
+
+Scout Intelligence (live market conditions):
+{ctx.get("scout_intelligence", "Scout intelligence pending.")}
+
+RECOMMENDATIONS FROM SCOUT:
+- If liquidity is thin or dangerous: discourage scalping, high-frequency churn, tight exits
+- If volatility is panic_vol: require wider stops, bias toward mean reversion or skip entries altogether
+- If trend is trending_up/trending_down: favor momentum/trend following, avoid mean reversion
+- If execution is degraded or stressed: widen expected edge requirements, reduce trade frequency target
+- If correlation is clustered or panic: avoid adding correlated positions, prefer regime-specific strategies
+- If liquidity is excellent and execution optimal: standard strategy generation allowed
+
+Scout intelligence is ADVISORY. Use it to bias your strategy construction toward the current market reality.{cost_block}
 APPROVED FEATURES (use ONLY these exact names):
   rsi_14, macd, macd_signal, ema_12, ema_26, sma_20,
   bollinger_upper, bollinger_lower, vwap,
@@ -686,19 +1340,51 @@ REALISTIC THRESHOLDS for {asset} 1m:
   ema_spread_pct: 0.0005-0.005
   volatility_regime: 0.8-2.0
 
+HARD ECONOMIC CONSTRAINTS:
+• Strategy WILL BE REJECTED if thresholds are too loose (entries fire on >20% of bars → 500+ trades).
+• Strategy WILL BE REJECTED if oscillator-only with no trend or volume filter (micro-scalping).
+• Strategy WILL BE REJECTED if ultra-tight exits (e.g. rsi_14 > 55, bollinger_position > 0.5) that fire on every bar.
+• Target: 10–80 trades over entire backtest. NOT 150. NOT 500.
+• Prefer wider profit targets, lower trade frequency, asymmetric risk/reward, trend persistence, durable momentum, multi-confirmation entries.
+• Reject noisy microstructure scalping, immediate mean-reversion exits, ultra-tight oscillators.
+
+REGIME INTELLIGENCE:
+• Strategies MUST specify valid_regimes — the market state(s) where this strategy works.
+• Valid regimes: high_vol, low_vol, normal_vol, bullish, bearish, trending, ranging, overbought, oversold.
+• A momentum strategy likely works in bullish, trending, high_vol regimes.
+• A mean_reversion strategy likely works in ranging, oversold, overbought regimes.
+• A breakout strategy likely works in high_vol, bullish regimes.
+• A trend_following strategy works best in bullish, bearish (directional), trending regimes.
+• A volatility_regime strategy works best in high_vol, low_vol regimes.
+• Pick 1-4 regimes that the strategy is DESIGNED for. Strategies restricted to a single regime are penalized.
+• The regime filter ensures strategies don't fire in inappropriate market conditions, massively improving PF and reducing false signals.
+
+REALISTIC THRESHOLDS for {asset} 1m:
+  rsi_14: 30-70 range (NOT <20 or >80 — too rare)
+  returns: {returns_range} per bar
+  relative_volume: 1.2-2.5 (NOT >4 — too rare)
+  bollinger_band_position: 0.1-0.9
+  ema_spread_pct: 0.0005-0.005
+  volatility_regime: 0.8-2.0
+
 CRITICAL: Each condition must trigger on 5-15% of bars minimum.
 Too restrictive = 0 trades = automatic failure.
+Too loose = >200 trades = automatic rejection for cost suicide.
 
 ✅ CORRECT conditions: "rsi_14 < 38", "relative_volume > 1.4",
    "bollinger_band_position < 0.2", "ema_spread_pct > 0.001"
 ❌ WRONG: "For LONG: close breaks above..." (natural language)
 ❌ WRONG: "rsi_14 < 15" (too extreme, never fires)
+❌ WRONG: "rsi_14 < 42" (too loose, fires on ~42% of bars = thousands of trades)
+❌ WRONG: "bollinger_band_position < 0.4" (too loose, fires on ~40%)
+✓ RIGHT: "bollinger_band_position < 0.2", "bollinger_band_position < 0.15"
 
 Output ONLY this JSON:
 {{"strategy_name":"unique_name","hypothesis":"one sentence",
 "reasoning":"why these thresholds trigger realistically",
 "entry_conditions":["feature op value","feature op value"],
 "exit_conditions":["feature op value"],
+"valid_regimes":["regime1","regime2"],
 "stop_loss":"0.5% below entry","take_profit":"1.0% above entry",
 "position_sizing":"10% of portfolio","timeframe":"1m",
 "asset_class":"{asset}","expected_sharpe":1.2,
@@ -783,6 +1469,16 @@ Output ONLY this JSON:
                 for c in entry
             ]
 
+        # Regime-aware valid_regimes per archetype
+        _REGIME_MAP = {
+            "momentum": ["bullish", "trending", "high_vol"],
+            "mean_reversion": ["oversold", "ranging", "normal_vol"],
+            "breakout": ["high_vol", "bullish", "trending"],
+            "trend_following": ["bullish", "bearish", "trending"],
+            "volatility_regime": ["high_vol", "low_vol"],
+        }
+        valid_regimes = _REGIME_MAP.get(archetype, [])
+
         suffix = datetime.utcnow().strftime("%H%M%S")
         spec = {
             "strategy_name": f"{archetype}_{asset}_tmpl_{suffix}",
@@ -790,6 +1486,7 @@ Output ONLY this JSON:
             "reasoning": "Proven template — guaranteed signal generation",
             "entry_conditions": entry,
             "exit_conditions": exit_,
+            "valid_regimes": valid_regimes,
             "stop_loss": "0.5% below entry",
             "take_profit": "1.0% above entry",
             "position_sizing": "10% of portfolio",

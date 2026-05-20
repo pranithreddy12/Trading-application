@@ -66,6 +66,34 @@ CREATE INDEX IF NOT EXISTS idx_dead_letter_severity
 CREATE INDEX IF NOT EXISTS idx_dead_letter_strategy
     ON execution_dead_letter(strategy_id);
 
+-- 3b. risk_state: persistent kill-switch governance for restart safety
+CREATE TABLE IF NOT EXISTS risk_state (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope           TEXT NOT NULL,
+    strategy_id     UUID NULL,
+    halted          BOOLEAN NOT NULL DEFAULT FALSE,
+    reason          TEXT,
+    triggered_by    TEXT,
+    activated_at    TIMESTAMPTZ,
+    released_at     TIMESTAMPTZ,
+    metadata        JSONB DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_state_scope ON risk_state(scope);
+
+INSERT INTO risk_state (
+    scope,
+    halted,
+    reason
+)
+VALUES (
+    'portfolio',
+    FALSE,
+    'initial_state'
+)
+ON CONFLICT DO NOTHING;
+
 -- 3. positions table upgrade: add strategy_id and broker columns
 -- (positions table already exists with: id, account_ref, symbol, qty, avg_price, side, created_at, updated_at)
 ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy_id UUID;

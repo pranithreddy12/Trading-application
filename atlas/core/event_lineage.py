@@ -15,6 +15,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from atlas.core.serialization import normalize_db_params, safe_json_dumps
+
 
 @dataclass
 class LifecycleEvent:
@@ -90,16 +92,16 @@ class EventLineageClient:
                         (:id, :trace_id, :strategy_id, :stage, :status, :actor,
                          :parent_event_id, :metadata, NOW())
                 """),
-                {
+                normalize_db_params({
                     "id": event_id,
                     "trace_id": trace_id,
-                    "strategy_id": strategy_id,
+                    "strategy_id": str(strategy_id) if strategy_id is not None else None,
                     "stage": stage,
                     "status": status,
                     "actor": actor,
-                    "parent_event_id": parent_event_id,
-                    "metadata": json.dumps(metadata or {}),
-                },
+                    "parent_event_id": str(parent_event_id) if parent_event_id is not None else None,
+                    "metadata": safe_json_dumps(metadata or {}),
+                }),
             )
         return event_id
 

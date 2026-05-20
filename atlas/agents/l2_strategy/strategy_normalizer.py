@@ -248,8 +248,60 @@ def normalize_strategy(spec: dict) -> dict:
     out.setdefault("expected_win_rate", 0.5)
     out.setdefault("risk_level", "medium")
     out.setdefault("tags", [])
+    out.setdefault("valid_regimes", [])  # empty = no regime restriction
+
+    # Normalize valid_regimes: ensure it's a list of lowercase strings
+    regimes = out.get("valid_regimes")
+    if not isinstance(regimes, list):
+        out["valid_regimes"] = []
+    else:
+        out["valid_regimes"] = [
+            r.strip().lower() for r in regimes if isinstance(r, str) and r.strip()
+        ]
+
+    # Economic parameter defaults — mutated by MutatorAgent Phase 5
+    out.setdefault("hold_time_min", 3)
+    out.setdefault("hold_time_max", 40)
+    out.setdefault("cooldown_bars", 5)
+    out.setdefault("stop_loss_pct", 2.0)  # % below entry
+    out.setdefault("take_profit_pct", 5.0)  # % above entry
+    out.setdefault("rr_ratio", 2.5)  # reward:risk ratio
+    out.setdefault("volatility_filter", None)  # None = no filter, or 'high_vol'/'low_vol'
 
     return out
+
+
+# =====================================================
+# ECONOMIC PARAMETER CONSTRAINTS
+# =====================================================
+MIN_HOLD_BARS_MIN = 1
+MIN_HOLD_BARS_MAX = 20
+MAX_HOLD_BARS_MIN = 10
+MAX_HOLD_BARS_MAX = 100
+COOLDOWN_BARS_MIN = 0
+COOLDOWN_BARS_MAX = 30
+
+
+def validate_economic_params(spec: dict) -> list[str]:
+    """
+    Validate economic parameters are within sensible bounds.
+    Returns list of warning strings (empty = all valid).
+    """
+    warnings = []
+    hold_min = spec.get("hold_time_min", 3)
+    hold_max = spec.get("hold_time_max", 40)
+    cooldown = spec.get("cooldown_bars", 5)
+
+    if hold_min < MIN_HOLD_BARS_MIN or hold_min > MIN_HOLD_BARS_MAX:
+        warnings.append(f"hold_time_min={hold_min} outside [{MIN_HOLD_BARS_MIN},{MIN_HOLD_BARS_MAX}]")
+    if hold_max < MAX_HOLD_BARS_MIN or hold_max > MAX_HOLD_BARS_MAX:
+        warnings.append(f"hold_time_max={hold_max} outside [{MAX_HOLD_BARS_MIN},{MAX_HOLD_BARS_MAX}]")
+    if hold_min >= hold_max:
+        warnings.append(f"hold_time_min ({hold_min}) >= hold_time_max ({hold_max})")
+    if cooldown < COOLDOWN_BARS_MIN or cooldown > COOLDOWN_BARS_MAX:
+        warnings.append(f"cooldown_bars={cooldown} outside [{COOLDOWN_BARS_MIN},{COOLDOWN_BARS_MAX}]")
+
+    return warnings
 
 
 # =====================================================
@@ -349,6 +401,19 @@ def validate_strategy(spec: dict) -> tuple[bool, str]:
 
     if _is_clone(entry, exit_):
         return False, "Rejected as EMA/RSI-only clone with no additional factors"
+
+    # Validate valid_regimes if specified
+    valid_regimes = spec.get("valid_regimes", [])
+    if valid_regimes:
+        ALLOWED_REGIMES = {
+            "high_vol", "low_vol", "normal_vol",
+            "bullish", "bearish",
+            "trending", "ranging",
+            "overbought", "oversold",
+        }
+        invalid = [r for r in valid_regimes if r not in ALLOWED_REGIMES]
+        if invalid:
+            return False, f"Invalid regime(s) in valid_regimes: {invalid}"
 
     return True, "ok"
 

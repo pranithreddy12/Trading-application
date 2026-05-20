@@ -7,19 +7,23 @@
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background: #0f1117; color: #e1e4e8; line-height: 1.5; padding: 20px; }
-  .container { max-width: 1400px; margin: 0 auto; }
+  .container { max-width: 1600px; margin: 0 auto; }
   header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
   header h1 { font-size: 20px; font-weight: 600; color: #58a6ff; }
   header .status-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 12px; font-size: 13px; font-weight: 500; }
   header .status-badge.ok { background: #0d4429; color: #3fb950; }
   header .status-badge.err { background: #441a1a; color: #f85149; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; margin-bottom: 20px; }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
   .card h3 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #8b949e; margin-bottom: 12px; }
   .card .value { font-size: 28px; font-weight: 700; color: #e1e4e8; }
   .card .sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
   .card .bar { display: flex; gap: 4px; margin-top: 8px; }
   .card .bar .seg { height: 6px; border-radius: 3px; min-width: 2px; }
+  .card .gauge { width: 100%; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+  .card .gauge .fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+  .card .gauge-label { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; margin-top: 4px; }
   .section-title { font-size: 16px; font-weight: 600; color: #e1e4e8; margin: 24px 0 12px; padding-bottom: 8px; border-bottom: 1px solid #30363d; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; padding: 8px 10px; color: #8b949e; font-weight: 600; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -43,7 +47,11 @@
   .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: #21262d; color: #8b949e; margin-right: 4px; }
   .scroll-x { overflow-x: auto; }
   .last-updated { text-align: right; font-size: 12px; color: #484f58; padding: 4px 0; }
-  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+  .metric-row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .metric { flex: 1; min-width: 100px; }
+  .metric .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.3px; }
+  .metric .val { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  @media (max-width: 600px) { .grid, .grid-3 { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -66,10 +74,16 @@ let refreshTimer = null;
 function statusChip(s) {
   if (!s) return '<span class="chip gray">unknown</span>';
   const lo = s.toLowerCase();
-  if (lo.includes('completed') || lo.includes('pass') || lo.includes('healthy') || lo.includes('active') || lo.includes('filled') || lo.includes('validated')) return '<span class="chip green">'+s+'</span>';
-  if (lo.includes('failed') || lo.includes('error') || lo.includes('unhealthy') || lo.includes('stale')) return '<span class="chip red">'+s+'</span>';
-  if (lo.includes('pending') || lo.includes('running') || lo.includes('skipped')) return '<span class="chip yellow">'+s+'</span>';
+  if (lo.includes('completed') || lo.includes('pass') || lo.includes('healthy') || lo.includes('active') || lo.includes('filled') || lo.includes('validated') || lo.includes('buy') || lo.includes('sell')) return '<span class="chip green">'+s+'</span>';
+  if (lo.includes('failed') || lo.includes('error') || lo.includes('unhealthy') || lo.includes('stale') || lo.includes('red')) return '<span class="chip red">'+s+'</span>';
+  if (lo.includes('pending') || lo.includes('running') || lo.includes('skipped') || lo.includes('hold')) return '<span class="chip yellow">'+s+'</span>';
   return '<span class="chip blue">'+s+'</span>';
+}
+
+function scoreBar(v, max=100) {
+  const pct = Math.min(Math.max((v/max)*100, 0), 100);
+  const color = pct >= 70 ? '#3fb950' : (pct >= 40 ? '#d29922' : '#f85149');
+  return '<div class="gauge"><div class="fill" style="width:'+pct+'%;background:'+color+'"></div></div><div class="gauge-label"><span>'+(typeof v==='number'?v.toFixed(1):v)+'</span><span>'+max+'</span></div>';
 }
 
 async function fetchJSON(url) {
@@ -79,9 +93,7 @@ async function fetchJSON(url) {
 }
 
 function renderOverview(data) {
-  const { system, strategies, backtests, lineage, patterns, briefs, execution, auth } = data;
-  const badges = [];
-  if (system) { badges.push({ label: 'Status', val: system.status || '?', cls: system.status==='ok'?'green':'red' }); }
+  const { system, strategies, backtests, lineage, patterns, briefs, execution, auth, portfolio, validation, monitoring, scouts } = data;
   document.getElementById('statusBadge').className = 'status-badge '+(system&&system.status==='ok'?'ok':'err');
   document.getElementById('statusBadge').textContent = system ? system.status : 'UNKNOWN';
 
@@ -90,9 +102,10 @@ function renderOverview(data) {
     { label: 'Backtests', val: (backtests&&backtests.total)||0, sub: 'completed' },
     { label: 'Lineage Events', val: (lineage&&lineage.total_events)||0, sub: ((lineage&&lineage.total_traces)||0)+' traces' },
     { label: 'Patterns', val: (patterns&&patterns.total)||0, sub: 'extracted' },
-    { label: 'Briefs', val: (briefs&&briefs.total)||0, sub: 'generated' },
-    { label: 'Paper Trades', val: (execution&&execution.total_paper_trades)||0, sub: 'executed' },
-    { label: 'Active API Keys', val: (auth&&auth.active_api_keys)||0, sub: 'authenticated' },
+    { label: 'Portfolio Intel', val: (portfolio&&portfolio.intel_runs)||0, sub: ((portfolio&&portfolio.allocations)||0)+' allocations' },
+    { label: 'Validation', val: (validation?validation.walk_forward+validation.monte_carlo:0)||0, sub: 'walk-forward + MC' },
+    { label: 'Drift Events', val: (monitoring&&monitoring.drift_events)||0, sub: 'monitoring scans' },
+    { label: 'Scout Signals', val: (scouts&&scouts.external_signals)||0, sub: 'external intelligence' },
   ];
 
   let html = '<div class="grid">';
@@ -107,8 +120,7 @@ function renderOverview(data) {
     const total = entries.reduce((s, [,v]) => s+v, 0) || 1;
     const colors = ['#3fb950','#d29922','#f85149','#58a6ff','#8b949e','#bc8cff'];
     entries.forEach(([k,v], i) => {
-      const pct = (v/total*100).toFixed(1);
-      html += '<div class="seg" style="flex:'+v+';background:'+colors[i%colors.length]+'" title="'+k+': '+v+' ('+pct+'%)"></div>';
+      html += '<div class="seg" style="flex:'+v+';background:'+colors[i%colors.length]+'" title="'+k+': '+v+'"></div>';
     });
     html += '</div><div class="sub" style="margin-top:6px">';
     entries.forEach(([k,v], i) => {
@@ -141,7 +153,7 @@ function renderPipeline(data) {
     for (const [stage, statuses] of Object.entries(lifecycle_events)) {
       const ok = statuses['completed']||0;
       const fail = statuses['failed']||0;
-      html += '<tr><td><span class="tag">'+stage+'</span></td><td class="text-right">'+ok+'</td><td class="text-right">'+fail+'</td></tr>';
+      html += '<tr><td><span class="tag">'+esc(stage)+'</span></td><td class="text-right">'+ok+'</td><td class="text-right">'+fail+'</td></tr>';
     }
     html += '</table>';
   } else {
@@ -233,29 +245,363 @@ function renderPatterns(data) {
 
 function renderRisk(data) {
   const { copy_trader, positions, pnl, kill_switch } = data;
-  let html = '<div class="grid">';
+  let html = '<div class=\"grid\">';
 
-  html += '<div class="card"><h3>Copy Executions</h3><div class="value">'+(copy_trader?.total_executions||0)+'</div>';
+  html += '<div class=\"card\"><h3>Copy Executions</h3><div class=\"value\">'+(copy_trader?.total_executions||0)+'</div>';
   if (copy_trader?.by_status) {
-    html += '<div class="sub" style="margin-top:6px">';
+    html += '<div class=\"sub\" style=\"margin-top:6px\">';
     for (const [k,v] of Object.entries(copy_trader.by_status)) {
-      html += '<span style="margin-right:8px;font-size:11px">'+k+': '+v+'</span>';
+      html += '<span style=\"margin-right:8px;font-size:11px\">'+k+': '+v+'</span>';
     }
     html += '</div>';
   }
   html += '</div>';
 
-  html += '<div class="card"><h3>Active Leaders</h3><div class="value">'+(copy_trader?.active_leaders||0)+'</div><div class="sub">followers: '+(copy_trader?.active_followers||0)+'</div></div>';
-  html += '<div class="card"><h3>Open Positions</h3><div class="value">'+(positions?.open||0)+'</div><div class="sub">paper trades</div></div>';
-  html += '<div class="card"><h3>Total PnL</h3><div class="value" style="color:'+((pnl?.total||0)>=0?'#3fb950':'#f85149')+'">$'+(pnl?.total||0).toLocaleString(undefined,{minimumFractionDigits:2})+'</div><div class="sub">all paper trades</div></div>';
-  html += '<div class="card"><h3>Kill Switch</h3><div class="value" style="color:'+(kill_switch?.active?'#f85149':'#3fb950')+'">'+(kill_switch?.active?'ACTIVE':'INACTIVE')+'</div>';
+  html += '<div class=\"card\"><h3>Active Leaders</h3><div class=\"value\">'+(copy_trader?.active_leaders||0)+'</div><div class=\"sub\">followers: '+(copy_trader?.active_followers||0)+'</div></div>';
+  html += '<div class=\"card\"><h3>Open Positions</h3><div class=\"value\">'+(positions?.open||0)+'</div><div class=\"sub\">paper trades</div></div>';
+  html += '<div class=\"card\"><h3>Total PnL</h3><div class=\"value\" style=\"color:'+((pnl?.total||0)>=0?'#3fb950':'#f85149')+'\">$'+(pnl?.total||0).toLocaleString(undefined,{minimumFractionDigits:2})+'</div><div class=\"sub\">all paper trades</div></div>';
+  html += '<div class=\"card\"><h3>Kill Switch</h3><div class=\"value\" style=\"color:'+(kill_switch?.active?'#f85149':'#3fb950')+'\">'+(kill_switch?.active?'ACTIVE':'INACTIVE')+'</div>';
   if (kill_switch?.active) {
-    html += '<div class="sub" style="color:#f85149">SYSTEM HALTED</div>';
+    html += '<div class=\"sub\" style=\"color:#f85149\">SYSTEM HALTED</div>';
   }
   html += '</div>';
 
   html += '</div>';
   document.getElementById('risk').innerHTML = html;
+}
+
+function renderPortfolio(data) {
+  const { portfolio_intelligence, capital_allocation, ensemble_trades } = data;
+  let html = '<div class=\"grid\">';
+  // Portfolio intelligence
+  if (portfolio_intelligence) {
+    const pi = portfolio_intelligence;
+    html += '<div class=\"card\"><h3>Portfolio Intelligence</h3>'
+      + '<div class=\"metric-row\">'
+      + '<div class=\"metric\"><div class=\"label\">Strategies</div><div class=\"val\">'+pi.n_strategies+'</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Diversification</div><div class=\"val\" style=\"color:'+(pi.diversification_score>=0.5?'#3fb950':'#d29922')+'\">'+(pi.diversification_score*100).toFixed(0)+'%</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Concentration Risk</div><div class=\"val\" style=\"color:'+(pi.concentration_risk<=0.3?'#3fb950':'#f85149')+'\">'+(pi.concentration_risk*100).toFixed(0)+'%</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Ensemble Survivability</div><div class=\"val\">'+(pi.ensemble_survivability*100).toFixed(0)+'%</div></div>'
+      + '</div></div>';
+  } else {
+    html += '<div class=\"card\"><h3>Portfolio Intelligence</h3><div class=\"sub\">No data yet</div></div>';
+  }
+  // Capital allocation
+  if (capital_allocation) {
+    const ca = capital_allocation;
+    html += '<div class=\"card\"><h3>Capital Allocation</h3>'
+      + '<div class=\"metric-row\">'
+      + '<div class=\"metric\"><div class=\"label\">Method</div><div class=\"val\" style=\"font-size:14px\">'+(ca.method||'--')+'</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Total Exposure</div><div class=\"val\">'+(ca.total_exposure*100).toFixed(0)+'%</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Strategies</div><div class=\"val\">'+ca.n_strategies+'</div></div>'
+      + '</div></div>';
+  } else {
+    html += '<div class=\"card\"><h3>Capital Allocation</h3><div class=\"sub\">No data yet</div></div>';
+  }
+  html += '</div>';
+
+  // Ensemble trades
+  if (ensemble_trades && ensemble_trades.length) {
+    html += '<div class=\"card mt-8\"><h3>Recent Ensemble Trades</h3>'
+      + '<div class=\"scroll-x\"><table><tr><th>Time</th><th class=\"text-right\">Signals</th><th class=\"text-right\">Trades</th></tr>';
+    for (const e of ensemble_trades) {
+      html += '<tr><td style=\"color:#8b949e;font-size:12px\">'+fmtTime(e.executed_at)+'</td>'
+        + '<td class=\"text-right\">'+e.signals+'</td>'
+        + '<td class=\"text-right\">'+e.trades+'</td></tr>';
+    }
+    html += '</table></div></div>';
+  }
+  document.getElementById('portfolio').innerHTML = html;
+}
+
+function renderValidation(data) {
+  const { walk_forward, monte_carlo, overfitting, regime_validation, cost_stress } = data;
+  let html = '<div class=\"grid-3\">';
+
+  if (walk_forward) {
+    html += '<div class=\"card\"><h3>Walk-Forward Analyzer</h3>'
+      + '<div class=\"metric\"><div class=\"label\">Walk-Forward Score</div>'+scoreBar(walk_forward.walk_forward_score, 100)+'</div>'
+      + '<div class=\"metric\"><div class=\"label\">Temporal Consistency</div>'+scoreBar(walk_forward.temporal_consistency, 100)+'</div>'
+      + '<div class=\"metric\"><div class=\"label\">Regime Survival Score</div>'+scoreBar(walk_forward.regime_survival_score, 100)+'</div>'
+      + '</div>';
+  }
+
+  if (monte_carlo) {
+    html += '<div class=\"card\"><h3>Monte Carlo Simulator</h3>'
+      + '<div class=\"metric\"><div class=\"label\">Survival Score</div>'+scoreBar(monte_carlo.survival_score, 100)+'</div>'
+      + '<div class=\"metric-row\">'
+      + '<div class=\"metric\"><div class=\"label\">Tail Drawdown</div><div class=\"val\" style=\"color:'+(monte_carlo.tail_drawdown<=-0.2?'#f85149':'#3fb950')+'\">'+(monte_carlo.tail_drawdown*100).toFixed(1)+'%</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Prob. Sharpe</div><div class=\"val\" style=\"color:'+(monte_carlo.prob_sharpe>=1?'#3fb950':'#d29922')+'\">'+monte_carlo.prob_sharpe.toFixed(2)+'</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Simulations</div><div class=\"val\">'+(monte_carlo.n_simulations||0)+'</div></div>'
+      + '</div></div>';
+  }
+
+  if (overfitting) {
+    html += '<div class=\"card\"><h3>Overfitting Detector</h3>'
+      + '<div class=\"metric\"><div class=\"label\">Overfit Probability</div>'+scoreBar(overfitting.overfit_probability, 100)+'</div>'
+      + '<div class=\"metric\"><div class=\"label\">Robustness Score</div>'+scoreBar(overfitting.robustness_score, 100)+'</div>'
+      + '<div class=\"metric\"><div class=\"label\">Parameter Stability</div>'+scoreBar(overfitting.stability_score, 100)+'</div>'
+      + '</div>';
+  }
+
+  if (regime_validation) {
+    html += '<div class=\"card\"><h3>Regime Validation</h3>'
+      + '<div class=\"metric\"><div class=\"label\">Survival Score</div>'+scoreBar(regime_validation.survival_score, 100)+'</div>'
+      + '<div class=\"metric-row\">'
+      + '<div class=\"metric\"><div class=\"label\">Regimes Survived</div><div class=\"val\">'+(regime_validation.n_regimes||0)+'</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Dependency</div><div class=\"val\">'+(regime_validation.dependency_score*100).toFixed(0)+'%</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Over-specialized</div><div class=\"val\" style=\"color:'+(regime_validation.over_specialized?'#f85149':'#3fb950')+'\">'+(regime_validation.over_specialized?'YES':'NO')+'</div></div>'
+      + '</div></div>';
+  }
+
+  if (cost_stress) {
+    html += '<div class=\"card\"><h3>Cost Stress Tester</h3>'
+      + '<div class=\"metric\"><div class=\"label\">Cost Survival Score</div>'+scoreBar(cost_stress.survival_score, 100)+'</div>'
+      + '<div class=\"metric-row\">'
+      + '<div class=\"metric\"><div class=\"label\">Max Multiplier</div><div class=\"val\">'+(cost_stress.max_multiplier||0).toFixed(1)+'x</div></div>'
+      + '<div class=\"metric\"><div class=\"label\">Fragile Scalper</div><div class=\"val\" style=\"color:'+(cost_stress.fragile_scalper?'#f85149':'#3fb950')+'\">'+(cost_stress.fragile_scalper?'DETECTED':'CLEAN')+'</div></div>'
+      + '</div></div>';
+  }
+
+  html += '</div>';
+  document.getElementById('validation').innerHTML = html;
+}
+
+function renderMonitoring(data) {
+  const { drift, retirement } = data;
+  let html = '<div class=\"flex\">';
+
+  if (drift) {
+    const composite = drift.composite_severity;
+    html += '<div class=\"card flex-grow\"><h3>Drift Detection</h3>';
+    html += '<div class=\"metric\"><div class=\"label\">Composite Severity</div>'+scoreBar(composite, 100)+'</div>';
+    html += '<div class=\"metric-row\">';
+    html += '<div class=\"metric\"><div class=\"label\">Feature Drift</div><div class=\"val\" style=\"color:'+(drift.feature_drift>=0.5?'#f85149':'#3fb950')+'\">'+(drift.feature_drift*100).toFixed(0)+'%</div></div>';
+    html += '<div class=\"metric\"><div class=\"label\">Strategy Drift</div><div class=\"val\" style=\"color:'+(drift.strategy_drift>=0.5?'#f85149':'#3fb950')+'\">'+(drift.strategy_drift*100).toFixed(0)+'%</div></div>';
+    html += '<div class=\"metric\"><div class=\"label\">Regime Drift</div><div class=\"val\" style=\"color:'+(drift.regime_drift>=0.5?'#f85149':'#3fb950')+'\">'+(drift.regime_drift*100).toFixed(0)+'%</div></div>';
+    html += '</div></div>';
+  } else {
+    html += '<div class=\"card flex-grow\"><h3>Drift Detection</h3><div class=\"sub\">No data yet</div></div>';
+  }
+
+  if (retirement) {
+    html += '<div class=\"card flex-grow\"><h3>Strategy Retirement</h3>';
+    html += '<div class=\"metric-row\">';
+    html += '<div class=\"metric\"><div class=\"label\">Analyzed</div><div class=\"val\">'+(retirement.n_analyzed||0)+'</div></div>';
+    html += '<div class=\"metric\"><div class=\"label\">Retired</div><div class=\"val\" style=\"color:#f85149\">'+(retirement.n_retired||0)+'</div></div>';
+    html += '<div class=\"metric\"><div class=\"label\">Monitor</div><div class=\"val\" style=\"color:#d29922\">'+(retirement.n_monitor||0)+'</div></div>';
+    html += '<div class=\"metric\"><div class=\"label\">Pending</div><div class=\"val\" style=\"color:#58a6ff\">'+(retirement.n_pending||0)+'</div></div>';
+    html += '</div></div>';
+  } else {
+    html += '<div class=\"card flex-grow\"><h3>Strategy Retirement</h3><div class=\"sub\">No data yet</div></div>';
+  }
+
+  html += '</div>';
+  document.getElementById('monitoring').innerHTML = html;
+}
+
+function renderFeatures(data) {
+  const { features } = data;
+  let html = '<div class=\"card\"><h3>Feature Importance Rankings</h3>';
+  if (features && features.length) {
+    html += '<div class=\"scroll-x\"><table><tr><th>Feature</th><th class=\"text-right\">Importance</th><th class=\"text-right\">Uses</th><th>Survival Rate</th><th>Dominant Archetype</th></tr>';
+    for (const f of features) {
+      html += '<tr><td><span class=\"tag\">'+esc(f.name)+'</span></td>'
+        + '<td class=\"text-right\">'+f.importance.toFixed(2)+'</td>'
+        + '<td class=\"text-right\">'+f.n_uses+'</td>'
+        + '<td>'+scoreBar((f.survival_rate||0)*100, 100)+'</td>'
+        + '<td>'+statusChip(f.dominant_archetype||'')+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class=\"sub\">No feature importance data yet</div>';
+  }
+  html += '</div>';
+  document.getElementById('features').innerHTML = html;
+}
+
+function renderExecutionRealism(data) {
+  const { simulations } = data;
+  let html = '<div class=\"card\"><h3>Execution Realism Simulations</h3>';
+  if (simulations && simulations.length) {
+    html += '<div class=\"scroll-x\"><table><tr><th>Time</th><th class=\"text-right\">Trades</th><th>Fill Prob</th><th class=\"text-right\">Slippage (bps)</th><th class=\"text-right\">Latency (ms)</th><th>Degradation</th></tr>';
+    for (const s of simulations) {
+      html += '<tr><td style=\"color:#8b949e;font-size:12px\">'+fmtTime(s.simulated_at)+'</td>'
+        + '<td class=\"text-right\">'+s.n_trades+'</td>'
+        + '<td>'+scoreBar(s.fill_prob*100, 100)+'</td>'
+        + '<td class=\"text-right\">'+s.slippage_bps.toFixed(1)+'</td>'
+        + '<td class=\"text-right\">'+s.latency_ms.toFixed(1)+'</td>'
+        + '<td>'+scoreBar(s.degradation_score*100, 100)+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class=\"sub\">No simulation data yet</div>';
+  }
+  html += '</div>';
+  document.getElementById('executionRealism').innerHTML = html;
+}
+
+function renderGovernance(data) {
+  const { system_health, event_store, audit, deployments, replay_integrity } = data;
+  let html = '<div class="flex">';
+  // System Health
+  if (system_health) {
+    html += '<div class="card flex-grow"><h3>System Health</h3>';
+    html += '<div class="metric"><div class="label">Composite Score</div>'+scoreBar((system_health.composite_score||0)*100, 100)+'</div>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Mode</div><div class="val" style="font-size:14px">'+(system_health.system_mode||'unknown')+'</div></div>';
+    html += '<div class="metric"><div class="label">Degraded</div><div class="val" style="color:'+((system_health.n_degraded||0)>0?'#f85149':'#3fb950')+'">'+(system_health.n_degraded||0)+'/'+(system_health.n_total||'?')+'</div></div>';
+    html += '</div></div>';
+  }
+  // Replay Integrity
+  if (replay_integrity) {
+    html += '<div class="card flex-grow"><h3>Replay Integrity</h3>';
+    html += '<div class="metric"><div class="label">Integrity Score</div>'+scoreBar((replay_integrity.integrity_score||0)*100, 100)+'</div>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Aggregates</div><div class="val">'+(replay_integrity.n_aggregates||0)+'</div></div>';
+    html += '<div class="metric"><div class="label">Violations</div><div class="val" style="color:'+((replay_integrity.n_violations||0)>0?'#f85149':'#3fb950')+'">'+(replay_integrity.n_violations||0)+'</div></div>';
+    html += '</div></div>';
+  }
+  html += '</div>';
+
+  // Event Store + Audit Ledger + Deployments
+  html += '<div class="flex mt-8">';
+  if (event_store) {
+    html += '<div class="card flex-grow"><h3>Event Store</h3><div class="value">'+(event_store.total_events||0)+'</div><div class="sub">immutable events</div></div>';
+  }
+  if (audit) {
+    html += '<div class="card flex-grow"><h3>Audit Ledger</h3><div class="value">'+(audit.total_entries||0)+'</div><div class="sub">tamper-resistant entries</div></div>';
+  }
+  if (deployments && deployments.deployments) {
+    const by_status = {};
+    for (const d of deployments.deployments) { by_status[d.status] = (by_status[d.status]||0)+1; }
+    html += '<div class="card flex-grow"><h3>Deployments</h3><div class="value">'+deployments.deployments.length+'</div><div class="sub">';
+    for (const [k,v] of Object.entries(by_status)) { html += k+':'+v+' '; }
+    html += '</div></div>';
+  }
+  html += '</div>';
+  document.getElementById('governance').innerHTML = html;
+}
+
+function renderRiskPhase14(data) {
+  const { systemic, stress_test, capital_preservation, optimizer } = data;
+  let html = '<div class="flex">';
+  if (systemic) {
+    html += '<div class="card flex-grow"><h3>Systemic Risk</h3>';
+    html += '<div class="metric"><div class="label">Risk Score</div>'+scoreBar((systemic.systemic_risk_score||0)*100, 100)+'</div>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Contagion Prob</div><div class="val" style="color:'+((systemic.contagion_probability||0)>0.3?'#f85149':'#3fb950')+'">'+((systemic.contagion_probability||0)*100).toFixed(0)+'%</div></div>';
+    html += '<div class="metric"><div class="label">Fragility</div><div class="val">'+((systemic.portfolio_fragility||0)*100).toFixed(0)+'%</div></div>';
+    html += '</div></div>';
+  }
+  if (stress_test) {
+    html += '<div class="card flex-grow"><h3>Stress Test</h3>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Survival Prob</div><div class="val" style="color:'+((stress_test.min_survival_prob||0)>0.5?'#3fb950':'#f85149')+'">'+((stress_test.min_survival_prob||0)*100).toFixed(0)+'%</div></div>';
+    html += '<div class="metric"><div class="label">Max Drawdown</div><div class="val">'+((stress_test.max_drawdown||0)*100).toFixed(0)+'%</div></div>';
+    html += '<div class="metric"><div class="label">Scenarios</div><div class="val">'+stress_test.n_scenarios+'</div></div>';
+    html += '</div><div class="sub" style="margin-top:4px">Worst: '+(stress_test.worst_scenario||'')+'</div></div>';
+  }
+  html += '</div><div class="flex mt-8">';
+  if (capital_preservation) {
+    html += '<div class="card flex-grow"><h3>Capital Preservation</h3>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Drawdown</div><div class="val" style="color:'+((capital_preservation.drawdown_pct||0)>5?'#f85149':'#3fb950')+'">'+((capital_preservation.drawdown_pct||0)*100).toFixed(0)+'%</div></div>';
+    html += '<div class="metric"><div class="label">Action</div><div class="val" style="font-size:14px">'+(capital_preservation.action_taken||'none')+'</div></div>';
+    html += '<div class="metric"><div class="label">Exposure</div><div class="val">'+((capital_preservation.total_exposure||0)*100).toFixed(0)+'%</div></div>';
+    html += '</div></div>';
+  }
+  if (optimizer) {
+    html += '<div class="card flex-grow"><h3>Portfolio Optimizer</h3>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Method</div><div class="val" style="font-size:14px">'+(optimizer.method||'--')+'</div></div>';
+    html += '<div class="metric"><div class="label">Strategies</div><div class="val">'+optimizer.n_strategies+'</div></div>';
+    html += '</div></div>';
+  }
+  html += '</div>';
+  document.getElementById('riskPhase14').innerHTML = html;
+}
+
+function renderMetaLearning(data) {
+  const { prompts, mutation_policy, agent_governance } = data;
+  let html = '<div class="flex">';
+  if (prompts && prompts.prompts) {
+    html += '<div class="card flex-grow"><h3>Prompt Evolution</h3><table><tr><th>Type</th><th class="text-right">Effectiveness</th><th class="text-right">Generations</th></tr>';
+    for (const p of prompts.prompts) {
+      html += '<tr><td><span class="tag">'+esc(p.type)+'</span></td><td class="text-right">'+scoreBar((p.effectiveness||0)*100, 100)+'</td><td class="text-right">'+p.generations+'</td></tr>';
+    }
+    html += '</table></div>';
+  }
+  if (mutation_policy) {
+    html += '<div class="card flex-grow"><h3>Mutation Policy</h3>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Observations</div><div class="val">'+(mutation_policy.n_observations||0)+'</div></div>';
+    html += '</div></div>';
+  }
+  if (agent_governance) {
+    html += '<div class="card flex-grow"><h3>Agent Governance</h3>';
+    html += '<div class="metric-row">';
+    html += '<div class="metric"><div class="label">Agents Assessed</div><div class="val">'+(agent_governance.n_agents_assessed||0)+'</div></div>';
+    html += '</div></div>';
+  }
+  html += '</div>';
+  document.getElementById('metaLearning').innerHTML = html;
+}
+
+function renderObservability(data) {
+  const { metrics, anomalies } = data;
+  let html = '<div class="flex">';
+  if (metrics && metrics.metrics) {
+    html += '<div class="card flex-grow"><h3>Monitoring Metrics</h3><table><tr><th>Time</th><th class="text-right">Counters</th></tr>';
+    for (const m of metrics.metrics.slice(0, 10)) {
+      const counters = Object.entries(m.counters||{}).map(([k,v]) => k+':'+v).join(', ');
+      html += '<tr><td style="color:#8b949e;font-size:12px">'+fmtTime(m.recorded_at)+'</td><td style="font-size:12px;color:#8b949e">'+esc(counters.slice(0, 80))+'</td></tr>';
+    }
+    html += '</table></div>';
+  }
+  if (anomalies && anomalies.anomalies) {
+    html += '<div class="card flex-grow"><h3>Anomaly Monitor</h3><table><tr><th>Time</th><th class="text-right">Anomalies</th><th>Severity</th></tr>';
+    for (const a of anomalies.anomalies.slice(0, 10)) {
+      html += '<tr><td style="color:#8b949e;font-size:12px">'+fmtTime(a.observed_at)+'</td><td class="text-right">'+a.n_anomalies+'</td><td>'+scoreBar((a.severity||0)*100, 100)+'</td></tr>';
+    }
+    html += '</table></div>';
+  }
+  html += '</div>';
+  document.getElementById('observability').innerHTML = html;
+}
+
+function renderScouts(data) {
+  const { by_source, signals } = data;
+  let html = '<div class=\"flex\">';
+  // Sources distribution
+  html += '<div class=\"card flex-grow\"><h3>Scout Sources</h3>';
+  if (by_source && Object.keys(by_source).length) {
+    html += '<table><tr><th>Source</th><th class=\"text-right\">Signals</th></tr>';
+    for (const [k,v] of Object.entries(by_source)) {
+      html += '<tr><td>'+statusChip(k)+'</td><td class=\"text-right\">'+v+'</td></tr>';
+    }
+    html += '</table>';
+  } else {
+    html += '<div class=\"sub\">No scout signals yet</div>';
+  }
+  html += '</div>';
+
+  // Recent signals
+  html += '<div class=\"card flex-grow\"><h3>Recent Scout Signals</h3>';
+  if (signals && signals.length) {
+    html += '<div class=\"scroll-x\"><table><tr><th>Source</th><th>Signal</th><th class=\"text-right\">Sentiment</th><th class=\"text-right\">Score</th></tr>';
+    for (const s of signals) {
+      html += '<tr><td>'+statusChip(s.source)+'</td>'
+        + '<td>'+statusChip(s.direction)+'</td>'
+        + '<td class=\"text-right\">'+(s.sentiment).toFixed(2)+'</td>'
+        + '<td class=\"text-right\">'+s.score.toFixed(2)+'</td></tr>';
+    }
+    html += '</table></div>';
+  } else {
+    html += '<div class=\"sub\">No signals yet</div>';
+  }
+  html += '</div></div>';
+  document.getElementById('scouts').innerHTML = html;
 }
 
 function esc(s) {
@@ -272,19 +618,75 @@ function fmtTime(t) {
 
 async function refreshAll() {
   try {
-    const [overview, pipeline, traces, patterns, risk] = await Promise.all([
+    const [overview, pipeline, traces, patterns, risk, portfolio, validation, monitoring, features, execRealism, scouts] = await Promise.all([
       fetchJSON(API+'/dashboard/api/overview'),
       fetchJSON(API+'/dashboard/api/pipeline'),
       fetchJSON(API+'/dashboard/api/traces?limit=20'),
       fetchJSON(API+'/dashboard/api/patterns'),
       fetchJSON(API+'/dashboard/api/risk'),
+      fetchJSON(API+'/dashboard/api/portfolio'),
+      fetchJSON(API+'/dashboard/api/validation'),
+      fetchJSON(API+'/dashboard/api/monitoring'),
+      fetchJSON(API+'/dashboard/api/features'),
+      fetchJSON(API+'/dashboard/api/execution/realism'),
+      fetchJSON(API+'/dashboard/api/scouts'),
     ]);
+    const [governanceHealth, eventStore, auditLedger, deployments, replayIntegrity] = await Promise.all([
+      fetchJSON(API+'/dashboard/api/governance/system-health'),
+      fetchJSON(API+'/dashboard/api/governance/event-store'),
+      fetchJSON(API+'/dashboard/api/governance/audit'),
+      fetchJSON(API+'/dashboard/api/governance/deployments'),
+      fetchJSON(API+'/dashboard/api/governance/replay-integrity'),
+    ]);
+    renderGovernance({
+      system_health: governanceHealth,
+      event_store: eventStore,
+      audit: auditLedger,
+      deployments: deployments,
+      replay_integrity: replayIntegrity,
+    });
+    const [systemicRisk, stressTest, capPreserve, optimizer] = await Promise.all([
+      fetchJSON(API+'/dashboard/api/risk/systemic'),
+      fetchJSON(API+'/dashboard/api/risk/stress-test'),
+      fetchJSON(API+'/dashboard/api/risk/capital-preservation'),
+      fetchJSON(API+'/dashboard/api/portfolio/optimizer'),
+    ]);
+    renderRiskPhase14({
+      systemic: systemicRisk,
+      stress_test: stressTest,
+      capital_preservation: capPreserve,
+      optimizer: optimizer,
+    });
+    const [prompts, mutationPolicy, agentGov] = await Promise.all([
+      fetchJSON(API+'/dashboard/api/meta/prompts'),
+      fetchJSON(API+'/dashboard/api/meta/mutation-policy'),
+      fetchJSON(API+'/dashboard/api/meta/agent-governance'),
+    ]);
+    renderMetaLearning({
+      prompts: prompts,
+      mutation_policy: mutationPolicy,
+      agent_governance: agentGov,
+    });
+    const [monitoringMetrics, anomalyData] = await Promise.all([
+      fetchJSON(API+'/dashboard/api/observability/metrics'),
+      fetchJSON(API+'/dashboard/api/observability/anomalies'),
+    ]);
+    renderObservability({
+      metrics: monitoringMetrics,
+      anomalies: anomalyData,
+    });
     document.getElementById('errors').innerHTML = '';
     renderOverview(overview);
     renderPipeline(pipeline);
     renderTraces(traces);
     renderPatterns(patterns);
     renderRisk(risk);
+    renderPortfolio(portfolio);
+    renderValidation(validation);
+    renderMonitoring(monitoring);
+    renderFeatures(features);
+    renderExecutionRealism(execRealism);
+    renderScouts(scouts);
     document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
     document.getElementById('content').classList.remove('loading');
   } catch (err) {
@@ -300,6 +702,16 @@ document.addEventListener('DOMContentLoaded', () => {
     + '<div class="section-title">Lifecycle Traces</div><div id="traces"></div>'
     + '<div class="section-title">Pattern Intelligence</div><div id="patterns"></div>'
     + '<div class="section-title">Risk & CopyTrader</div><div id="risk"></div>'
+    + '<div class="section-title">Portfolio Intelligence (Phase 12)</div><div id="portfolio"></div>'
+    + '<div class="section-title">Validation Analytics (Phase 11)</div><div id="validation"></div>'
+    + '<div class="section-title">Drift & Retirement (Phase 12)</div><div id="monitoring"></div>'
+    + '<div class="section-title">Feature Importance (Phase 11)</div><div id="features"></div>'
+    + '<div class="section-title">Execution Realism (Phase 12)</div><div id="executionRealism"></div>'
+    + '  <div class="section-title">External Scout Network (Phase 12)</div><div id="scouts"></div>
+    + '<div class="section-title">Institutional Governance (Phase 13)</div><div id="governance"></div>'
+    + '<div class="section-title">Risk & Capital Preservation (Phase 14)</div><div id="riskPhase14"></div>'
+    + '<div class="section-title">Meta-Learning (Phase 15)</div><div id="metaLearning"></div>'
+    + '<div class="section-title">Observability (Phase 17)</div><div id="observability"></div>''
     + '<div class="last-updated">Auto-refreshes every 30s</div>';
   refreshAll();
   if (refreshTimer) clearInterval(refreshTimer);

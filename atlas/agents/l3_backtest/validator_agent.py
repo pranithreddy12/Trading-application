@@ -51,7 +51,57 @@ class ValidatorAgent(BaseAgent):
         "max_entry_pct": 0.50,  # entries must not exceed 50% of bars
         "max_exit_pct": 0.95,  # exits must not exceed 95% of bars
     }
-    
+
+    # Scout Intelligence Cache for dynamic adjustments
+    _scout_adjustment: float = 1.0
+    _scout_cache_time: float = 0.0
+    _scout_cache_ttl: float = 120.0  # refresh every 2 minutes
+
+    async def _compute_scout_adjustment(self) -> float:
+        """
+        Fetch live scout intelligence and compute a dynamic validation adjustment.
+        Returns a multiplier (1.0 = normal, <1.0 = stricter, >1.0 = looser).
+        """
+        import time
+        now = time.time()
+        if now - self._scout_cache_time < self._scout_cache_ttl:
+            return self._scout_adjustment
+
+        adjustment = 1.0
+        try:
+            scout = await self.db.get_latest_scout_intelligence()
+
+            # Thin liquidity → stricter requirements (harder to survive costs)
+            liq_regime = scout.get("liquidity", {}).get("regime", "")
+            if liq_regime == "dangerous":
+                adjustment *= 0.7
+            elif liq_regime == "thin":
+                adjustment *= 0.85
+
+            # Stressed execution → stricter cost requirements
+            exec_regime = scout.get("execution", {}).get("regime", "")
+            if exec_regime == "unstable":
+                adjustment *= 0.6
+            elif exec_regime == "stressed":
+                adjustment *= 0.8
+            elif exec_regime == "degraded":
+                adjustment *= 0.9
+
+            # Panic correlation → stricter robustness requirements
+            corr_state = scout.get("correlation", {}).get("risk_state", "")
+            if corr_state == "panic_correlation":
+                adjustment *= 0.75
+
+            self._scout_adjustment = adjustment
+            self._scout_cache_time = now
+
+            logger.debug(f"Scout validation adjustment: {adjustment:.2f}x")
+
+        except Exception as e:
+            logger.debug(f"Scout adjustment fetch failed: {e}")
+
+        return self._scout_adjustment
+
     # Cost Governance Rules (NEW) — applied based on trade frequency
     # These enforce economic viability, not just statistical viability
     COST_GOVERNANCE_ENABLED = True  # Can be set via env var later
@@ -61,13 +111,23 @@ class ValidatorAgent(BaseAgent):
         env = getattr(settings, "environment", "dev")
         return self.DEV_RULES if env in ("dev", "staging") else self.PROD_RULES
 
-    def __init__(self, db_client: TimescaleClient):
+    def __init__(
+        self,
+        redis_client=None,
+        db_client: TimescaleClient | None = None,
+    ):
+        super().__init__(
+            name=self.name,
+            agent_type=self.agent_type,
+            layer=self.layer,
+            redis_client=redis_client,
+        )
         self.db = db_client
 
     async def run(self):
         print("=== VALIDATOR RUN LOOP ENTERED ===", flush=True)
         logger.info("ValidatorAgent polling for pending_validation strategies")
-        while True:
+        while self.status == "running":
             try:
                 strategies = await self.db.get_strategies_by_status(
                     "pending_validation"
@@ -114,10 +174,25 @@ class ValidatorAgent(BaseAgent):
             if train_sh > 0 and holdout_sh > 0 and ratio > 0:
                 overfit_flag = holdout_sh < train_sh * ratio
 
-            # Regime score if provided by backtest results (0-1), else neutral 0.5
+            # Regime robustness score [0,1] — rewards multi-regime strategies
             regime_score = float(self._safe(self._extract(result, "regime_score"), 0.5))
 
-            status = self._assign_tier(score, passed)
+            # ------------------------------------------------------------------
+            # SCOUT-AWARE DYNAMIC VALIDATION (Phase 10.9)
+            # Adjust pass thresholds based on live market conditions.
+            # ------------------------------------------------------------------
+            scout_dynamic_adjustment = await self._compute_scout_adjustment()
+
+            # Apply scout-aware adjustment to pass thresholds
+            scored_passed = passed
+            if scout_dynamic_adjustment < 1.0 and passed:
+                # Stricter environment — require higher tier
+                adjusted_score = score * scout_dynamic_adjustment
+                if adjusted_score < 50 and score >= 50:
+                    scored_passed = False
+                    failed_tests.append(f"scout_strict: adjusted_score {adjusted_score:.1f} < 50")
+
+            status = self._assign_tier(score, scored_passed)
             notes = self._build_notes(result, score, grade, status, failed_tests)
 
             # Persist validation metrics into strategy parameters via update (as validation_notes)
@@ -151,21 +226,22 @@ class ValidatorAgent(BaseAgent):
             # COST GOVERNANCE METRICS (NEW)
             # ─────────────────────────────────────────────────────────
             try:
+                trades_cg = int(self._safe(self._extract(result, "total_trades"), 0))
                 net_return = float(self._safe(self._extract(result, "total_return"), 0.0))
                 gross_return = float(self._safe(self._extract(result, "total_return_gross"), net_return))
                 asset_class = result.get("asset_class", "crypto")
                 
-                ce_score = cost_efficiency_score(net_return, trades)
+                ce_score = cost_efficiency_score(net_return, trades_cg)
                 friction = friction_burden_pct(gross_return, net_return)
-                edge_per_trade_bps = expected_edge_per_trade(net_return, trades, asset_class)
+                edge_per_trade_bps = expected_edge_per_trade(net_return, trades_cg, asset_class)
                 
-                cost_profile = classify_cost_profile(net_return, trades, gross_return, asset_class)
+                cost_profile = classify_cost_profile(net_return, trades_cg, gross_return, asset_class)
                 
                 metrics["cost_efficiency_score"] = round(ce_score, 6)
                 metrics["friction_burden_pct"] = round(friction * 100, 1)
                 metrics["expected_edge_per_trade_bps"] = round(edge_per_trade_bps, 1)
                 metrics["cost_profile_classification"] = cost_profile.classification.value
-                metrics["cost_governance_status"] = "PASS" if not is_cost_trap(net_return, trades, asset_class) else "ALERT"
+                metrics["cost_governance_status"] = "PASS" if not is_cost_trap(net_return, trades_cg, asset_class) else "ALERT"
                 
             except Exception as e:
                 logger.warning(f"Failed to compute cost governance metrics for {strategy_id}: {e}")
@@ -338,13 +414,17 @@ class ValidatorAgent(BaseAgent):
         trades = int(self._safe(self._extract(result, "total_trades")))
         drawdown = self._safe(self._extract(result, "max_drawdown"))
         pf = self._safe(self._extract(result, "profit_factor"), 1.0)
-        return [
+        regime_score = self._safe(self._extract(result, "regime_score"), 0.5)
+        regime_icon = "🌐" if regime_score >= 0.5 else "🔒"
+        lines = [
             f"Sharpe={sharpe:.2f}",
             f"WinRate={win_rate:.0%}",
             f"Trades={trades}",
             f"MaxDD={drawdown:.1f}%",
             f"PF={pf:.2f}",
+            f"Regime={regime_score:.1f}{regime_icon}",
         ]
+        return lines
 
     # ------------------------------------------------------------------
     # PASS / FAIL TESTS
@@ -496,7 +576,8 @@ async def main():
     db_client = TimescaleClient(settings.database_url)
     await db_client.connect()
 
-    agent = ValidatorAgent(db_client)
+    redis_client = None
+    agent = ValidatorAgent(redis_client=redis_client, db_client=db_client)
 
     print("=== STARTING VALIDATOR AGENT ===", flush=True)
 

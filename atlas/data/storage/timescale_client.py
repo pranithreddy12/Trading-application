@@ -8,6 +8,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.sql import text
 import pandas as pd
 
+from atlas.core.scout_validation import validate_scout_payload
+from atlas.core.serialization import normalize_db_params, safe_json_dumps
+
 
 def _r4(v: float) -> float:
     return round(float(v), 4)
@@ -371,6 +374,61 @@ class TimescaleClient:
                     "CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage)"
                 )
             )
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS risk_state (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        scope TEXT NOT NULL,
+                        strategy_id UUID NULL,
+                        halted BOOLEAN NOT NULL DEFAULT FALSE,
+                        reason TEXT,
+                        triggered_by TEXT,
+                        activated_at TIMESTAMPTZ,
+                        released_at TIMESTAMPTZ,
+                        metadata JSONB DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            await conn.execute(
+                text("CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_state_scope ON risk_state (scope)")
+            )
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO risk_state (scope, halted, reason)
+                    VALUES ('portfolio', FALSE, 'initial_state')
+                    ON CONFLICT DO NOTHING
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS scout_quarantine (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        source TEXT,
+                        source_sub TEXT,
+                        reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        raw_payload JSONB NOT NULL,
+                        quarantined_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_source ON scout_quarantine (source)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quarantined_at DESC)"
+                )
+            )
             # trace_id column on strategies
             await conn.execute(
                 text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT")
@@ -381,9 +439,994 @@ class TimescaleClient:
                 )
             )
 
+            # ================================================================
+            # SCOUT NETWORK TABLES — Phase 10: Internal Scout Intelligence
+            # ================================================================
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS market_regime_memory (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    symbol TEXT,
+                    asset_class TEXT,
+                    timeframe TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    volatility_regime TEXT,
+                    trend_regime TEXT,
+                    liquidity_regime TEXT,
+                    correlation_regime TEXT,
+                    atr_percentile NUMERIC,
+                    realized_volatility NUMERIC,
+                    relative_volume NUMERIC,
+                    spread_bps NUMERIC,
+                    compression_detected BOOLEAN,
+                    expansion_detected BOOLEAN,
+                    vwap_deviation_pct NUMERIC,
+                    confidence_score NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_symbol ON market_regime_memory (symbol)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_timestamp ON market_regime_memory (timestamp DESC)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS liquidity_intelligence (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    symbol TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    avg_spread_bps NUMERIC,
+                    depth_imbalance NUMERIC,
+                    liquidity_score NUMERIC,
+                    slippage_risk NUMERIC,
+                    market_impact_estimate NUMERIC,
+                    liquidity_regime TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_symbol ON liquidity_intelligence (symbol)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_timestamp ON liquidity_intelligence (timestamp DESC)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS correlation_memory (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    cluster_name TEXT,
+                    avg_pairwise_corr NUMERIC,
+                    dominant_factor TEXT,
+                    risk_state TEXT,
+                    symbols_analyzed TEXT[],
+                    top_correlated_pairs JSONB,
+                    correlation_spike_detected BOOLEAN DEFAULT FALSE,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_timestamp ON correlation_memory (timestamp DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_risk_state ON correlation_memory (risk_state)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS execution_intelligence (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    symbol TEXT,
+                    broker TEXT,
+                    avg_slippage_bps NUMERIC,
+                    fill_latency_ms NUMERIC,
+                    rejection_rate NUMERIC,
+                    fill_quality_score NUMERIC,
+                    execution_regime TEXT,
+                    sample_size INT DEFAULT 0,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_symbol ON execution_intelligence (symbol)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_timestamp ON execution_intelligence (timestamp DESC)"))
+
+            # ================================================================
+            # VALIDATION TABLES — Phase 11: Advanced Validation & Pattern Intelligence
+            # ================================================================
+            # walk_forward_analysis
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS walk_forward_analysis (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id UUID NOT NULL,
+                    walk_forward_score NUMERIC,
+                    temporal_consistency NUMERIC,
+                    regime_survival_score NUMERIC,
+                    n_windows_survived INT,
+                    n_windows_total INT,
+                    per_window_metrics JSONB DEFAULT '[]'::jsonb,
+                    analyzed_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (strategy_id)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_walkforward_strategy ON walk_forward_analysis (strategy_id)"))
+
+            # monte_carlo_analysis
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS monte_carlo_analysis (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id UUID NOT NULL,
+                    monte_carlo_survival_score NUMERIC,
+                    expected_tail_drawdown NUMERIC,
+                    probabilistic_sharpe NUMERIC,
+                    ci_low_90pct NUMERIC,
+                    ci_high_90pct NUMERIC,
+                    n_simulations INT DEFAULT 0,
+                    n_trades_input INT DEFAULT 0,
+                    simulated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (strategy_id)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mc_strategy ON monte_carlo_analysis (strategy_id)"))
+
+            # overfitting_analysis
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS overfitting_analysis (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id UUID NOT NULL,
+                    overfit_probability NUMERIC,
+                    robustness_score NUMERIC,
+                    parameter_stability_score NUMERIC,
+                    shuffle_test_p_value NUMERIC,
+                    noise_degradation_pct NUMERIC,
+                    analyzed_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (strategy_id)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overfit_strategy ON overfitting_analysis (strategy_id)"))
+
+            # regime_validation
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS regime_validation (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id UUID NOT NULL,
+                    regime_survival_map JSONB DEFAULT '{}'::jsonb,
+                    regime_dependency_score NUMERIC,
+                    regime_survival_score NUMERIC,
+                    n_regimes_survived INT,
+                    passes_min_regimes BOOLEAN DEFAULT FALSE,
+                    over_specialized BOOLEAN DEFAULT FALSE,
+                    validated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (strategy_id)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regimeval_strategy ON regime_validation (strategy_id)"))
+
+            # cost_stress_analysis
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS cost_stress_analysis (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id UUID NOT NULL,
+                    cost_survival_score NUMERIC,
+                    max_survivable_multiplier NUMERIC,
+                    profit_factor_degradation NUMERIC,
+                    expectancy_degradation NUMERIC,
+                    passes_min_survival BOOLEAN DEFAULT FALSE,
+                    fragile_scalper_detected BOOLEAN DEFAULT FALSE,
+                    tested_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (strategy_id)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_coststress_strategy ON cost_stress_analysis (strategy_id)"))
+
+            # feature_importance
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS feature_importance (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    feature_name TEXT NOT NULL,
+                    feature_importance_score NUMERIC,
+                    avg_composite_score NUMERIC,
+                    std_composite_score NUMERIC,
+                    n_uses INT DEFAULT 0,
+                    survival_rate NUMERIC,
+                    decay_score NUMERIC,
+                    dominant_archetype TEXT,
+                    archetype_focus_pct NUMERIC,
+                    top_archetypes JSONB DEFAULT '{}'::jsonb,
+                    computed_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (feature_name)
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_score ON feature_importance (feature_importance_score DESC)"))
+
+            # ================================================================
+            # PORTFOLIO TABLES — Phase 12: Portfolio Intelligence & Capital Realism
+            # ================================================================
+            # portfolio_intelligence
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS portfolio_intelligence (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    computed_at TIMESTAMPTZ NOT NULL,
+                    n_strategies INT DEFAULT 0,
+                    strategy_ids JSONB DEFAULT '[]'::jsonb,
+                    correlation_matrix JSONB DEFAULT '[]'::jsonb,
+                    covariance_matrix JSONB DEFAULT '[]'::jsonb,
+                    cluster_map JSONB DEFAULT '{}'::jsonb,
+                    efficiency_scores JSONB DEFAULT '[]'::jsonb,
+                    optimal_allocations JSONB DEFAULT '[]'::jsonb,
+                    regime_conditioned_weights JSONB DEFAULT '{}'::jsonb,
+                    ensemble_survivability_score NUMERIC,
+                    concentration_risk NUMERIC,
+                    diversification_score NUMERIC,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_computed ON portfolio_intelligence (computed_at DESC)"))
+
+            # capital_allocation
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS capital_allocation (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    computed_at TIMESTAMPTZ NOT NULL,
+                    n_strategies INT DEFAULT 0,
+                    method TEXT,
+                    final_allocations JSONB DEFAULT '[]'::jsonb,
+                    total_exposure NUMERIC,
+                    kelly_weights JSONB DEFAULT '[]'::jsonb,
+                    vol_target_weights JSONB DEFAULT '[]'::jsonb,
+                    risk_parity_weights JSONB DEFAULT '[]'::jsonb,
+                    redistribution_signals JSONB DEFAULT '[]'::jsonb,
+                    regime_applied JSONB DEFAULT '{}'::jsonb,
+                    leverage_cap_applied NUMERIC DEFAULT 1.0,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_capital_allocation_computed ON capital_allocation (computed_at DESC)"))
+
+            # ensemble_execution
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS ensemble_execution (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    executed_at TIMESTAMPTZ NOT NULL,
+                    n_signals_processed INT DEFAULT 0,
+                    n_trades_generated INT DEFAULT 0,
+                    consensus_trades JSONB DEFAULT '[]'::jsonb,
+                    strategy_weights_used JSONB DEFAULT '{}'::jsonb,
+                    regime_context JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ensemble_executed ON ensemble_execution (executed_at DESC)"))
+
+            # execution_realism
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS execution_realism (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    simulated_at TIMESTAMPTZ NOT NULL,
+                    n_trades_simulated INT DEFAULT 0,
+                    avg_fill_probability NUMERIC,
+                    avg_expected_slippage_bps NUMERIC,
+                    avg_expected_partial_pct NUMERIC,
+                    avg_simulated_latency_ms NUMERIC,
+                    avg_market_impact_bps NUMERIC,
+                    exhaustion_scenario JSONB DEFAULT '{}'::jsonb,
+                    execution_degradation_score NUMERIC,
+                    liquidity_state JSONB DEFAULT '{}'::jsonb,
+                    simulated_fills JSONB DEFAULT '[]'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_realism_simulated ON execution_realism (simulated_at DESC)"))
+
+            # drift_detection
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS drift_detection (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    detected_at TIMESTAMPTZ NOT NULL,
+                    feature_drift_score NUMERIC,
+                    strategy_drift_score NUMERIC,
+                    regime_drift_score NUMERIC,
+                    execution_drift_score NUMERIC,
+                    composite_severity NUMERIC,
+                    n_strategies_monitored INT DEFAULT 0,
+                    retirement_candidates JSONB DEFAULT '[]'::jsonb,
+                    retrain_recommendations JSONB DEFAULT '[]'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_drift_detected ON drift_detection (detected_at DESC)"))
+
+            # strategy_retirement
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS strategy_retirement (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    analyzed_at TIMESTAMPTZ NOT NULL,
+                    n_strategies_analyzed INT DEFAULT 0,
+                    n_active INT DEFAULT 0,
+                    n_monitor INT DEFAULT 0,
+                    n_retirement_pending INT DEFAULT 0,
+                    n_retired INT DEFAULT 0,
+                    lifecycle_states JSONB DEFAULT '{}'::jsonb,
+                    retirement_recommendations JSONB DEFAULT '[]'::jsonb,
+                    capital_withdrawal_signals JSONB DEFAULT '[]'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_retirement_analyzed ON strategy_retirement (analyzed_at DESC)"))
+
+            # external_scout_memory — External Scout Network (Phase 12.9)
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS external_scout_memory (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    source TEXT NOT NULL,
+                    source_sub TEXT,
+                    source_reliability NUMERIC,
+                    timestamp TIMESTAMPTZ NOT NULL,
+                    sentiment NUMERIC,
+                    mentioned_tickers JSONB DEFAULT '[]'::jsonb,
+                    hypothesis_score NUMERIC,
+                    signal_direction TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_source ON external_scout_memory (source)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_timestamp ON external_scout_memory (timestamp DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_score ON external_scout_memory (hypothesis_score DESC)"))
+
+            # ================================================================
+            # PHASE 13 — PRODUCTION GOVERNANCE & RELIABILITY TABLES
+            # ================================================================
+            # Event Store (append-only immutable event log)
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS event_store (
+                    id TEXT PRIMARY KEY,
+                    aggregate_id TEXT NOT NULL,
+                    aggregate_type TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_version INT DEFAULT 1,
+                    data JSONB DEFAULT '{}'::jsonb,
+                    trace_id TEXT,
+                    parent_event_id TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_aggregate ON event_store (aggregate_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_type ON event_store (event_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_trace ON event_store (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_created ON event_store (created_at DESC)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS event_snapshots (
+                    id TEXT PRIMARY KEY,
+                    aggregate_id TEXT NOT NULL,
+                    version INT NOT NULL,
+                    state JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_agg_version ON event_snapshots (aggregate_id, version)"))
+
+            # Audit Ledger (tamper-resistant, cryptographic hash chaining)
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS audit_ledger (
+                    id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    target_id TEXT,
+                    action TEXT NOT NULL,
+                    data_hash TEXT,
+                    previous_hash TEXT,
+                    trace_id TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_ledger (event_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_ledger (actor)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_ledger (created_at DESC)"))
+
+            # Deployment Governance
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS deployment_governance (
+                    id TEXT PRIMARY KEY,
+                    strategy_id TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'paper',
+                    status TEXT NOT NULL DEFAULT 'pending_approval',
+                    proposed_by TEXT,
+                    approved_by TEXT,
+                    proposed_at TIMESTAMPTZ DEFAULT NOW(),
+                    approved_at TIMESTAMPTZ,
+                    activated_at TIMESTAMPTZ,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_strategy ON deployment_governance (strategy_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_status ON deployment_governance (status)"))
+
+            # System Health
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS system_health (
+                    id TEXT PRIMARY KEY,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    composite_score NUMERIC,
+                    system_mode TEXT,
+                    subsystem_scores JSONB DEFAULT '{}'::jsonb,
+                    degraded_subsystems JSONB DEFAULT '[]'::jsonb,
+                    n_degraded INT DEFAULT 0,
+                    n_total INT DEFAULT 0
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_health_checked ON system_health (checked_at DESC)"))
+
+            # Replay Integrity
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS replay_integrity (
+                    id TEXT PRIMARY KEY,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    n_aggregates_checked INT DEFAULT 0,
+                    n_events_checked INT DEFAULT 0,
+                    integrity_score NUMERIC,
+                    n_violations INT DEFAULT 0,
+                    details JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_replay_checked ON replay_integrity (checked_at DESC)"))
+
+            # Systemic Risk
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS systemic_risk (
+                    id TEXT PRIMARY KEY,
+                    assessed_at TIMESTAMPTZ NOT NULL,
+                    systemic_risk_score NUMERIC,
+                    contagion_probability NUMERIC,
+                    portfolio_fragility NUMERIC,
+                    correlation_regime NUMERIC,
+                    concentration_risk NUMERIC,
+                    n_strategies_analyzed INT DEFAULT 0,
+                    details JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sysrisk_assessed ON systemic_risk (assessed_at DESC)"))
+
+            # Stress Test Results
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stress_test_results (
+                    id TEXT PRIMARY KEY,
+                    tested_at TIMESTAMPTZ NOT NULL,
+                    n_scenarios INT DEFAULT 0,
+                    n_positions INT DEFAULT 0,
+                    worst_scenario TEXT,
+                    min_survival_probability NUMERIC,
+                    max_drawdown NUMERIC,
+                    avg_recovery_days NUMERIC,
+                    scenario_results JSONB DEFAULT '[]'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stress_tested ON stress_test_results (tested_at DESC)"))
+
+            # Capital Preservation State
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS capital_preservation_state (
+                    id TEXT PRIMARY KEY,
+                    checked_at TIMESTAMPTZ NOT NULL,
+                    drawdown_pct NUMERIC,
+                    action_taken TEXT,
+                    exposure_cut_ratio NUMERIC,
+                    peak_value NUMERIC,
+                    current_value NUMERIC,
+                    total_pnl NUMERIC,
+                    total_exposure NUMERIC
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_cap_pres_checked ON capital_preservation_state (checked_at DESC)"))
+
+            # ================================================================
+            # PHASE 14 — PORTFOLIO DURABILITY TABLES
+            # ================================================================
+            # Advanced Portfolio Optimization
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS advanced_portfolio_optimization (
+                    id TEXT PRIMARY KEY,
+                    optimized_at TIMESTAMPTZ NOT NULL,
+                    method_used TEXT,
+                    n_strategies INT DEFAULT 0,
+                    final_allocations JSONB DEFAULT '[]'::jsonb,
+                    method_scores JSONB DEFAULT '{}'::jsonb,
+                    details JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_adv_portfolio_opt ON advanced_portfolio_optimization (optimized_at DESC)"))
+
+            # ================================================================
+            # PHASE 15 — TRUE META-LEARNING TABLES
+            # ================================================================
+            # Prompt Templates
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS prompt_templates (
+                    id TEXT PRIMARY KEY,
+                    prompt_type TEXT NOT NULL DEFAULT 'ideator',
+                    prompt_text TEXT NOT NULL,
+                    archetype TEXT,
+                    status TEXT DEFAULT 'active',
+                    parent_prompt_id TEXT,
+                    generation_count INT DEFAULT 0,
+                    success_count INT DEFAULT 0,
+                    effectiveness_score NUMERIC DEFAULT 0.0,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_type ON prompt_templates (prompt_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_effectiveness ON prompt_templates (effectiveness_score DESC)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS prompt_generation_log (
+                    id TEXT PRIMARY KEY,
+                    prompt_id TEXT,
+                    strategy_id TEXT,
+                    success BOOLEAN DEFAULT FALSE,
+                    generation_score NUMERIC,
+                    generated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_log_prompt ON prompt_generation_log (prompt_id)"))
+
+            # Mutation Policy State
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mutation_policy_state (
+                    id TEXT PRIMARY KEY,
+                    learned_at TIMESTAMPTZ NOT NULL,
+                    mutation_weights JSONB DEFAULT '{}'::jsonb,
+                    per_type_success_rates JSONB DEFAULT '{}'::jsonb,
+                    n_observations INT DEFAULT 0,
+                    details JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_policy_learned ON mutation_policy_state (learned_at DESC)"))
+
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mutation_outcome_log (
+                    id TEXT PRIMARY KEY,
+                    mutation_type TEXT,
+                    parent_strategy_id TEXT,
+                    child_strategy_id TEXT,
+                    outcome_score NUMERIC,
+                    recorded_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_outcome_type ON mutation_outcome_log (mutation_type)"))
+
+            # Agent Governance State
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS agent_governance_state (
+                    id TEXT PRIMARY KEY,
+                    assessed_at TIMESTAMPTZ NOT NULL,
+                    n_agents_assessed INT DEFAULT 0,
+                    agent_scores JSONB DEFAULT '{}'::jsonb,
+                    throttled_agents JSONB DEFAULT '[]'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gov_assessed ON agent_governance_state (assessed_at DESC)"))
+
+            # ================================================================
+            # PHASE 17 — OBSERVABILITY TABLES
+            # ================================================================
+            # Monitoring Metrics
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS monitoring_metrics (
+                    id TEXT PRIMARY KEY,
+                    recorded_at TIMESTAMPTZ NOT NULL,
+                    counters JSONB DEFAULT '{}'::jsonb,
+                    latencies JSONB DEFAULT '{}'::jsonb
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_recorded ON monitoring_metrics (recorded_at DESC)"))
+
+            # Anomaly Observations
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS anomaly_observations (
+                    id TEXT PRIMARY KEY,
+                    observed_at TIMESTAMPTZ NOT NULL,
+                    n_anomalies INT DEFAULT 0,
+                    anomalies JSONB DEFAULT '[]'::jsonb,
+                    severity NUMERIC DEFAULT 0
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_anomaly_observed ON anomaly_observations (observed_at DESC)"))
+
+            # Feature evolution metadata column on feature_importance
+            await conn.execute(text("ALTER TABLE feature_importance ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb"))
+
+            # ================================================================
+            # PHASE 19 — META-INTELLIGENCE ADVISORY TABLES
+            # ================================================================
+            # Meta Reasoning Log — MetaReasoningAgent outputs
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS meta_reasoning_log (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    advisory_type TEXT NOT NULL,
+                    confidence NUMERIC DEFAULT 0.0,
+                    reasoning_text TEXT,
+                    system_state_snapshot JSONB DEFAULT '{}'::jsonb,
+                    recommendations JSONB DEFAULT '[]'::jsonb,
+                    advisory_only BOOLEAN DEFAULT TRUE,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_trace ON meta_reasoning_log (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_type ON meta_reasoning_log (advisory_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_created ON meta_reasoning_log (created_at DESC)"))
+
+            # Hypothesis Registry — structured research hypotheses
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS hypothesis_registry (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    observation_source TEXT,
+                    testable_prediction TEXT,
+                    confidence NUMERIC DEFAULT 0.5,
+                    evidence_count INT DEFAULT 0,
+                    contradiction_count INT DEFAULT 0,
+                    regime_scope TEXT,
+                    replay_score NUMERIC DEFAULT 0.0,
+                    decay_rate NUMERIC DEFAULT 0.01,
+                    status TEXT DEFAULT 'active',
+                    evidence JSONB DEFAULT '[]'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    last_confirmed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_trace ON hypothesis_registry (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_status ON hypothesis_registry (status)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_confidence ON hypothesis_registry (confidence DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_created ON hypothesis_registry (created_at DESC)"))
+
+            # Failure Analysis — postmortem reasoning on systemic failures
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS failure_analysis (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    analysis_type TEXT NOT NULL,
+                    confidence NUMERIC DEFAULT 0.0,
+                    root_causes JSONB DEFAULT '[]'::jsonb,
+                    systemic_patterns JSONB DEFAULT '[]'::jsonb,
+                    governance_recommendations JSONB DEFAULT '[]'::jsonb,
+                    mutation_collapse_warnings JSONB DEFAULT '[]'::jsonb,
+                    feature_saturation_alerts JSONB DEFAULT '[]'::jsonb,
+                    n_failures_analyzed INT DEFAULT 0,
+                    advisory_only BOOLEAN DEFAULT TRUE,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_trace ON failure_analysis (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_type ON failure_analysis (analysis_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_created ON failure_analysis (created_at DESC)"))
+
+            # Mutation Policy Log — advisory history for mutation directions
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mutation_policy_log (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    confidence NUMERIC DEFAULT 0.0,
+                    advisory TEXT,
+                    exploration_vs_exploitation TEXT,
+                    entropy_metric NUMERIC DEFAULT 0.0,
+                    diversification_advisory TEXT,
+                    priority_weights JSONB DEFAULT '{}'::jsonb,
+                    leaderboard_snapshot JSONB DEFAULT '{}'::jsonb,
+                    advisory_only BOOLEAN DEFAULT TRUE,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_trace ON mutation_policy_log (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_created ON mutation_policy_log (created_at DESC)"))
+
+            # Scout Synthesis Log — synthesized scout intelligence
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_synthesis_log (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    confidence NUMERIC DEFAULT 0.0,
+                    contextual_summary TEXT,
+                    scout_agreement_score NUMERIC DEFAULT 0.0,
+                    scout_disagreement_areas JSONB DEFAULT '[]'::jsonb,
+                    market_state_interpretation TEXT,
+                    confidence_weights JSONB DEFAULT '{}'::jsonb,
+                    source_signals JSONB DEFAULT '{}'::jsonb,
+                    advisory_only BOOLEAN DEFAULT TRUE,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_trace ON scout_synthesis_log (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_created ON scout_synthesis_log (created_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_agreement ON scout_synthesis_log (scout_agreement_score DESC)"))
+
+            # ================================================================
+            # PHASE 21 — INSTITUTIONAL COPY TRADING TABLES
+            # ================================================================
+            # Copy Position State — leader vs follower portfolio snapshots
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_position_state (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    leader_id TEXT NOT NULL,
+                    follower_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    leader_qty NUMERIC DEFAULT 0,
+                    follower_qty NUMERIC DEFAULT 0,
+                    leader_avg_entry NUMERIC,
+                    follower_avg_entry NUMERIC,
+                    leader_exposure NUMERIC DEFAULT 0,
+                    follower_exposure NUMERIC DEFAULT 0,
+                    leader_unrealized_pnl NUMERIC DEFAULT 0,
+                    follower_unrealized_pnl NUMERIC DEFAULT 0,
+                    leader_realized_pnl NUMERIC DEFAULT 0,
+                    follower_realized_pnl NUMERIC DEFAULT 0,
+                    execution_latency_ms INT DEFAULT 0,
+                    sync_quality_score NUMERIC DEFAULT 1.0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    snapshot_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_leader ON copy_position_state (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_follower ON copy_position_state (follower_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_snapshot ON copy_position_state (snapshot_at DESC)"))
+
+            # Copy Drift Log — follower divergence tracking
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_drift_log (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    leader_id TEXT NOT NULL,
+                    follower_id TEXT NOT NULL,
+                    drift_score NUMERIC DEFAULT 0.0,
+                    drift_severity TEXT DEFAULT 'synchronized',
+                    exposure_drift NUMERIC DEFAULT 0.0,
+                    pnl_drift NUMERIC DEFAULT 0.0,
+                    leverage_drift NUMERIC DEFAULT 0.0,
+                    symbol_allocation_drift NUMERIC DEFAULT 0.0,
+                    execution_timing_drift_ms INT DEFAULT 0,
+                    slippage_amplification NUMERIC DEFAULT 0.0,
+                    partial_fill_divergence NUMERIC DEFAULT 0.0,
+                    sync_quality_score NUMERIC DEFAULT 1.0,
+                    repair_recommendation TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    detected_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_leader ON copy_drift_log (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_severity ON copy_drift_log (drift_severity)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_detected ON copy_drift_log (detected_at DESC)"))
+
+            # Leader Health Metrics — leader governance scores
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS leader_health_metrics (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    leader_id TEXT NOT NULL,
+                    health_score NUMERIC DEFAULT 1.0,
+                    leader_state TEXT DEFAULT 'trusted',
+                    drawdown_pct NUMERIC DEFAULT 0.0,
+                    survivability_score NUMERIC DEFAULT 1.0,
+                    execution_quality NUMERIC DEFAULT 1.0,
+                    replay_consistency NUMERIC DEFAULT 1.0,
+                    drift_stability NUMERIC DEFAULT 1.0,
+                    portfolio_concentration NUMERIC DEFAULT 0.0,
+                    slippage_amplification NUMERIC DEFAULT 0.0,
+                    strategy_mortality_rate NUMERIC DEFAULT 0.0,
+                    vol_adjusted_return NUMERIC DEFAULT 0.0,
+                    n_followers INT DEFAULT 0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    assessed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_leader ON leader_health_metrics (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_state ON leader_health_metrics (leader_state)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_assessed ON leader_health_metrics (assessed_at DESC)"))
+
+            # Follower Reconciliation — reconciliation reports
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS follower_reconciliation (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    leader_id TEXT NOT NULL,
+                    follower_id TEXT NOT NULL,
+                    reconciliation_type TEXT DEFAULT 'periodic',
+                    n_positions_checked INT DEFAULT 0,
+                    n_mismatches INT DEFAULT 0,
+                    exposure_delta NUMERIC DEFAULT 0.0,
+                    pnl_delta NUMERIC DEFAULT 0.0,
+                    repair_actions JSONB DEFAULT '[]'::jsonb,
+                    reconciliation_score NUMERIC DEFAULT 1.0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    reconciled_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_leader ON follower_reconciliation (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_follower ON follower_reconciliation (follower_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_at ON follower_reconciliation (reconciled_at DESC)"))
+
+            # Copy Overlap Metrics — portfolio overlap detection
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_overlap_metrics (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    follower_id TEXT NOT NULL,
+                    overlap_score NUMERIC DEFAULT 0.0,
+                    concentration_risk NUMERIC DEFAULT 0.0,
+                    diversification_penalty NUMERIC DEFAULT 0.0,
+                    duplicated_exposure JSONB DEFAULT '[]'::jsonb,
+                    correlated_leaders JSONB DEFAULT '[]'::jsonb,
+                    hidden_concentration JSONB DEFAULT '{}'::jsonb,
+                    n_leaders_analyzed INT DEFAULT 0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    analyzed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_follower ON copy_overlap_metrics (follower_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_analyzed ON copy_overlap_metrics (analyzed_at DESC)"))
+
+            # Copy Failover Events — degradation mode tracking
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_failover_events (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    follower_id TEXT NOT NULL,
+                    leader_id TEXT,
+                    event_type TEXT NOT NULL,
+                    previous_mode TEXT,
+                    new_mode TEXT NOT NULL,
+                    trigger_reason TEXT,
+                    recovery_action TEXT,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    occurred_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_follower ON copy_failover_events (follower_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_type ON copy_failover_events (event_type)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_at ON copy_failover_events (occurred_at DESC)"))
+
+            # Copy Replay Events — replayable copy execution log
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_replay_events (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    leader_id TEXT,
+                    follower_id TEXT,
+                    leader_order_id TEXT,
+                    follower_order_id TEXT,
+                    symbol TEXT,
+                    side TEXT,
+                    leader_qty NUMERIC,
+                    follower_qty NUMERIC,
+                    leader_price NUMERIC,
+                    follower_price NUMERIC,
+                    slippage_bps NUMERIC DEFAULT 0,
+                    execution_latency_ms INT DEFAULT 0,
+                    drift_at_execution NUMERIC DEFAULT 0,
+                    event_data JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_trace ON copy_replay_events (trace_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_leader ON copy_replay_events (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_created ON copy_replay_events (created_at DESC)"))
+
+            # Copy Quality Metrics — institutional replication quality
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS copy_quality_metrics (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    leader_id TEXT,
+                    follower_id TEXT,
+                    replication_latency_ms NUMERIC DEFAULT 0,
+                    sync_quality_score NUMERIC DEFAULT 1.0,
+                    slippage_amplification NUMERIC DEFAULT 0.0,
+                    execution_divergence NUMERIC DEFAULT 0.0,
+                    pnl_divergence NUMERIC DEFAULT 0.0,
+                    replay_integrity NUMERIC DEFAULT 1.0,
+                    drift_accumulation NUMERIC DEFAULT 0.0,
+                    follower_survivability NUMERIC DEFAULT 1.0,
+                    n_events_analyzed INT DEFAULT 0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    measured_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_leader ON copy_quality_metrics (leader_id)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_measured ON copy_quality_metrics (measured_at DESC)"))
+
+            # ================================================================
+            # PHASE 22 — SCOUT NETWORK HARDENING & OUTCOME ATTRIBUTION
+            # ================================================================
+
+            # Scout Signal Attribution — Links signals to execution/pnl outcomes
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_signal_attribution (
+                    id TEXT PRIMARY KEY,
+                    signal_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_sub TEXT,
+                    symbol TEXT,
+                    executed_order_id TEXT,
+                    hypothesis_id TEXT,
+                    outcome_pnl NUMERIC DEFAULT 0.0,
+                    attribution_score NUMERIC DEFAULT 0.0,
+                    predictive_survivability NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    attributed_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_source ON scout_signal_attribution (source)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_signal ON scout_signal_attribution (signal_id)"))
+
+            # Source Performance Log — Dynamic trust tracking over time
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS source_performance_log (
+                    id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    source_sub TEXT,
+                    dynamic_trust_score NUMERIC DEFAULT 0.5,
+                    historical_accuracy NUMERIC DEFAULT 0.5,
+                    n_profitable_signals INT DEFAULT 0,
+                    n_loss_signals INT DEFAULT 0,
+                    n_quarantined_signals INT DEFAULT 0,
+                    recent_contradiction_rate NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_source_perf_source ON source_performance_log (source, source_sub)"))
+            
+            # Scout Poison Quarantine — Anti-poisoning detection logs
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_poison_quarantine (
+                    id TEXT PRIMARY KEY,
+                    trace_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_sub TEXT,
+                    violation_type TEXT NOT NULL,
+                    severity_score NUMERIC DEFAULT 1.0,
+                    affected_symbols JSONB DEFAULT '[]'::jsonb,
+                    action_taken TEXT NOT NULL,
+                    metadata JSONB DEFAULT '{}'::jsonb,
+                    detected_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quarantine (source)"))
+
+
     async def _execute_insert(self, query: str, params: Dict[str, Any]) -> None:
+        normalized_params = normalize_db_params(params)
+        query_l = query.strip().lower()
+        if query_l.startswith("insert into external_scout_memory"):
+            validation = validate_scout_payload(normalized_params)
+            if not validation.valid:
+                await self._quarantine_scout_payload(validation.normalized_payload, validation.reasons)
+                return
+            normalized_params = validation.normalized_payload
         async with self.engine.begin() as conn:
-            await conn.execute(text(query), params)
+            await conn.execute(text(query), normalized_params)
+
+    async def _quarantine_scout_payload(self, payload: dict[str, Any], reasons: list[str]) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO scout_quarantine (source, source_sub, reasons, raw_payload)
+                    VALUES (:source, :source_sub, :reasons::jsonb, :raw_payload::jsonb)
+                    """
+                ),
+                {
+                    "source": payload.get("source"),
+                    "source_sub": payload.get("source_sub") or payload.get("signal_type"),
+                    "reasons": safe_json_dumps(reasons),
+                    "raw_payload": safe_json_dumps(payload),
+                },
+            )
+
+    async def fetchval(self, query: str, params: Optional[Dict[str, Any]] = None):
+        async with self.engine.connect() as conn:
+            result = await conn.execute(text(query), params or {})
+            return result.scalar()
 
     async def write_bars(self, symbol: str, data: BarData) -> None:
         """Insert to market_data_l1 (idempotent — skips duplicates)"""
@@ -1064,6 +2107,135 @@ class TimescaleClient:
                 )
             return out
 
+    async def get_latest_scout_intelligence(self) -> dict:
+        """
+        Fetch latest scout intelligence payloads for Ideator/Mutator/Validator consumption.
+        Returns: {regime: {...}, liquidity: {...}, correlation: {...}, execution: {...}}
+        """
+        results = {}
+        async with self.engine.connect() as conn:
+            try:
+                result = await conn.execute(text("""
+                    SELECT volatility_regime, trend_regime, liquidity_regime, correlation_regime,
+                           realized_volatility, relative_volume, confidence_score
+                    FROM market_regime_memory
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """))
+                row = result.fetchone()
+                if row:
+                    results["regime"] = {
+                        "volatility": row[0],
+                        "trend": row[1],
+                        "liquidity": row[2],
+                        "correlation": row[3],
+                        "realized_vol": float(row[4]) if row[4] else 0,
+                        "relative_volume": float(row[5]) if row[5] else 0,
+                        "confidence": float(row[6]) if row[6] else 0,
+                    }
+            except Exception:
+                pass
+
+            try:
+                result = await conn.execute(text("""
+                    SELECT liquidity_regime, liquidity_score, slippage_risk, avg_spread_bps
+                    FROM liquidity_intelligence
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """))
+                row = result.fetchone()
+                if row:
+                    results["liquidity"] = {
+                        "regime": row[0],
+                        "score": float(row[1]) if row[1] else 0,
+                        "risk": float(row[2]) if row[2] else 0,
+                        "spread_bps": float(row[3]) if row[3] else 0,
+                    }
+            except Exception:
+                pass
+
+            try:
+                result = await conn.execute(text("""
+                    SELECT cluster_name, avg_pairwise_corr, risk_state, correlation_spike_detected
+                    FROM correlation_memory
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """))
+                row = result.fetchone()
+                if row:
+                    results["correlation"] = {
+                        "cluster": row[0],
+                        "avg_corr": float(row[1]) if row[1] else 0,
+                        "risk_state": row[2],
+                        "spike": bool(row[3]),
+                    }
+            except Exception:
+                pass
+
+            try:
+                result = await conn.execute(text("""
+                    SELECT execution_regime, fill_quality_score, avg_slippage_bps, rejection_rate
+                    FROM execution_intelligence
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """))
+                row = result.fetchone()
+                if row:
+                    results["execution"] = {
+                        "regime": row[0],
+                        "fill_score": float(row[1]) if row[1] else 0,
+                        "slippage_bps": float(row[2]) if row[2] else 0,
+                        "rejection_rate": float(row[3]) if row[3] else 0,
+                    }
+            except Exception:
+                pass
+
+        return results
+
+    async def get_validation_intelligence(self) -> dict:
+        """
+        Fetch latest Phase 11 validation intelligence for Ideator/Mutator consumption.
+        Returns: {walk_forward: {...}, monte_carlo: {...}, overfitting: {...},
+                  regime: {...}, cost_stress: {...}}
+        """
+        results = {}
+        # Each table has its own timestamp column for ORDER BY
+        queries = [
+            ("walk_forward_analysis", "walk_forward",
+             ["walk_forward_score", "temporal_consistency", "regime_survival_score"],
+             "analyzed_at"),
+            ("monte_carlo_analysis", "monte_carlo",
+             ["monte_carlo_survival_score", "expected_tail_drawdown", "probabilistic_sharpe"],
+             "simulated_at"),
+            ("overfitting_analysis", "overfitting",
+             ["overfit_probability", "robustness_score", "parameter_stability_score"],
+             "analyzed_at"),
+            ("regime_validation", "regime",
+             ["regime_dependency_score", "regime_survival_score", "over_specialized"],
+             "validated_at"),
+            ("cost_stress_analysis", "cost_stress",
+             ["cost_survival_score", "passes_min_survival", "fragile_scalper_detected"],
+             "tested_at"),
+        ]
+        async with self.engine.connect() as conn:
+            for tbl, key, cols, order_by in queries:
+                try:
+                    col_list = ", ".join(cols)
+                    q = text(f"SELECT {col_list} FROM {tbl} ORDER BY {order_by} DESC NULLS LAST LIMIT 1")
+                    result = await conn.execute(q)
+                    row = result.fetchone()
+                    if row:
+                        results[key] = {}
+                        for i, c in enumerate(cols):
+                            val = row[i]
+                            if isinstance(val, bool):
+                                results[key][c] = bool(val)
+                            else:
+                                results[key][c] = float(val) if val is not None else 0.0
+                except Exception:
+                    pass
+        return results
+
     async def get_top_strategies_by_sharpe(
         self, min_sharpe: float, max_sharpe: float, limit: int
     ) -> list[dict]:
@@ -1340,7 +2512,8 @@ class TimescaleClient:
     async def get_repair_candidates(self, limit: int = 10) -> list[dict]:
         """
         Fetch strategies suitable for mutation repair.
-        Targets: failed_validation with entries + trades, research_candidate, validated_B.
+        Targets: repair_candidate and research_candidate only.
+        Excludes failed_validation — directed evolution, not random garbage mutation.
         """
         query = """
             SELECT s.id, s.name, s.code, s.parameters, s.normalized_strategy,
@@ -1349,15 +2522,11 @@ class TimescaleClient:
                    b.win_rate, b.results
             FROM strategies s
             JOIN backtest_results b ON s.id = b.strategy_id
-            WHERE (
-                (s.status = 'failed_validation' AND b.entry_count > 0 AND b.total_trades >= 3)
-                OR s.status IN ('repair_candidate', 'research_candidate')
-            )
+            WHERE s.status IN ('repair_candidate', 'research_candidate')
             ORDER BY
                 CASE s.status
                     WHEN 'research_candidate' THEN 1
                     WHEN 'repair_candidate' THEN 2
-                    ELSE 3
                 END,
                 b.sharpe DESC
             LIMIT :limit

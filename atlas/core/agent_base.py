@@ -12,6 +12,7 @@ class AgentLayer(str, Enum):
     L3 = "L3"
     L4 = "L4"
     L5 = "L5"
+    L6 = "L6"
     L7 = "L7"
 
 
@@ -23,12 +24,25 @@ class AgentStatus(str, Enum):
     INITIALIZING = "initializing"
 
 
+class GovernanceViolation(RuntimeError):
+    """Raised when an advisory-only agent attempts a forbidden action."""
+    pass
+
+
 class BaseAgent(ABC):
-    def __init__(self, name: str, agent_type: str, layer: str | AgentLayer, redis_client: Redis):
+    def __init__(
+        self,
+        name: str,
+        agent_type: str,
+        layer: str | AgentLayer,
+        redis_client: Redis,
+        advisory_only: bool = False,
+    ):
         self.agent_id: str = str(uuid.uuid4())
         self.name: str = name
         self.agent_type: str = agent_type
         self.layer: str = layer.value if isinstance(layer, AgentLayer) else layer
+        self.advisory_only: bool = advisory_only
 
         self.status: str = AgentStatus.STOPPED.value
 
@@ -38,6 +52,19 @@ class BaseAgent(ABC):
 
         self._heartbeat_task: asyncio.Task | None = None
         self._main_task: asyncio.Task | None = None
+
+    def _enforce_advisory_guard(self, action: str = "unknown") -> None:
+        """Raise GovernanceViolation if this agent is advisory-only.
+
+        Call this at the top of any method that mutates execution state,
+        places orders, allocates capital, or overrides governance.
+        """
+        if self.advisory_only:
+            raise GovernanceViolation(
+                f"Agent '{self.name}' is advisory-only and cannot perform "
+                f"action '{action}'. Advisory agents may only produce "
+                f"persisted recommendations — never mutate system state."
+            )
 
     async def start(self):
         if self.status == AgentStatus.RUNNING.value:
@@ -85,6 +112,7 @@ class BaseAgent(ABC):
                         "layer": self.layer,
                         "name": self.name,
                         "agent_type": self.agent_type,
+                        "advisory_only": str(self.advisory_only),
                     },
                 )
 
