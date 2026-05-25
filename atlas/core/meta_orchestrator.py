@@ -3,6 +3,25 @@ import httpx
 from loguru import logger
 from atlas.core.agent_registry import AgentRegistry
 from atlas.config.settings import get_settings
+from atlas.agents.l7_meta.regime_stress_engine import RegimeStressEngine
+from atlas.agents.l7_meta.dominant_organism_tracker import DominantOrganismTracker
+from atlas.agents.l7_meta.mutation_lineage_tracker import MutationLineageTracker
+from atlas.agents.l7_meta.regime_specialization_engine import RegimeSpecializationEngine
+from atlas.agents.l7_meta.scout_divergence_engine import ScoutDivergenceEngine
+from atlas.agents.l6_portfolio.portfolio_evolution_pressure import PortfolioEvolutionPressure
+
+
+# ─────────────────────────────────────────────────────────
+# PHASE 31 ENGINE TYPES — used for selective startup
+# ─────────────────────────────────────────────────────────
+PHASE31_ENGINE_TYPES = (
+    RegimeStressEngine,
+    DominantOrganismTracker,
+    MutationLineageTracker,
+    RegimeSpecializationEngine,
+    ScoutDivergenceEngine,
+    PortfolioEvolutionPressure,
+)
 
 
 class MetaOrchestrator:
@@ -12,8 +31,23 @@ class MetaOrchestrator:
         # Holds registry of all agent instances
         self.agent_map = {a.agent_id: a for a in agents}
         self._monitor_task: asyncio.Task | None = None
+        self._phase31_engines: list = []
 
     async def start_all(self):
+        # Phase 31: Start all L7/L6 evolutionary engines in background
+        phase31_engines = [
+            a for a in self.agents
+            if isinstance(a, PHASE31_ENGINE_TYPES)
+        ]
+        if phase31_engines:
+            self._phase31_engines = phase31_engines
+            await asyncio.gather(*(a.start() for a in phase31_engines), return_exceptions=True)
+            names = [a.name for a in phase31_engines]
+            logger.info(
+                f"Phase 31 engines started: {len(phase31_engines)} instances "
+                f"({', '.join(names)})"
+            )
+
         # Spawn agents in order:
         # 1. EquityIngestorAgent + CryptoIngestorAgent (parallel)
         l1_agents = [

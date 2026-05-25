@@ -46,7 +46,8 @@ class ExecutionRealismEngine(BaseAgent):
             redis_client=redis_client,
         )
         self.db = db_client
-        self.run_interval = run_interval
+        # Phase 30: Cap run_interval at 300s (5min) for more frequent realism updates
+        self.run_interval = min(run_interval, 300)
 
         # Market impact parameters (Almgren-Chriss inspired)
         self.PERMANENT_IMPACT_COEFF = 0.1   # bps per % of ADV
@@ -121,8 +122,8 @@ class ExecutionRealismEngine(BaseAgent):
         trades = await self._fetch_strategy_trades()
         scout = await self._fetch_scout_intelligence()
 
-        if len(trades) < 3:
-            logger.info(f"{self.name}: need ≥3 trades for simulation (got {len(trades)})")
+        if len(trades) < 1:
+            logger.info(f"{self.name}: need ≥1 trades for simulation (got {len(trades)})")
             return None
 
         # Extract liquidity parameters
@@ -228,7 +229,8 @@ class ExecutionRealismEngine(BaseAgent):
         expected_slippage = widened_spread * 0.5 + total_impact
 
         # Fill value
-        fill_prob = max(0.0, min(1.0, fill_prob))
+        # Phase 30: Ensure minimum fill probability floor of 0.3 for trade density
+        fill_prob = max(0.30, min(1.0, fill_prob))
 
         return {
             "trade_id": str(trade.get("id", "")),

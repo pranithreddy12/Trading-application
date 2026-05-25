@@ -80,7 +80,7 @@ class ScoutSynthesisEngine(BaseAgent):
         self.db = db_client
         self._claude = claude_client
         self.run_interval = run_interval
-        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "true").lower() == "true"
+        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "false").lower() == "true"
 
     async def run(self):
         logger.info(
@@ -279,10 +279,17 @@ class ScoutSynthesisEngine(BaseAgent):
                 weights[s] = self.DEFAULT_WEIGHTS.get(s, 0.3)
         return weights
 
-    def _compute_agreement_metrics(self, signals: dict, dynamic_weights: dict) -> dict:
+    def _compute_agreement_metrics(
+        self,
+        signals: dict,
+        dynamic_weights: dict | None = None,
+    ) -> dict:
         """Compute agreement/disagreement, consensus reliability, and Shannon entropy."""
         if not signals:
             return {"agreement_score": 0.0, "disagreement_areas": [], "disagreement_entropy": 0.0}
+
+        if dynamic_weights is None:
+            dynamic_weights = dict(self.DEFAULT_WEIGHTS)
 
         # Map summary signals to numeric direction
         signal_map = {

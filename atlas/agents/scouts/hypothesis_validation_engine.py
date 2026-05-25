@@ -166,7 +166,7 @@ class HypothesisValidationEngine(BaseAgent):
             """
             UPDATE external_scout_memory
             SET hypothesis_score = -1.0,
-                details = COALESCE(details, '{}'::jsonb) || '{"retired": true}'::jsonb
+                details = COALESCE(details, CAST('{}' AS jsonb)) || CAST('{"retired": true}' AS jsonb)
             WHERE id = :id
             """,
             {"id": signal_id},

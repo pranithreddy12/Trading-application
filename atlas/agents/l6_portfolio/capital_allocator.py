@@ -37,11 +37,11 @@ class CapitalAllocator(BaseAgent):
     layer = "L6"
 
     # Default constraints
-    MAX_STRATEGY_EXPOSURE = 0.30       # No strategy > 30%
-    MAX_ASSET_CLASS_EXPOSURE = 0.60    # No asset class > 60%
+    MAX_STRATEGY_EXPOSURE = 0.15       # Phase 30: Reduced from 0.30 — tighter capital competition
+    MAX_ASSET_CLASS_EXPOSURE = 0.40    # Phase 30: Reduced from 0.60
     MAX_LEVERAGE = 1.0                 # No leverage
-    KELLY_FRACTION = 0.25              # Fraction of Kelly to use (conservative)
-    VOL_TARGET = 0.15                  # 15% annualized volatility target
+    KELLY_FRACTION = 0.15              # Phase 30: Reduced from 0.25 — more scarcity pressure
+    VOL_TARGET = 0.12                  # Phase 30: Reduced from 0.15 — lower vol target
     RISK_FREE_RATE = 0.05              # 5% risk-free rate
 
     def __init__(self, redis_client=None, db_client=None, run_interval: int = 1800):

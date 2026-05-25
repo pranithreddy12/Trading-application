@@ -43,7 +43,7 @@ phase26_tables = """
                     confidence NUMERIC DEFAULT 0.0,
                     regime_context TEXT,
                     entropy_context NUMERIC,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             \"""))
@@ -78,7 +78,7 @@ phase26_tables = """
                     survived_validation BOOLEAN DEFAULT FALSE,
                     regime_at_time TEXT,
                     entropy_at_time NUMERIC,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             \"""))

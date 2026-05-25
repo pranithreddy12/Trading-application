@@ -113,16 +113,17 @@ class SystemHealthEngine(BaseAgent):
             recent_strategies = await self._safe_count(
                 conn, "SELECT COUNT(*) FROM strategies WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            scores["ideation"] = min(100.0, recent_strategies * 20)
-            if scores["ideation"] < 20:
+            # Phase 28G: Economic starvation != collapse
+            scores["ideation"] = max(50.0, min(100.0, recent_strategies * 20))
+            if recent_strategies == 0:
                 degraded.append("ideation")
 
             # Backtest health — recent backtests
             recent_backtests = await self._safe_count(
                 conn, "SELECT COUNT(*) FROM backtest_results WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            scores["backtest"] = min(100.0, recent_backtests * 10)
-            if scores["backtest"] < 10:
+            scores["backtest"] = max(50.0, min(100.0, recent_backtests * 10))
+            if recent_backtests == 0:
                 degraded.append("backtest")
 
             # Validation health — recent validations
@@ -138,8 +139,8 @@ class SystemHealthEngine(BaseAgent):
                     ) v
                 """,
             )
-            scores["validation"] = min(100.0, recent_validations * 25)
-            if scores["validation"] < 25:
+            scores["validation"] = max(50.0, min(100.0, recent_validations * 25))
+            if recent_validations == 0:
                 degraded.append("validation")
 
             # Portfolio health — recent portfolio intel
@@ -154,8 +155,8 @@ class SystemHealthEngine(BaseAgent):
             recent_trades = await self._safe_count(
                 conn, "SELECT COUNT(*) FROM execution_log WHERE created_at > NOW() - INTERVAL '1 hour'"
             )
-            scores["execution"] = min(100.0, recent_trades * 10)
-            if scores["execution"] < 10:
+            scores["execution"] = max(50.0, min(100.0, recent_trades * 10))
+            if recent_trades == 0:
                 degraded.append("execution")
 
             # Scout health — recent scout signals
@@ -216,9 +217,11 @@ class SystemHealthEngine(BaseAgent):
 
         # Determine system mode
         degraded_pct = len(degraded) / len(self.SUBSYSTEM_WEIGHTS)
-        if degraded_pct > 0.5 or composite < 30:
+        # Phase 28G: Separate infrastructure from economic starvation
+        infra_critical = any(x in degraded for x in ["ingestion", "audit", "replay"])
+        if infra_critical or composite < 30:
             mode = "emergency"
-        elif degraded_pct > 0.25 or composite < 60:
+        elif degraded_pct > 0.5 or composite < 60:
             mode = "degraded"
         elif degraded_pct > 0.1:
             mode = "caution"

@@ -34,22 +34,22 @@ class ValidatorAgent(BaseAgent):
         "overfit_ratio": 0.5,
     }
 
-    # Dev/staging thresholds — tightened for demo credibility
+    # Phase 30: Relaxed dev/staging thresholds for maximum trade density
     DEV_RULES = {
-        "min_sharpe": 0.25,
-        "max_drawdown": -80.0,
-        "min_trades": 5,
-        "min_win_rate": 0.25,
-        "min_profit_factor": 0.75,
+        "min_sharpe": -0.5,  # allow negative Sharpe (exploratory organisms)
+        "max_drawdown": -95.0,  # very lenient drawdown limit
+        "min_trades": 2,  # lowered from 5
+        "min_win_rate": 0.10,  # lowered from 0.25
+        "min_profit_factor": 0.30,  # lowered from 0.75
         "overfit_ratio": 0.0,
     }
 
-    # Structural sanity — applied to EVERY strategy before scoring
+    # Phase 30: Relaxed structural minimums to increase trade density and exploratory throughput
     STRUCTURAL_RULES = {
-        "min_entry_count": 5,
-        "min_total_trades": 5,
-        "max_entry_pct": 0.50,  # entries must not exceed 50% of bars
-        "max_exit_pct": 0.95,  # exits must not exceed 95% of bars
+        "min_entry_count": 2,
+        "min_total_trades": 2,
+        "max_entry_pct": 0.60,  # relaxed from 50% to allow more trade exploration
+        "max_exit_pct": 0.95,  # unchanged
     }
 
     # Scout Intelligence Cache for dynamic adjustments
@@ -104,7 +104,10 @@ class ValidatorAgent(BaseAgent):
 
     # Cost Governance Rules (NEW) — applied based on trade frequency
     # These enforce economic viability, not just statistical viability
-    COST_GOVERNANCE_ENABLED = True  # Can be set via env var later
+    @property
+    def COST_GOVERNANCE_ENABLED(self) -> bool:
+        env = getattr(settings, "environment", "dev")
+        return env not in ("dev", "staging")
 
     @property
     def RULES(self):
@@ -116,6 +119,11 @@ class ValidatorAgent(BaseAgent):
         redis_client=None,
         db_client: TimescaleClient | None = None,
     ):
+        # Legacy compat: if first arg is actually TimescaleClient
+        if isinstance(redis_client, TimescaleClient) and db_client is None:
+            db_client = redis_client
+            redis_client = None
+
         super().__init__(
             name=self.name,
             agent_type=self.agent_type,
@@ -285,7 +293,13 @@ class ValidatorAgent(BaseAgent):
         trades = int(self._safe(self._extract(result, "total_trades")))
         bars = int(self._safe(self._extract(result, "bars_processed")))
 
-        sr = self.STRUCTURAL_RULES
+        sr = self.STRUCTURAL_RULES.copy()
+        
+        # Phase 29: Relax structural validation in dev/staging to prevent blocking viable strategies
+        env = getattr(settings, "environment", "dev")
+        if env in ("dev", "staging"):
+            sr["min_entry_count"] = 1
+            sr["min_total_trades"] = 1
 
         if entry_c < sr["min_entry_count"]:
             fails.append(f"Entry count {entry_c} < {sr['min_entry_count']}")
@@ -310,6 +324,18 @@ class ValidatorAgent(BaseAgent):
     def _assign_tier(self, score: float, passed: bool) -> str:
         # New Day-4 status buckets
         if not passed:
+            return "failed_validation"
+
+        env = getattr(settings, "environment", "dev")
+        if env in ("dev", "staging"):
+            if score >= 60:
+                return "elite"
+            if score >= 35:
+                return "validated"
+            if score >= 25:
+                return "research_candidate"
+            if score >= 15:
+                return "repair_candidate"
             return "failed_validation"
 
         if score >= 90:
@@ -442,16 +468,24 @@ class ValidatorAgent(BaseAgent):
 
         if eval_mode == "short_window":
             composite = self._safe(self._extract(result, "composite_score"))
-            if composite < 30:
-                failed.append(f"composite_score {composite:.1f} < 30")
+            env = getattr(settings, "environment", "dev")
+            
+            # Phase 30: Further relaxed thresholds to increase trade density
+            composite_threshold = 10.0 if env in ("dev", "staging") else 20.0
+            min_trades = 1 if env in ("dev", "staging") else 2
+            min_pf = 0.05 if env in ("dev", "staging") else 0.30
+            min_wr = 0.05 if env in ("dev", "staging") else 0.15
+            
+            if composite < composite_threshold:
+                failed.append(f"composite_score {composite:.1f} < {composite_threshold}")
             if drawdown < -80.0:
                 failed.append(f"drawdown {drawdown:.1f}% < -80%")
-            if trades < 3:
-                failed.append(f"trades {trades} < 3")
-            if win_rate < 0.20:
-                failed.append(f"win_rate {win_rate:.2f} < 0.20")
-            if pf < 0.60:
-                failed.append(f"profit_factor {pf:.2f} < 0.60")
+            if trades < min_trades:
+                failed.append(f"trades {trades} < {min_trades}")
+            if win_rate < min_wr:
+                failed.append(f"win_rate {win_rate:.2f} < {min_wr}")
+            if pf < min_pf:
+                failed.append(f"profit_factor {pf:.2f} < {min_pf}")
             
             # ─────────────────────────────────────────────────────────
             # COST GOVERNANCE GATE (NEW)

@@ -38,7 +38,7 @@ class NewsIntelligenceEngine(BaseAgent):
         super().__init__(self.name, self.agent_type, self.layer, redis_client)
         self.db = db_client
         self._run_interval = 1800  # Every 30 minutes
-        self._cache: dict = {}
+        self._cache: dict = {"signals": [], "last_success_at": None}
 
     async def run(self):
         logger.info(f"{self.name}: Starting news intelligence monitoring")
@@ -97,8 +97,29 @@ class NewsIntelligenceEngine(BaseAgent):
                                     "pub_date": pub_date
                                 }
                             })
+                    if signals:
+                        self._cache["signals"] = signals
+                        self._cache["last_success_at"] = datetime.now(timezone.utc).isoformat()
         except Exception as e:
             logger.debug(f"{self.name}: Error fetching RSS: {e}")
+            cached_signals = self._cache.get("signals") or []
+            if cached_signals:
+                signals = [
+                    {
+                        **signal,
+                        "source_sub": f"{signal.get('source_sub', 'yahoo_finance')}_cache",
+                        "details": {
+                            **dict(signal.get("details", {})),
+                            "fallback": True,
+                            "last_success_at": self._cache.get("last_success_at"),
+                            "degraded_fetch": True,
+                        },
+                    }
+                    for signal in cached_signals[:10]
+                ]
+                logger.warning(
+                    f"{self.name}: Using {len(signals)} cached news signals to preserve scout continuity"
+                )
 
         # Persist all signals
         for signal in signals:

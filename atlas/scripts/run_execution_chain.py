@@ -14,11 +14,11 @@ async def main():
 
     redis = Redis.from_url(settings.redis_url)
 
-    va = await db.get_strategies_by_status("validated_A")
-    vb = await db.get_strategies_by_status("validated_B")
-    validated = va + vb
+    validated_strats = await db.get_strategies_by_status("validated")
+    elite = await db.get_strategies_by_status("elite")
+    validated = validated_strats + elite
     logger.info(
-        f"Found {len(validated)} validated strategies (A={len(va)}, B={len(vb)})"
+        f"Found {len(validated)} validated strategies (Validated={len(validated_strats)}, Elite={len(elite)})"
     )
 
     if not validated:

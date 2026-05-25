@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     key_hash TEXT NOT NULL, key_prefix TEXT NOT NULL DEFAULT 'atlas_',
     user_id TEXT NOT NULL, role TEXT NOT NULL,
-    scopes JSONB DEFAULT '[]'::jsonb,
+    scopes JSONB DEFAULT CAST('[]' AS jsonb),
     rate_limit_per_min INT NOT NULL DEFAULT 100,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS copy_leader_accounts (
     account_ref TEXT NOT NULL, broker TEXT NOT NULL DEFAULT 'paper',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
+    metadata JSONB DEFAULT CAST('{}' AS jsonb)
 );
 CREATE TABLE IF NOT EXISTS copy_follower_accounts (
     follower_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS copy_follower_accounts (
     max_position_pct NUMERIC NOT NULL DEFAULT 0.1,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    metadata JSONB DEFAULT '{}'::jsonb
+    metadata JSONB DEFAULT CAST('{}' AS jsonb)
 );
 CREATE TABLE IF NOT EXISTS positions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

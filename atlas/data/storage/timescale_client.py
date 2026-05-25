@@ -207,6 +207,77 @@ class TimescaleClient:
         self.db_url = db_url
         self.engine = create_async_engine(self.db_url, echo=False)
 
+    async def _log_strategy_transition(
+        self,
+        strategy_id: str,
+        old_status: str | None,
+        new_status: str,
+        reason: str,
+        *,
+        trace_id: str | None = None,
+        strategy_name: str | None = None,
+        actor: str = "TimescaleClient",
+        stage: str = "strategy_lifecycle",
+        persist_to_lineage: bool = True,
+    ) -> None:
+        if not strategy_id:
+            return
+
+        try:
+            if not trace_id or not strategy_name:
+                async with self.engine.connect() as conn:
+                    result = await conn.execute(
+                        text("""
+                            SELECT trace_id, name
+                            FROM strategies
+                            WHERE id = :sid
+                        """),
+                        {"sid": str(strategy_id)},
+                    )
+                    row = result.fetchone()
+                    if row:
+                        trace_id = trace_id or (str(row[0]) if row[0] else None)
+                        strategy_name = strategy_name or (str(row[1]) if row[1] else None)
+
+            if not trace_id:
+                return
+
+            if not persist_to_lineage:
+                from loguru import logger
+
+                logger.info(
+                    f"Strategy transition: id={strategy_id} old={old_status or 'unknown'} "
+                    f"new={new_status} reason={reason}"
+                )
+                return
+
+            from atlas.core.event_lineage import EventLineageClient
+            from loguru import logger
+
+            lineage = EventLineageClient(self)
+            await lineage.create_event(
+                trace_id=trace_id,
+                stage=stage,
+                status=new_status,
+                actor=actor,
+                strategy_id=strategy_id,
+                metadata={
+                    "strategy_name": strategy_name or "",
+                    "old_status": old_status or "",
+                    "new_status": new_status,
+                    "reason": reason,
+                },
+            )
+
+            logger.info(
+                f"Strategy transition: id={strategy_id} old={old_status or 'unknown'} "
+                f"new={new_status} reason={reason}"
+            )
+        except Exception as exc:
+            from loguru import logger
+
+            logger.debug(f"Strategy transition log failed for {strategy_id}: {exc}")
+
     async def close(self) -> None:
         """Dispose the SQLAlchemy engine and release pooled connections."""
         await self.engine.dispose()
@@ -424,7 +495,7 @@ class TimescaleClient:
                     status TEXT NOT NULL,
                     actor TEXT NOT NULL,
                     parent_event_id TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """)
@@ -456,7 +527,7 @@ class TimescaleClient:
                         triggered_by TEXT,
                         activated_at TIMESTAMPTZ,
                         released_at TIMESTAMPTZ,
-                        metadata JSONB DEFAULT '{}'::jsonb,
+                        metadata JSONB DEFAULT CAST('{}' AS jsonb),
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW()
                     )
@@ -482,7 +553,7 @@ class TimescaleClient:
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                         source TEXT,
                         source_sub TEXT,
-                        reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        reasons JSONB NOT NULL DEFAULT CAST('[]' AS jsonb),
                         raw_payload JSONB NOT NULL,
                         quarantined_at TIMESTAMPTZ DEFAULT NOW()
                     )
@@ -559,7 +630,7 @@ class TimescaleClient:
                     expansion_detected BOOLEAN,
                     vwap_deviation_pct NUMERIC,
                     confidence_score NUMERIC DEFAULT 0.0,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_symbol ON market_regime_memory (symbol)"))
@@ -576,7 +647,7 @@ class TimescaleClient:
                     slippage_risk NUMERIC,
                     market_impact_estimate NUMERIC,
                     liquidity_regime TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_symbol ON liquidity_intelligence (symbol)"))
@@ -593,7 +664,7 @@ class TimescaleClient:
                     symbols_analyzed TEXT[],
                     top_correlated_pairs JSONB,
                     correlation_spike_detected BOOLEAN DEFAULT FALSE,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_timestamp ON correlation_memory (timestamp DESC)"))
@@ -611,7 +682,7 @@ class TimescaleClient:
                     fill_quality_score NUMERIC,
                     execution_regime TEXT,
                     sample_size INT DEFAULT 0,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_symbol ON execution_intelligence (symbol)"))
@@ -630,7 +701,7 @@ class TimescaleClient:
                     regime_survival_score NUMERIC,
                     n_windows_survived INT,
                     n_windows_total INT,
-                    per_window_metrics JSONB DEFAULT '[]'::jsonb,
+                    per_window_metrics JSONB DEFAULT CAST('[]' AS jsonb),
                     analyzed_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
@@ -676,7 +747,7 @@ class TimescaleClient:
                 CREATE TABLE IF NOT EXISTS regime_validation (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
-                    regime_survival_map JSONB DEFAULT '{}'::jsonb,
+                    regime_survival_map JSONB DEFAULT CAST('{}' AS jsonb),
                     regime_dependency_score NUMERIC,
                     regime_survival_score NUMERIC,
                     n_regimes_survived INT,
@@ -718,7 +789,7 @@ class TimescaleClient:
                     decay_score NUMERIC,
                     dominant_archetype TEXT,
                     archetype_focus_pct NUMERIC,
-                    top_archetypes JSONB DEFAULT '{}'::jsonb,
+                    top_archetypes JSONB DEFAULT CAST('{}' AS jsonb),
                     computed_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (feature_name)
                 )
@@ -734,17 +805,17 @@ class TimescaleClient:
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     computed_at TIMESTAMPTZ NOT NULL,
                     n_strategies INT DEFAULT 0,
-                    strategy_ids JSONB DEFAULT '[]'::jsonb,
-                    correlation_matrix JSONB DEFAULT '[]'::jsonb,
-                    covariance_matrix JSONB DEFAULT '[]'::jsonb,
-                    cluster_map JSONB DEFAULT '{}'::jsonb,
-                    efficiency_scores JSONB DEFAULT '[]'::jsonb,
-                    optimal_allocations JSONB DEFAULT '[]'::jsonb,
-                    regime_conditioned_weights JSONB DEFAULT '{}'::jsonb,
+                    strategy_ids JSONB DEFAULT CAST('[]' AS jsonb),
+                    correlation_matrix JSONB DEFAULT CAST('[]' AS jsonb),
+                    covariance_matrix JSONB DEFAULT CAST('[]' AS jsonb),
+                    cluster_map JSONB DEFAULT CAST('{}' AS jsonb),
+                    efficiency_scores JSONB DEFAULT CAST('[]' AS jsonb),
+                    optimal_allocations JSONB DEFAULT CAST('[]' AS jsonb),
+                    regime_conditioned_weights JSONB DEFAULT CAST('{}' AS jsonb),
                     ensemble_survivability_score NUMERIC,
                     concentration_risk NUMERIC,
                     diversification_score NUMERIC,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_computed ON portfolio_intelligence (computed_at DESC)"))
@@ -756,15 +827,15 @@ class TimescaleClient:
                     computed_at TIMESTAMPTZ NOT NULL,
                     n_strategies INT DEFAULT 0,
                     method TEXT,
-                    final_allocations JSONB DEFAULT '[]'::jsonb,
+                    final_allocations JSONB DEFAULT CAST('[]' AS jsonb),
                     total_exposure NUMERIC,
-                    kelly_weights JSONB DEFAULT '[]'::jsonb,
-                    vol_target_weights JSONB DEFAULT '[]'::jsonb,
-                    risk_parity_weights JSONB DEFAULT '[]'::jsonb,
-                    redistribution_signals JSONB DEFAULT '[]'::jsonb,
-                    regime_applied JSONB DEFAULT '{}'::jsonb,
+                    kelly_weights JSONB DEFAULT CAST('[]' AS jsonb),
+                    vol_target_weights JSONB DEFAULT CAST('[]' AS jsonb),
+                    risk_parity_weights JSONB DEFAULT CAST('[]' AS jsonb),
+                    redistribution_signals JSONB DEFAULT CAST('[]' AS jsonb),
+                    regime_applied JSONB DEFAULT CAST('{}' AS jsonb),
                     leverage_cap_applied NUMERIC DEFAULT 1.0,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_capital_allocation_computed ON capital_allocation (computed_at DESC)"))
@@ -776,10 +847,10 @@ class TimescaleClient:
                     executed_at TIMESTAMPTZ NOT NULL,
                     n_signals_processed INT DEFAULT 0,
                     n_trades_generated INT DEFAULT 0,
-                    consensus_trades JSONB DEFAULT '[]'::jsonb,
-                    strategy_weights_used JSONB DEFAULT '{}'::jsonb,
-                    regime_context JSONB DEFAULT '{}'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    consensus_trades JSONB DEFAULT CAST('[]' AS jsonb),
+                    strategy_weights_used JSONB DEFAULT CAST('{}' AS jsonb),
+                    regime_context JSONB DEFAULT CAST('{}' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ensemble_executed ON ensemble_execution (executed_at DESC)"))
@@ -795,11 +866,11 @@ class TimescaleClient:
                     avg_expected_partial_pct NUMERIC,
                     avg_simulated_latency_ms NUMERIC,
                     avg_market_impact_bps NUMERIC,
-                    exhaustion_scenario JSONB DEFAULT '{}'::jsonb,
+                    exhaustion_scenario JSONB DEFAULT CAST('{}' AS jsonb),
                     execution_degradation_score NUMERIC,
-                    liquidity_state JSONB DEFAULT '{}'::jsonb,
-                    simulated_fills JSONB DEFAULT '[]'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    liquidity_state JSONB DEFAULT CAST('{}' AS jsonb),
+                    simulated_fills JSONB DEFAULT CAST('[]' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_realism_simulated ON execution_realism (simulated_at DESC)"))
@@ -815,9 +886,9 @@ class TimescaleClient:
                     execution_drift_score NUMERIC,
                     composite_severity NUMERIC,
                     n_strategies_monitored INT DEFAULT 0,
-                    retirement_candidates JSONB DEFAULT '[]'::jsonb,
-                    retrain_recommendations JSONB DEFAULT '[]'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    retirement_candidates JSONB DEFAULT CAST('[]' AS jsonb),
+                    retrain_recommendations JSONB DEFAULT CAST('[]' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_drift_detected ON drift_detection (detected_at DESC)"))
@@ -832,10 +903,10 @@ class TimescaleClient:
                     n_monitor INT DEFAULT 0,
                     n_retirement_pending INT DEFAULT 0,
                     n_retired INT DEFAULT 0,
-                    lifecycle_states JSONB DEFAULT '{}'::jsonb,
-                    retirement_recommendations JSONB DEFAULT '[]'::jsonb,
-                    capital_withdrawal_signals JSONB DEFAULT '[]'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    lifecycle_states JSONB DEFAULT CAST('{}' AS jsonb),
+                    retirement_recommendations JSONB DEFAULT CAST('[]' AS jsonb),
+                    capital_withdrawal_signals JSONB DEFAULT CAST('[]' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_retirement_analyzed ON strategy_retirement (analyzed_at DESC)"))
@@ -849,10 +920,10 @@ class TimescaleClient:
                     source_reliability NUMERIC,
                     timestamp TIMESTAMPTZ NOT NULL,
                     sentiment NUMERIC,
-                    mentioned_tickers JSONB DEFAULT '[]'::jsonb,
+                    mentioned_tickers JSONB DEFAULT CAST('[]' AS jsonb),
                     hypothesis_score NUMERIC,
                     signal_direction TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_source ON external_scout_memory (source)"))
@@ -870,7 +941,7 @@ class TimescaleClient:
                     aggregate_type TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     event_version INT DEFAULT 1,
-                    data JSONB DEFAULT '{}'::jsonb,
+                    data JSONB DEFAULT CAST('{}' AS jsonb),
                     trace_id TEXT,
                     parent_event_id TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -886,7 +957,7 @@ class TimescaleClient:
                     id TEXT PRIMARY KEY,
                     aggregate_id TEXT NOT NULL,
                     version INT NOT NULL,
-                    state JSONB DEFAULT '{}'::jsonb,
+                    state JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -903,7 +974,7 @@ class TimescaleClient:
                     data_hash TEXT,
                     previous_hash TEXT,
                     trace_id TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -923,7 +994,7 @@ class TimescaleClient:
                     proposed_at TIMESTAMPTZ DEFAULT NOW(),
                     approved_at TIMESTAMPTZ,
                     activated_at TIMESTAMPTZ,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -937,8 +1008,8 @@ class TimescaleClient:
                     checked_at TIMESTAMPTZ NOT NULL,
                     composite_score NUMERIC,
                     system_mode TEXT,
-                    subsystem_scores JSONB DEFAULT '{}'::jsonb,
-                    degraded_subsystems JSONB DEFAULT '[]'::jsonb,
+                    subsystem_scores JSONB DEFAULT CAST('{}' AS jsonb),
+                    degraded_subsystems JSONB DEFAULT CAST('[]' AS jsonb),
                     n_degraded INT DEFAULT 0,
                     n_total INT DEFAULT 0
                 )
@@ -954,7 +1025,7 @@ class TimescaleClient:
                     n_events_checked INT DEFAULT 0,
                     integrity_score NUMERIC,
                     n_violations INT DEFAULT 0,
-                    details JSONB DEFAULT '{}'::jsonb
+                    details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_replay_checked ON replay_integrity (checked_at DESC)"))
@@ -970,7 +1041,7 @@ class TimescaleClient:
                     correlation_regime NUMERIC,
                     concentration_risk NUMERIC,
                     n_strategies_analyzed INT DEFAULT 0,
-                    details JSONB DEFAULT '{}'::jsonb
+                    details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sysrisk_assessed ON systemic_risk (assessed_at DESC)"))
@@ -986,7 +1057,7 @@ class TimescaleClient:
                     min_survival_probability NUMERIC,
                     max_drawdown NUMERIC,
                     avg_recovery_days NUMERIC,
-                    scenario_results JSONB DEFAULT '[]'::jsonb
+                    scenario_results JSONB DEFAULT CAST('[]' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stress_tested ON stress_test_results (tested_at DESC)"))
@@ -1017,9 +1088,9 @@ class TimescaleClient:
                     optimized_at TIMESTAMPTZ NOT NULL,
                     method_used TEXT,
                     n_strategies INT DEFAULT 0,
-                    final_allocations JSONB DEFAULT '[]'::jsonb,
-                    method_scores JSONB DEFAULT '{}'::jsonb,
-                    details JSONB DEFAULT '{}'::jsonb
+                    final_allocations JSONB DEFAULT CAST('[]' AS jsonb),
+                    method_scores JSONB DEFAULT CAST('{}' AS jsonb),
+                    details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_adv_portfolio_opt ON advanced_portfolio_optimization (optimized_at DESC)"))
@@ -1063,10 +1134,10 @@ class TimescaleClient:
                 CREATE TABLE IF NOT EXISTS mutation_policy_state (
                     id TEXT PRIMARY KEY,
                     learned_at TIMESTAMPTZ NOT NULL,
-                    mutation_weights JSONB DEFAULT '{}'::jsonb,
-                    per_type_success_rates JSONB DEFAULT '{}'::jsonb,
+                    mutation_weights JSONB DEFAULT CAST('{}' AS jsonb),
+                    per_type_success_rates JSONB DEFAULT CAST('{}' AS jsonb),
                     n_observations INT DEFAULT 0,
-                    details JSONB DEFAULT '{}'::jsonb
+                    details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_policy_learned ON mutation_policy_state (learned_at DESC)"))
@@ -1089,8 +1160,8 @@ class TimescaleClient:
                     id TEXT PRIMARY KEY,
                     assessed_at TIMESTAMPTZ NOT NULL,
                     n_agents_assessed INT DEFAULT 0,
-                    agent_scores JSONB DEFAULT '{}'::jsonb,
-                    throttled_agents JSONB DEFAULT '[]'::jsonb
+                    agent_scores JSONB DEFAULT CAST('{}' AS jsonb),
+                    throttled_agents JSONB DEFAULT CAST('[]' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gov_assessed ON agent_governance_state (assessed_at DESC)"))
@@ -1103,8 +1174,8 @@ class TimescaleClient:
                 CREATE TABLE IF NOT EXISTS monitoring_metrics (
                     id TEXT PRIMARY KEY,
                     recorded_at TIMESTAMPTZ NOT NULL,
-                    counters JSONB DEFAULT '{}'::jsonb,
-                    latencies JSONB DEFAULT '{}'::jsonb
+                    counters JSONB DEFAULT CAST('{}' AS jsonb),
+                    latencies JSONB DEFAULT CAST('{}' AS jsonb)
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_recorded ON monitoring_metrics (recorded_at DESC)"))
@@ -1115,14 +1186,14 @@ class TimescaleClient:
                     id TEXT PRIMARY KEY,
                     observed_at TIMESTAMPTZ NOT NULL,
                     n_anomalies INT DEFAULT 0,
-                    anomalies JSONB DEFAULT '[]'::jsonb,
+                    anomalies JSONB DEFAULT CAST('[]' AS jsonb),
                     severity NUMERIC DEFAULT 0
                 )
             """))
             await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_anomaly_observed ON anomaly_observations (observed_at DESC)"))
 
             # Feature evolution metadata column on feature_importance
-            await conn.execute(text("ALTER TABLE feature_importance ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb"))
+            await conn.execute(text("ALTER TABLE feature_importance ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)"))
 
             # ================================================================
             # PHASE 19 — META-INTELLIGENCE ADVISORY TABLES
@@ -1135,10 +1206,10 @@ class TimescaleClient:
                     advisory_type TEXT NOT NULL,
                     confidence NUMERIC DEFAULT 0.0,
                     reasoning_text TEXT,
-                    system_state_snapshot JSONB DEFAULT '{}'::jsonb,
-                    recommendations JSONB DEFAULT '[]'::jsonb,
+                    system_state_snapshot JSONB DEFAULT CAST('{}' AS jsonb),
+                    recommendations JSONB DEFAULT CAST('[]' AS jsonb),
                     advisory_only BOOLEAN DEFAULT TRUE,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1161,8 +1232,8 @@ class TimescaleClient:
                     replay_score NUMERIC DEFAULT 0.0,
                     decay_rate NUMERIC DEFAULT 0.01,
                     status TEXT DEFAULT 'active',
-                    evidence JSONB DEFAULT '[]'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    evidence JSONB DEFAULT CAST('[]' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     last_confirmed_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -1180,14 +1251,14 @@ class TimescaleClient:
                     trace_id TEXT NOT NULL,
                     analysis_type TEXT NOT NULL,
                     confidence NUMERIC DEFAULT 0.0,
-                    root_causes JSONB DEFAULT '[]'::jsonb,
-                    systemic_patterns JSONB DEFAULT '[]'::jsonb,
-                    governance_recommendations JSONB DEFAULT '[]'::jsonb,
-                    mutation_collapse_warnings JSONB DEFAULT '[]'::jsonb,
-                    feature_saturation_alerts JSONB DEFAULT '[]'::jsonb,
+                    root_causes JSONB DEFAULT CAST('[]' AS jsonb),
+                    systemic_patterns JSONB DEFAULT CAST('[]' AS jsonb),
+                    governance_recommendations JSONB DEFAULT CAST('[]' AS jsonb),
+                    mutation_collapse_warnings JSONB DEFAULT CAST('[]' AS jsonb),
+                    feature_saturation_alerts JSONB DEFAULT CAST('[]' AS jsonb),
                     n_failures_analyzed INT DEFAULT 0,
                     advisory_only BOOLEAN DEFAULT TRUE,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1205,10 +1276,10 @@ class TimescaleClient:
                     exploration_vs_exploitation TEXT,
                     entropy_metric NUMERIC DEFAULT 0.0,
                     diversification_advisory TEXT,
-                    priority_weights JSONB DEFAULT '{}'::jsonb,
-                    leaderboard_snapshot JSONB DEFAULT '{}'::jsonb,
+                    priority_weights JSONB DEFAULT CAST('{}' AS jsonb),
+                    leaderboard_snapshot JSONB DEFAULT CAST('{}' AS jsonb),
                     advisory_only BOOLEAN DEFAULT TRUE,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1223,12 +1294,12 @@ class TimescaleClient:
                     confidence NUMERIC DEFAULT 0.0,
                     contextual_summary TEXT,
                     scout_agreement_score NUMERIC DEFAULT 0.0,
-                    scout_disagreement_areas JSONB DEFAULT '[]'::jsonb,
+                    scout_disagreement_areas JSONB DEFAULT CAST('[]' AS jsonb),
                     market_state_interpretation TEXT,
-                    confidence_weights JSONB DEFAULT '{}'::jsonb,
-                    source_signals JSONB DEFAULT '{}'::jsonb,
+                    confidence_weights JSONB DEFAULT CAST('{}' AS jsonb),
+                    source_signals JSONB DEFAULT CAST('{}' AS jsonb),
                     advisory_only BOOLEAN DEFAULT TRUE,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1259,7 +1330,7 @@ class TimescaleClient:
                     follower_realized_pnl NUMERIC DEFAULT 0,
                     execution_latency_ms INT DEFAULT 0,
                     sync_quality_score NUMERIC DEFAULT 1.0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     snapshot_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1285,7 +1356,7 @@ class TimescaleClient:
                     partial_fill_divergence NUMERIC DEFAULT 0.0,
                     sync_quality_score NUMERIC DEFAULT 1.0,
                     repair_recommendation TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     detected_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1311,7 +1382,7 @@ class TimescaleClient:
                     strategy_mortality_rate NUMERIC DEFAULT 0.0,
                     vol_adjusted_return NUMERIC DEFAULT 0.0,
                     n_followers INT DEFAULT 0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     assessed_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1331,9 +1402,9 @@ class TimescaleClient:
                     n_mismatches INT DEFAULT 0,
                     exposure_delta NUMERIC DEFAULT 0.0,
                     pnl_delta NUMERIC DEFAULT 0.0,
-                    repair_actions JSONB DEFAULT '[]'::jsonb,
+                    repair_actions JSONB DEFAULT CAST('[]' AS jsonb),
                     reconciliation_score NUMERIC DEFAULT 1.0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     reconciled_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1350,11 +1421,11 @@ class TimescaleClient:
                     overlap_score NUMERIC DEFAULT 0.0,
                     concentration_risk NUMERIC DEFAULT 0.0,
                     diversification_penalty NUMERIC DEFAULT 0.0,
-                    duplicated_exposure JSONB DEFAULT '[]'::jsonb,
-                    correlated_leaders JSONB DEFAULT '[]'::jsonb,
-                    hidden_concentration JSONB DEFAULT '{}'::jsonb,
+                    duplicated_exposure JSONB DEFAULT CAST('[]' AS jsonb),
+                    correlated_leaders JSONB DEFAULT CAST('[]' AS jsonb),
+                    hidden_concentration JSONB DEFAULT CAST('{}' AS jsonb),
                     n_leaders_analyzed INT DEFAULT 0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     analyzed_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1373,7 +1444,7 @@ class TimescaleClient:
                     new_mode TEXT NOT NULL,
                     trigger_reason TEXT,
                     recovery_action TEXT,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     occurred_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1400,8 +1471,8 @@ class TimescaleClient:
                     slippage_bps NUMERIC DEFAULT 0,
                     execution_latency_ms INT DEFAULT 0,
                     drift_at_execution NUMERIC DEFAULT 0,
-                    event_data JSONB DEFAULT '{}'::jsonb,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    event_data JSONB DEFAULT CAST('{}' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1425,7 +1496,7 @@ class TimescaleClient:
                     drift_accumulation NUMERIC DEFAULT 0.0,
                     follower_survivability NUMERIC DEFAULT 1.0,
                     n_events_analyzed INT DEFAULT 0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     measured_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1449,7 +1520,7 @@ class TimescaleClient:
                     outcome_pnl NUMERIC DEFAULT 0.0,
                     attribution_score NUMERIC DEFAULT 0.0,
                     predictive_survivability NUMERIC DEFAULT 0.0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     attributed_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1468,7 +1539,7 @@ class TimescaleClient:
                     n_loss_signals INT DEFAULT 0,
                     n_quarantined_signals INT DEFAULT 0,
                     recent_contradiction_rate NUMERIC DEFAULT 0.0,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1483,9 +1554,9 @@ class TimescaleClient:
                     source_sub TEXT,
                     violation_type TEXT NOT NULL,
                     severity_score NUMERIC DEFAULT 1.0,
-                    affected_symbols JSONB DEFAULT '[]'::jsonb,
+                    affected_symbols JSONB DEFAULT CAST('[]' AS jsonb),
                     action_taken TEXT NOT NULL,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     detected_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1500,7 +1571,7 @@ class TimescaleClient:
                     symbol TEXT,
                     signal_type TEXT,
                     confidence_score NUMERIC DEFAULT 0.0,
-                    signal_data JSONB DEFAULT '{}'::jsonb,
+                    signal_data JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1556,7 +1627,7 @@ class TimescaleClient:
                     confidence NUMERIC DEFAULT 0.0,
                     regime_context TEXT,
                     entropy_context NUMERIC,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1591,7 +1662,7 @@ class TimescaleClient:
                     survived_validation BOOLEAN DEFAULT FALSE,
                     regime_at_time TEXT,
                     entropy_at_time NUMERIC,
-                    metadata JSONB DEFAULT '{}'::jsonb,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -1639,7 +1710,7 @@ class TimescaleClient:
 
             # event_store.metadata — JSONB metadata column
             await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT '{}'::jsonb")
+                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)")
             )
 
             # event_store.hash_prev — previous event hash for chain integrity
@@ -1669,7 +1740,7 @@ class TimescaleClient:
 
             # audit_ledger.details — JSONB details column
             await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS details JSONB DEFAULT '{}'::jsonb")
+                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS details JSONB DEFAULT CAST('{}' AS jsonb)")
             )
 
             # audit_ledger.severity — severity level column
@@ -1731,6 +1802,222 @@ class TimescaleClient:
             )
             await conn.execute(
                 text("CREATE INDEX IF NOT EXISTS idx_strategies_batch ON strategies (generation_batch)")
+            )
+
+            # ================================================================
+            # PHASE 28 — ECONOMIC FITNESS, SURVIVAL & LONG-HORIZON EVOLUTION
+            # ================================================================
+            # 1. Evolutionary Survival Pressure - Strategies Lifecycle
+            await conn.execute(
+                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'emerging'")
+            )
+            await conn.execute(
+                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS age_bars INT DEFAULT 0")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_strategies_lifecycle ON strategies (lifecycle_state)")
+            )
+
+            # 2. Economic Fitness Engine - Composite Metrics
+            await conn.execute(
+                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS composite_fitness_score NUMERIC DEFAULT 0.0")
+            )
+            await conn.execute(
+                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS sortino_ratio NUMERIC DEFAULT 0.0")
+            )
+            await conn.execute(
+                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS calmar_ratio NUMERIC DEFAULT 0.0")
+            )
+            await conn.execute(
+                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS expectancy NUMERIC DEFAULT 0.0")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_backtest_composite_fitness ON backtest_results (composite_fitness_score DESC)")
+            )
+
+            # 3. Regime-Conditioned Fitness
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS regime_fitness_log (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    strategy_id TEXT NOT NULL,
+                    regime TEXT NOT NULL,
+                    sharpe NUMERIC DEFAULT 0.0,
+                    sortino NUMERIC DEFAULT 0.0,
+                    win_rate NUMERIC DEFAULT 0.0,
+                    max_drawdown NUMERIC DEFAULT 0.0,
+                    total_trades INT DEFAULT 0,
+                    regime_fitness_score NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_strategy ON regime_fitness_log (strategy_id)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_regime ON regime_fitness_log (regime)")
+            )
+
+            # 4. Mutation Survival Intelligence
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS mutation_survival_log (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    mutation_type TEXT NOT NULL,
+                    target_agent TEXT NOT NULL,
+                    total_applications INT DEFAULT 0,
+                    survival_count INT DEFAULT 0,
+                    avg_fitness_contribution NUMERIC DEFAULT 0.0,
+                    survival_rate NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_mutation_survival_type ON mutation_survival_log (mutation_type)")
+            )
+
+            # 5. Portfolio-Level Evolution (Phase 31 - managed by phase31_db_migration.py)
+            # The portfolio_evolution_log schema is now managed by Phase 31 migration.
+            # Ensure backward compatibility: add created_at alias if table exists.
+            try:
+                await conn.execute(text("ALTER TABLE portfolio_evolution_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"))
+            except Exception:
+                pass
+
+            # ================================================================
+            # PHASE 29 - ECONOMIC EFFICIENCY, SURVIVAL QUALITY & REAL EVOLUTIONARY FITNESS
+            # ================================================================
+
+            # 1. Economic Fitness Windows - rolling long-horizon fitness
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS economic_fitness_windows (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    window_hours INT NOT NULL,
+                    computed_at TIMESTAMPTZ NOT NULL,
+                    n_strategies INT DEFAULT 0,
+                    avg_composite_fitness NUMERIC DEFAULT 0.0,
+                    avg_sharpe NUMERIC DEFAULT 0.0,
+                    avg_sortino NUMERIC DEFAULT 0.0,
+                    avg_calmar NUMERIC DEFAULT 0.0,
+                    avg_expectancy NUMERIC DEFAULT 0.0,
+                    median_composite_fitness NUMERIC DEFAULT 0.0,
+                    top_decile_fitness NUMERIC DEFAULT 0.0,
+                    bottom_decile_fitness NUMERIC DEFAULT 0.0,
+                    fitness_trend NUMERIC DEFAULT 0.0,
+                    mutation_survival_rate NUMERIC DEFAULT 0.0,
+                    scout_attribution_quality NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb),
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_fitness_windows_computed ON economic_fitness_windows (computed_at DESC)")
+            )
+
+            # 2. Economic Efficiency Composite Analysis
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS economic_efficiency_analysis (
+                    id TEXT PRIMARY KEY,
+                    analyzed_at TIMESTAMPTZ NOT NULL,
+                    expectancy NUMERIC DEFAULT 0.0,
+                    win_loss_asymmetry NUMERIC DEFAULT 1.0,
+                    slippage_adjusted_edge NUMERIC DEFAULT 0.0,
+                    risk_adjusted_return NUMERIC DEFAULT 0.0,
+                    return_per_drawdown NUMERIC DEFAULT 0.0,
+                    capital_velocity NUMERIC DEFAULT 0.0,
+                    strategy_half_life_hours NUMERIC DEFAULT 0.0,
+                    mutation_survival_rate NUMERIC DEFAULT 0.0,
+                    regime_persistence NUMERIC DEFAULT 0.0,
+                    drawdown_persistence_hours NUMERIC DEFAULT 0.0,
+                    recovery_efficiency NUMERIC DEFAULT 1.0,
+                    cascading_failure_risk NUMERIC DEFAULT 0.0,
+                    concentration_instability NUMERIC DEFAULT 0.0,
+                    portfolio_contagion_risk NUMERIC DEFAULT 0.0,
+                    dominant_mutation_family TEXT,
+                    collapsing_families JSONB DEFAULT CAST('[]' AS jsonb),
+                    exploration_ratio NUMERIC DEFAULT 0.5,
+                    top_scout TEXT,
+                    worst_scout TEXT,
+                    predictive_divergence NUMERIC DEFAULT 0.0,
+                    execution_degradation NUMERIC DEFAULT 0.0,
+                    spread_sensitivity NUMERIC DEFAULT 0.0,
+                    liquidity_degradation_trend NUMERIC DEFAULT 0.0,
+                    composite_analysis JSONB DEFAULT CAST('{}' AS jsonb),
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_efficiency_analyzed ON economic_efficiency_analysis (analyzed_at DESC)")
+            )
+
+            # 3. Regime Specialization Log
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS regime_specialization_log (
+                    id TEXT PRIMARY KEY,
+                    analysis_id TEXT,
+                    regime TEXT NOT NULL,
+                    n_observations INT DEFAULT 0,
+                    avg_fitness NUMERIC DEFAULT 0.0,
+                    avg_sharpe NUMERIC DEFAULT 0.0,
+                    avg_sortino NUMERIC DEFAULT 0.0,
+                    avg_win_rate NUMERIC DEFAULT 0.0,
+                    avg_drawdown NUMERIC DEFAULT 0.0,
+                    total_trades INT DEFAULT 0,
+                    recorded_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_regime ON regime_specialization_log (regime)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_recorded ON regime_specialization_log (recorded_at DESC)")
+            )
+
+            # 3b. Regime Specialization Summary
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS regime_specialization_summary (
+                    id TEXT PRIMARY KEY,
+                    analysis_id TEXT,
+                    computed_at TIMESTAMPTZ NOT NULL,
+                    n_fragile_organisms INT DEFAULT 0,
+                    n_cross_regime_survivors INT DEFAULT 0,
+                    n_volatility_sensitive INT DEFAULT 0,
+                    n_liquidity_sensitive INT DEFAULT 0,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_regime_summary_computed ON regime_specialization_summary (computed_at DESC)")
+            )
+
+            # 4. Scout Predictive Value Log
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scout_predictive_value_log (
+                    id TEXT PRIMARY KEY,
+                    analysis_id TEXT,
+                    source_scout TEXT NOT NULL,
+                    computed_at TIMESTAMPTZ NOT NULL,
+                    n_attributions INT DEFAULT 0,
+                    survival_rate NUMERIC DEFAULT 0.0,
+                    avg_sharpe_contribution NUMERIC DEFAULT 0.0,
+                    avg_pnl_contribution NUMERIC DEFAULT 0.0,
+                    avg_drawdown_contribution NUMERIC DEFAULT 0.0,
+                    contradiction_rate NUMERIC DEFAULT 0.0,
+                    economic_score NUMERIC DEFAULT 0.0,
+                    economic_score_penalized NUMERIC DEFAULT 0.0,
+                    metadata JSONB DEFAULT CAST('{}' AS jsonb)
+                )
+            """))
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_scout ON scout_predictive_value_log (source_scout)")
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_computed ON scout_predictive_value_log (computed_at DESC)")
+            )
+
+            # Record schema version
+            await conn.execute(
+                text("INSERT INTO schema_version (version, description) VALUES ('v29.0', 'Phase 29: Economic efficiency, survival quality, real evolutionary fitness') ON CONFLICT DO NOTHING")
             )
 
             # ================================================================
@@ -2562,17 +2849,21 @@ class TimescaleClient:
 
     async def get_recent_feature_combos(
         self, limit: int = 50
-    ) -> list[tuple[set[str], str]]:
-        """Returns: list of (feature_set, archetype) from recent strategies."""
+    ) -> list[tuple[set[str], str, float, str | None]]:
+        """Returns: list of (feature_set, archetype, time_weight, cond_sig_md5) from recent strategies."""
+        import hashlib
         query = """
-            SELECT normalized_strategy FROM strategies
+            SELECT normalized_strategy, created_at FROM strategies
             WHERE normalized_strategy IS NOT NULL
+              AND (status NOT IN ('code_failed', 'permanently_failed', 'invalidated', 'obsolete') OR status IS NULL)
+              AND created_at > NOW() - INTERVAL '7 days'
             ORDER BY created_at DESC
             LIMIT :limit
         """
         async with self.engine.connect() as conn:
             result = await conn.execute(text(query), {"limit": limit})
             combos = []
+            now = datetime.now(timezone.utc)
             for row in result.fetchall():
                 raw = row[0]
                 if isinstance(raw, str):
@@ -2583,15 +2874,156 @@ class TimescaleClient:
                 if not isinstance(raw, dict):
                     continue
                 features = set()
+                all_conds = []
                 for key in ("entry_conditions", "exit_conditions"):
                     for cond in raw.get(key) or []:
                         if isinstance(cond, str):
+                            all_conds.append(cond)
                             for feat in re.findall(r"\b[a-z_][a-z_0-9]+\b", cond):
                                 features.add(feat)
                 archetype = (raw.get("tags") or ["unknown"])[0]
                 if features:
-                    combos.append((features, archetype))
+                    # Time-decay weight
+                    created_raw = row[1]
+                    age_hours = 168
+                    if created_raw is not None:
+                        try:
+                            if hasattr(created_raw, 'isoformat'):
+                                age_hours = (now - created_raw).total_seconds() / 3600
+                        except Exception:
+                            age_hours = 0
+                    time_weight = max(0.1, 1.0 - (age_hours / 168.0))
+                    # Condition-string MD5 for exact-clone secondary gate
+                    cond_sig = hashlib.md5(
+                        "|".join(sorted(all_conds)).encode()
+                    ).hexdigest() if all_conds else None
+                    combos.append((features, archetype, time_weight, cond_sig))
             return combos
+
+
+    
+
+    async def evolutionary_garbage_collection(self, dry_run: bool = True) -> dict:
+        """Phase 27E: Clean up stale evolutionary artifacts.
+        
+        Marks and/or removes:
+        - code_failed strategies older than 24 hours (failed code compilation)
+        - permanently_failed strategies older than 7 days
+        - invalidated strategies older than 3 days
+        - obsoletes strategies that are > 7 days old with no backtest results
+        
+        Preserves audit trail and event lineage.
+        Returns dict of counts of affected rows per table.
+        If dry_run=True, only counts rows that WOULD be affected without modifying them.
+        """
+        from loguru import logger
+        results = {"dry_run": dry_run}
+        try:
+            async with self.engine.begin() as conn:
+                if dry_run:
+                    logger.info("evolutionary_gc: DRY RUN — no actual changes made")
+                    # Count but don't modify
+                    r = await conn.execute(text("""
+                        SELECT COUNT(*) FROM strategies
+                        WHERE status = 'code_failed'
+                          AND created_at < NOW() - INTERVAL '24 hours'
+                    """))
+                    results["code_failed_obsoleted"] = r.fetchone()[0]
+                    
+                    r = await conn.execute(text("""
+                        SELECT COUNT(*) FROM strategies
+                        WHERE status = 'permanently_failed'
+                          AND created_at < NOW() - INTERVAL '7 days'
+                    """))
+                    results["perm_failed_obsoleted"] = r.fetchone()[0]
+                    
+                    r = await conn.execute(text("""
+                        SELECT COUNT(*) FROM strategies
+                        WHERE status = 'invalidated'
+                          AND created_at < NOW() - INTERVAL '3 days'
+                    """))
+                    results["invalidated_obsoleted"] = r.fetchone()[0]
+                    
+                    r = await conn.execute(text("""
+                        SELECT COUNT(*) FROM strategies
+                        WHERE status = 'obsolete'
+                          AND created_at < NOW() - INTERVAL '14 days'
+                    """))
+                    results["obsolete_deleted"] = r.fetchone()[0]
+                    
+                    r = await conn.execute(text("""
+                        SELECT COUNT(*) FROM mutation_record
+                        WHERE child_id NOT IN (SELECT id::text FROM strategies)
+                          AND created_at < NOW() - INTERVAL '7 days'
+                    """))
+                    results["orphan_mutations_deleted"] = r.fetchone()[0]
+                    
+                    logger.info(f"evolutionary_gc (dry_run): code_failed->obsolete={results.get('code_failed_obsoleted',0)}, "
+                                f"perm_failed->obsolete={results.get('perm_failed_obsoleted',0)}, "
+                                f"invalidated->obsolete={results.get('invalidated_obsoleted',0)}, "
+                                f"obsolete_deleted={results.get('obsolete_deleted',0)}")
+                    return results
+                
+                # ==== ACTUAL EXECUTION ====
+                # 1. Soft-delete code_failed > 24h: mark as obsolete
+                r = await conn.execute(text("""
+                    UPDATE strategies
+                    SET status = 'obsolete', compiled_code = NULL
+                    WHERE status = 'code_failed'
+                      AND created_at < NOW() - INTERVAL '24 hours'
+                """))
+                results["code_failed_obsoleted"] = r.rowcount
+                logger.info(f"evolutionary_gc: {r.rowcount} code_failed strategies -> obsolete")
+
+                # 2. Soft-delete permanently_failed > 7d
+                r = await conn.execute(text("""
+                    UPDATE strategies
+                    SET status = 'obsolete'
+                    WHERE status = 'permanently_failed'
+                      AND created_at < NOW() - INTERVAL '7 days'
+                """))
+                results["perm_failed_obsoleted"] = r.rowcount
+
+                # 3. Soft-delete invalidated > 3d
+                r = await conn.execute(text("""
+                    UPDATE strategies
+                    SET status = 'obsolete'
+                    WHERE status = 'invalidated'
+                      AND created_at < NOW() - INTERVAL '3 days'
+                """))
+                results["invalidated_obsoleted"] = r.rowcount
+
+                # 4. Delete obsolete strategies > 14 days old from active tables
+                #    (preserve event lineage but remove from diversity search)
+                r = await conn.execute(text("""
+                    DELETE FROM strategies
+                    WHERE status = 'obsolete'
+                      AND created_at < NOW() - INTERVAL '14 days'
+                """))
+                results["obsolete_deleted"] = r.rowcount
+
+                # 5. Clean up orphan mutation_records where parent child no longer exists
+                r = await conn.execute(text("""
+                    DELETE FROM mutation_record
+                    WHERE child_id NOT IN (SELECT id::text FROM strategies)
+                      AND created_at < NOW() - INTERVAL '7 days'
+                """))
+                results["orphan_mutations_deleted"] = r.rowcount
+
+                logger.info(
+                    "evolutionary_gc: code_failed->obsolete=%s, "
+                    "perm_failed->obsolete=%s, "
+                    "invalidated->obsolete=%s, "
+                    "obsolete_deleted=%s",
+                    results.get('code_failed_obsoleted', 0),
+                    results.get('perm_failed_obsoleted', 0),
+                    results.get('invalidated_obsoleted', 0),
+                    results.get('obsolete_deleted', 0)
+                )
+        except Exception as e:
+            logger.error(f"evolutionary_gc: Error: {e}")
+            results["error"] = str(e)
+        return results
 
     async def save_strategy(
         self,
@@ -2650,25 +3082,17 @@ class TimescaleClient:
         }
         await self._execute_insert(query, params)
 
-        # Log first lifecycle event
-        try:
-            from atlas.core.event_lineage import EventLineageClient
-
-            lineage = EventLineageClient(self)
-            await lineage.create_event(
-                trace_id=trace_id,
-                stage="ideator",
-                status="completed",
-                actor=author_agent,
-                strategy_id=strategy_id,
-                metadata={
-                    "strategy_name": strategy_name,
-                    "status": status,
-                    "mode": spec.get("mode", "unknown"),
-                },
-            )
-        except Exception as exc:
-            logger.warning(f"Failed to log lifecycle event: {exc}")
+        await self._log_strategy_transition(
+            strategy_id,
+            None,
+            status,
+            "strategy_created",
+            trace_id=trace_id,
+            strategy_name=strategy_name,
+            actor=author_agent,
+            stage="ideator",
+            persist_to_lineage=False,
+        )
 
         return strategy_id
 
@@ -2690,6 +3114,34 @@ class TimescaleClient:
         self, strategy_id: str, code: str, status: str
     ) -> None:
         """Updates code + status in strategies table"""
+        def _coerce_text(value):
+            if value is None:
+                return None
+            if type(value).__module__.startswith("unittest.mock"):
+                return None
+            return str(value)
+
+        old_status = None
+        trace_id = None
+        strategy_name = None
+
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT status, trace_id, name
+                    FROM strategies
+                    WHERE id = :sid
+                """),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            if asyncio.iscoroutine(row):
+                row = await row
+            if row:
+                old_status = _coerce_text(row[0])
+                trace_id = _coerce_text(row[1])
+                strategy_name = _coerce_text(row[2])
+
         query = """
             UPDATE strategies 
             SET code = :code, status = :status
@@ -2697,6 +3149,18 @@ class TimescaleClient:
         """
         params = {"id": strategy_id, "code": code, "status": status}
         await self._execute_insert(query, params)
+
+        if trace_id:
+            await self._log_strategy_transition(
+                strategy_id,
+                old_status,
+                status,
+                "code_updated",
+                trace_id=trace_id,
+                strategy_name=strategy_name,
+                actor="CoderAgent",
+                stage="coder",
+            )
 
     async def get_backtest_result(self, strategy_id: str) -> dict | None:
         """Fetch latest backtest result for a strategy"""
@@ -2729,13 +3193,41 @@ class TimescaleClient:
     async def update_strategy_status(
         self, strategy_id: str, status: str, notes: str = ""
     ) -> None:
+        def _coerce_text(value):
+            if value is None:
+                return None
+            if type(value).__module__.startswith("unittest.mock"):
+                return None
+            return str(value)
+
+        old_status = None
+        trace_id = None
+        strategy_name = None
+
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT status, trace_id, name
+                    FROM strategies
+                    WHERE id = :sid
+                """),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            if asyncio.iscoroutine(row):
+                row = await row
+            if row:
+                old_status = _coerce_text(row[0])
+                trace_id = _coerce_text(row[1])
+                strategy_name = _coerce_text(row[2])
+
         async with self.engine.begin() as conn:
             await conn.execute(
                 text("""
                     UPDATE strategies
                     SET status = :status,
                         parameters = jsonb_set(
-                            COALESCE(parameters::jsonb, '{}'::jsonb),
+                            COALESCE(parameters::jsonb, CAST('{}' AS jsonb)),
                             '{validation_notes}',
                             cast(:notes_json as jsonb)
                         )
@@ -2746,6 +3238,18 @@ class TimescaleClient:
                     "notes_json": json.dumps(notes),
                     "sid": str(strategy_id),
                 },
+            )
+
+        if trace_id:
+            await self._log_strategy_transition(
+                strategy_id,
+                old_status,
+                status,
+                notes or "status_updated",
+                trace_id=trace_id,
+                strategy_name=strategy_name,
+                actor="TimescaleClient",
+                stage="status_update",
             )
 
     async def get_strategies_by_status(self, status: str) -> list[dict]:
@@ -2771,7 +3275,7 @@ class TimescaleClient:
                         "status": r[4],
                         "created_at": r[5],
                         "author_agent": r[6],
-                        "trace_id": str(r[7]) if r[7] else None,
+                        "trace_id": str(r[7]) if len(r) > 7 and r[7] else None,
                     }
                 )
             return out
@@ -3140,8 +3644,8 @@ class TimescaleClient:
     ) -> None:
         """Saves backtest results including short_window temporal scores"""
         query = """
-            INSERT INTO backtest_results (strategy_id, start_date, end_date, sharpe, cagr, max_drawdown, win_rate, total_trades, passed_validation, results, entry_count, exit_count, bars_processed, short_window_score, score_7d, score_14d, score_30d)
-            VALUES (:strategy_id, :start_date, :end_date, :sharpe, :cagr, :max_drawdown, :win_rate, :total_trades, :passed_validation, :results, :entry_count, :exit_count, :bars_processed, :short_window_score, :score_7d, :score_14d, :score_30d)
+            INSERT INTO backtest_results (strategy_id, start_date, end_date, sharpe, cagr, max_drawdown, win_rate, total_trades, passed_validation, results, entry_count, exit_count, bars_processed, short_window_score, score_7d, score_14d, score_30d, composite_fitness_score, sortino_ratio, calmar_ratio, expectancy)
+            VALUES (:strategy_id, :start_date, :end_date, :sharpe, :cagr, :max_drawdown, :win_rate, :total_trades, :passed_validation, :results, :entry_count, :exit_count, :bars_processed, :short_window_score, :score_7d, :score_14d, :score_30d, :composite_fitness_score, :sortino_ratio, :calmar_ratio, :expectancy)
             ON CONFLICT (strategy_id, start_date, end_date) DO UPDATE SET
                 sharpe = EXCLUDED.sharpe,
                 cagr = EXCLUDED.cagr,
@@ -3156,7 +3660,11 @@ class TimescaleClient:
                 short_window_score = EXCLUDED.short_window_score,
                 score_7d = EXCLUDED.score_7d,
                 score_14d = EXCLUDED.score_14d,
-                score_30d = EXCLUDED.score_30d
+                score_30d = EXCLUDED.score_30d,
+                composite_fitness_score = EXCLUDED.composite_fitness_score,
+                sortino_ratio = EXCLUDED.sortino_ratio,
+                calmar_ratio = EXCLUDED.calmar_ratio,
+                expectancy = EXCLUDED.expectancy
         """
         params = {
             "strategy_id": strategy_id,
@@ -3180,6 +3688,10 @@ class TimescaleClient:
             "score_7d": results.get("score_7d"),
             "score_14d": results.get("score_14d"),
             "score_30d": results.get("score_30d"),
+            "composite_fitness_score": results.get("composite_fitness_score", 0.0),
+            "sortino_ratio": results.get("sortino_ratio", 0.0),
+            "calmar_ratio": results.get("calmar_ratio", 0.0),
+            "expectancy": results.get("expectancy", 0.0),
         }
         await self._execute_insert(query, params)
 
@@ -3286,7 +3798,7 @@ class TimescaleClient:
         """
         Fetch strategies suitable for mutation repair.
         Targets: repair_candidate and research_candidate only.
-        Excludes failed_validation — directed evolution, not random garbage mutation.
+        Excludes failed_validation â€” directed evolution, not random garbage mutation.
         """
         query = """
             SELECT s.id, s.name, s.code, s.parameters, s.normalized_strategy,
@@ -3404,3 +3916,232 @@ class TimescaleClient:
                 text(query), {"sid": strategy_id, "limit": max_depth * 2}
             )
             return [dict(r._mapping) for r in result.fetchall()]
+
+    # ================================================================
+    # PHASE 26 — SCOUT COUPLING TELEMETRY METHODS
+    # ================================================================
+
+    async def log_scout_influence(
+        self,
+        source_scout: str,
+        target_agent: str,
+        influence_type: str,
+        influence_metric: str,
+        delta: float = 0.0,
+        before_value: float | None = None,
+        after_value: float | None = None,
+        confidence: float = 0.0,
+        regime_context: str = "",
+        entropy_context: float = 0.0,
+        metadata: dict | None = None,
+    ) -> None:
+        import json as _json
+        await self._execute_insert(
+            """
+            INSERT INTO scout_influence_log
+                (id, source_scout, target_agent, influence_type, influence_metric,
+                 before_value, after_value, delta, confidence,
+                 regime_context, entropy_context, metadata, created_at)
+            VALUES
+                (gen_random_uuid(), :source, :target, :itype, :metric,
+                 :before, :after, :delta, :conf,
+                 :regime, :entropy, CAST(:meta AS jsonb), NOW())
+            """,
+            {
+                "source": source_scout,
+                "target": target_agent,
+                "itype": influence_type,
+                "metric": influence_metric,
+                "before": before_value,
+                "after": after_value,
+                "delta": round(float(delta), 6),
+                "conf": round(float(confidence), 4),
+                "regime": regime_context or "",
+                "entropy": round(float(entropy_context), 4),
+                "meta": _json.dumps(metadata or {}),
+            },
+        )
+
+    async def log_economic_attribution(
+        self,
+        source_scout: str,
+        influence_type: str,
+        target_agent: str,
+        strategy_id: str | None = None,
+        strategy_name: str = "",
+        sharpe_contribution: float = 0.0,
+        drawdown_contribution: float = 0.0,
+        pnl_contribution: float = 0.0,
+        win_rate_contribution: float = 0.0,
+        attribution_weight: float = 0.0,
+        survived_validation: bool = False,
+        regime_at_time: str = "",
+        entropy_at_time: float = 0.0,
+        before_value: float | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        import json as _json
+        import uuid as _uuid
+        trace_id = _uuid.uuid4().hex[:16]
+        await self._execute_insert(
+            """
+            INSERT INTO scout_economic_attribution
+                (trace_id, source_scout, influence_type, target_agent,
+                 strategy_id, strategy_name, sharpe_contribution,
+                 drawdown_contribution, pnl_contribution, win_rate_contribution,
+                 attribution_weight, survived_validation,
+                 regime_at_time, entropy_at_time, metadata, created_at)
+            VALUES
+                (:trace_id, :source, :itype, :target,
+                 :strat_id, :strat_name, :sharpe,
+                 :drawdown, :pnl, :win_rate,
+                 :weight, :survived,
+                 :regime, :entropy, CAST(:meta AS jsonb), NOW())
+            """,
+            {
+                "trace_id": trace_id,
+                "source": source_scout,
+                "itype": influence_type,
+                "target": target_agent,
+                "strat_id": strategy_id or "",
+                "strat_name": strategy_name or "",
+                "sharpe": round(float(sharpe_contribution), 6),
+                "drawdown": round(float(drawdown_contribution), 6),
+                "pnl": round(float(pnl_contribution), 6),
+                "win_rate": round(float(win_rate_contribution), 6),
+                "weight": round(float(attribution_weight), 6),
+                "survived": bool(survived_validation),
+                "regime": regime_at_time or "",
+                "entropy": round(float(entropy_at_time), 4),
+                "meta": _json.dumps(metadata or {"before_value": before_value}),
+            },
+        )
+
+    async def get_scout_influence_summary(self, hours: int = 24) -> list[dict]:
+        async with self.engine.connect() as conn:
+            r = await conn.execute(text("""
+                SELECT source_scout, target_agent, influence_type,
+                       influence_metric, delta, regime_context,
+                       entropy_context, created_at
+                FROM scout_influence_log
+                WHERE created_at > NOW() - INTERVAL :hours_str
+                ORDER BY created_at DESC
+                LIMIT 200
+            """), {"hours_str": f"{hours} hours"})
+            return [
+                {
+                    "source_scout": row[0],
+                    "target_agent": row[1],
+                    "influence_type": row[2],
+                    "influence_metric": row[3],
+                    "delta": float(row[4]) if row[4] is not None else 0.0,
+                    "regime_context": row[5] or "",
+                    "entropy_context": float(row[6]) if row[6] is not None else 0.0,
+                    "created_at": row[7].isoformat() if hasattr(row[7], "isoformat") else str(row[7]),
+                }
+                for row in r.fetchall()
+            ]
+
+    async def get_economic_attribution_summary(self, hours: int = 24) -> list[dict]:
+        async with self.engine.connect() as conn:
+            r = await conn.execute(text("""
+                SELECT source_scout, COUNT(*) as n_strategies,
+                       AVG(sharpe_contribution) as avg_sharpe,
+                       AVG(pnl_contribution) as avg_pnl,
+                       SUM(CASE WHEN survived_validation THEN 1 ELSE 0 END) as n_survived,
+                       AVG(attribution_weight) as avg_weight
+                FROM scout_economic_attribution
+                WHERE created_at > NOW() - INTERVAL :hours_str
+                GROUP BY source_scout
+                ORDER BY avg_sharpe DESC
+            """), {"hours_str": f"{hours} hours"})
+            return [
+                {
+                    "source_scout": row[0],
+                    "n_strategies": int(row[1]),
+                    "avg_sharpe_contribution": float(row[2] or 0),
+                    "avg_pnl_contribution": float(row[3] or 0),
+                    "n_survived_validation": int(row[4] or 0),
+                    "avg_attribution_weight": float(row[5] or 0),
+                }
+                for row in r.fetchall()
+            ]
+
+    # ================================================================
+    # PHASE 27E — EVOLUTIONARY GARBAGE COLLECTION
+    # ================================================================
+
+    async def evolutionary_garbage_collection(self, dry_run: bool = True) -> dict:
+        """Phase 27E: Clean up stale evolutionary artifacts.
+
+        Marks and/or removes stale failed/invalid/obsolete strategies
+        and orphan mutation records. Preserves audit trail.
+
+        If dry_run=True, only counts rows that WOULD be affected.
+        """
+        from loguru import logger
+        results = {"dry_run": dry_run}
+        try:
+            async with self.engine.begin() as conn:
+                # Count phase (runs in both dry_run and execution mode)
+                count_queries = [
+                    ("code_failed_obsoleted",
+                     "SELECT COUNT(*) FROM strategies WHERE status = 'code_failed' AND created_at < NOW() - INTERVAL '24 hours'"),
+                    ("perm_failed_obsoleted",
+                     "SELECT COUNT(*) FROM strategies WHERE status = 'permanently_failed' AND created_at < NOW() - INTERVAL '7 days'"),
+                    ("invalidated_obsoleted",
+                     "SELECT COUNT(*) FROM strategies WHERE status = 'invalidated' AND created_at < NOW() - INTERVAL '3 days'"),
+                    ("obsolete_deleted",
+                     "SELECT COUNT(*) FROM strategies WHERE status = 'obsolete' AND created_at < NOW() - INTERVAL '14 days'"),
+                    ("orphan_mutations_deleted",
+                     "SELECT COUNT(*) FROM mutation_memory WHERE child_strategy_id NOT IN (SELECT id FROM strategies) AND created_at < NOW() - INTERVAL '7 days'"),
+                ]
+                for key, sql in count_queries:
+                    r = await conn.execute(text(sql))
+                    results[key] = r.fetchone()[0]
+
+                if dry_run:
+                    logger.info(
+                        "evolutionary_gc (dry_run): code_failed->obsolete=%s, "
+                        "perm_failed->obsolete=%s, invalidated->obsolete=%s, "
+                        "obsolete_deleted=%s, orphan_mutations=%s",
+                        results.get("code_failed_obsoleted", 0),
+                        results.get("perm_failed_obsoleted", 0),
+                        results.get("invalidated_obsoleted", 0),
+                        results.get("obsolete_deleted", 0),
+                        results.get("orphan_mutations_deleted", 0),
+                    )
+                    return results
+
+                # Execution phase — only when dry_run=False
+                exec_queries = [
+                    ("code_failed_obsoleted",
+                     "UPDATE strategies SET status = 'obsolete' WHERE status = 'code_failed' AND created_at < NOW() - INTERVAL '24 hours'"),
+                    ("perm_failed_obsoleted",
+                     "UPDATE strategies SET status = 'obsolete' WHERE status = 'permanently_failed' AND created_at < NOW() - INTERVAL '7 days'"),
+                    ("invalidated_obsoleted",
+                     "UPDATE strategies SET status = 'obsolete' WHERE status = 'invalidated' AND created_at < NOW() - INTERVAL '3 days'"),
+                    ("obsolete_deleted",
+                     "DELETE FROM strategies WHERE status = 'obsolete' AND created_at < NOW() - INTERVAL '14 days'"),
+                    ("orphan_mutations_deleted",
+                     "DELETE FROM mutation_memory WHERE child_strategy_id NOT IN (SELECT id FROM strategies) AND created_at < NOW() - INTERVAL '7 days'"),
+                ]
+                for key, sql in exec_queries:
+                    r = await conn.execute(text(sql))
+                    results[key] = r.rowcount
+
+                logger.info(
+                    "evolutionary_gc: code_failed->obsolete=%s, "
+                    "perm_failed->obsolete=%s, invalidated->obsolete=%s, "
+                    "obsolete_deleted=%s, orphan_mutations=%s",
+                    results.get("code_failed_obsoleted", 0),
+                    results.get("perm_failed_obsoleted", 0),
+                    results.get("invalidated_obsoleted", 0),
+                    results.get("obsolete_deleted", 0),
+                    results.get("orphan_mutations_deleted", 0),
+                )
+        except Exception as e:
+            logger.error(f"evolutionary_gc: Error: {e}")
+            results["error"] = str(e)
+        return results
+

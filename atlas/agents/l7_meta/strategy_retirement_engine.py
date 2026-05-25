@@ -45,13 +45,14 @@ class StrategyRetirementEngine(BaseAgent):
         self.run_interval = run_interval
 
         # Retirement thresholds
-        self.MIN_SCORE_SURVIVAL = 30.0          # Below this → retirement risk
-        self.DEGRADATION_PERSISTENCE_CYCLES = 3  # Must degrade for 3 cycles
-        self.MAX_DIVERGENCE_PCT = 0.50          # 50% divergence from backtest
+        self.MIN_SCORE_SURVIVAL = 40.0          # Phase 30: Raised from 30 — more retirement pressure
+        self.DEGRADATION_PERSISTENCE_CYCLES = 2  # Phase 30: Reduced from 3 — faster retirement
+        self.MAX_DIVERGENCE_PCT = 0.35          # Phase 30: Reduced from 0.50 — tighter divergence tolerance
         self.OVERFIT_RELAPSE_THRESHOLD = 0.35   # 35% score drop indicates relapse
+        self.DOMINANT_SCORE_THRESHOLD = 75.0    # Phase 30: Raised from 70 — harder to achieve dominant status
 
-        # Retirement lifecycle
-        self.LIFECYCLE_STATES = ["active", "monitor", "retirement_pending", "retired"]
+        # Phase 28B: Evolutionary Survival Pressure Lifecycle
+        self.LIFECYCLE_STATES = ["emerging", "active", "dominant", "degrading", "quarantined", "retired"]
 
         # Per-strategy tracking
         self._degradation_count: dict[str, int] = defaultdict(int)
@@ -134,12 +135,12 @@ class StrategyRetirementEngine(BaseAgent):
                 result = await conn.execute(
                     text("""
                         SELECT DISTINCT ON (s.id)
-                            s.id, s.name, s.status, s.created_at,
-                            b.short_window_score, b.sharpe, b.win_rate,
+                            s.id, s.name, s.status, s.created_at, s.lifecycle_state, s.age_bars,
+                            b.composite_fitness_score, b.sharpe, b.win_rate,
                             b.total_trades, b.max_drawdown, b.created_at as backtest_time
                         FROM strategies s
                         JOIN backtest_results b ON s.id = b.strategy_id
-                        WHERE b.short_window_score IS NOT NULL
+                        WHERE b.composite_fitness_score IS NOT NULL
                         ORDER BY s.id, b.created_at DESC
                         LIMIT 100
                     """)
@@ -149,10 +150,10 @@ class StrategyRetirementEngine(BaseAgent):
                 # Also get historical scores for degradation tracking
                 hist_result = await conn.execute(
                     text("""
-                        SELECT s.id, b.short_window_score, b.created_at
+                        SELECT s.id, b.composite_fitness_score, b.created_at
                         FROM strategies s
                         JOIN backtest_results b ON s.id = b.strategy_id
-                        WHERE b.short_window_score IS NOT NULL
+                        WHERE b.composite_fitness_score IS NOT NULL
                         ORDER BY s.id, b.created_at ASC
                         LIMIT 1000
                     """)
@@ -179,12 +180,14 @@ class StrategyRetirementEngine(BaseAgent):
                     "name": r[1],
                     "status": r[2],
                     "created_at": r[3],
-                    "recent_score": float(r[4]) if r[4] is not None else 0,
-                    "sharpe": float(r[5]) if r[5] is not None else 0,
-                    "win_rate": float(r[6]) if r[6] is not None else 0,
-                    "total_trades": int(r[7]) if r[7] is not None else 0,
-                    "max_drawdown": float(r[8]) if r[8] is not None else 0,
-                    "backtest_time": r[9],
+                    "current_lifecycle": r[4] or "emerging",
+                    "age_bars": r[5] or 0,
+                    "recent_score": float(r[6]) if r[6] is not None else 0,
+                    "sharpe": float(r[7]) if r[7] is not None else 0,
+                    "win_rate": float(r[8]) if r[8] is not None else 0,
+                    "total_trades": int(r[9]) if r[9] is not None else 0,
+                    "max_drawdown": float(r[10]) if r[10] is not None else 0,
+                    "backtest_time": r[11],
                     "peak_score": peak_score,
                     "avg_score": avg_score,
                     "score_history": hist[-10:],  # Last 10 scores
@@ -242,6 +245,12 @@ class StrategyRetirementEngine(BaseAgent):
         # 1. Score-based assessment
         score_degradation = (peak_score - recent_score) / peak_score if peak_score > 0 else 0
 
+        # Phase 28B: Evolutionary Survival Pressure
+        # Age-based decay: Enforce stricter survival thresholds as strategy ages
+        age_bars = strategy.get("age_bars", 0)
+        age_penalty = min(20.0, age_bars / 5000.0) # Penalty up to 20 score points
+        adjusted_survival_threshold = self.MIN_SCORE_SURVIVAL + age_penalty
+
         # 2. Overfit relapse check
         overfit_relapse = score_degradation > self.OVERFIT_RELAPSE_THRESHOLD
 
@@ -256,31 +265,42 @@ class StrategyRetirementEngine(BaseAgent):
 
         persistence = self._degradation_count[sid]
 
-        # Determine state
-        if sid in drift_candidates or (overfit_relapse and persistence >= self.DEGRADATION_PERSISTENCE_CYCLES):
-            state = "retired"
-            reason = "overfit_relapse_and_drift_confirmed"
+        # Phase 28B: Determine State mapping
+        if sid in drift_candidates:
+            state = "quarantined"
+            reason = "drift_detected_quarantine"
             severity = "high"
-        elif recent_score < self.MIN_SCORE_SURVIVAL and persistence >= self.DEGRADATION_PERSISTENCE_CYCLES:
-            state = "retirement_pending"
-            reason = "persistent_below_minimum_score"
+        elif overfit_relapse and persistence >= self.DEGRADATION_PERSISTENCE_CYCLES:
+            state = "retired"
+            reason = "overfit_relapse"
+            severity = "high"
+        elif recent_score < adjusted_survival_threshold and persistence >= self.DEGRADATION_PERSISTENCE_CYCLES:
+            state = "retired"
+            reason = "persistent_below_age_adjusted_minimum_score"
             severity = "high"
         elif divergence > self.MAX_DIVERGENCE_PCT and persistence >= 2:
-            state = "retirement_pending"
+            state = "degrading"
             reason = "live_backtest_divergence"
             severity = "medium"
         elif score_degradation > 0.15 and persistence >= 2:
-            state = "retirement_pending"
+            state = "degrading"
             reason = "score_degradation_persistence"
             severity = "medium"
-        elif score_degradation > 0.10 or persistence >= 1:
-            state = "monitor"
-            reason = "initial_degradation_detected"
-            severity = "low"
+        elif recent_score > self.DOMINANT_SCORE_THRESHOLD and score_degradation < 0.10:
+            state = "dominant"
+            reason = "high_sustained_performance"
+            severity = "none"
+        elif age_bars < 2000 and persistence == 0:
+            state = "emerging"
+            reason = "new_strategy_initial_phase"
+            severity = "none"
         else:
             state = "active"
             reason = "normal_performance"
             severity = "none"
+
+        # Update lifecycle state in database
+        asyncio.create_task(self._update_lifecycle_state(sid, state, age_bars + 100)) # Approximation of age growth
 
         return {
             "state": state,
@@ -294,6 +314,20 @@ class StrategyRetirementEngine(BaseAgent):
             "degradation_persistence_count": persistence,
             "overfit_relapse_detected": overfit_relapse,
         }
+
+    async def _update_lifecycle_state(self, strategy_id: str, state: str, age_bars: int) -> None:
+        """Persist the lifecycle state and age_bars back to the strategies table."""
+        if not self.db:
+            return
+        try:
+            async with self.db.engine.begin() as conn:
+                from sqlalchemy.sql import text
+                await conn.execute(
+                    text("UPDATE strategies SET lifecycle_state = :state, age_bars = :age WHERE id = :id"),
+                    {"state": state, "age": age_bars, "id": strategy_id}
+                )
+        except Exception as e:
+            logger.warning(f"{self.name}: Failed to update lifecycle state for {strategy_id}: {e}")
 
     def _compute_withdrawal_pct(self, lifecycle: dict) -> float:
         """Compute the % of capital to withdraw based on lifecycle state."""

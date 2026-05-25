@@ -177,7 +177,7 @@ class FeatureEvolutionEngine(BaseAgent):
                 text("""
                     UPDATE feature_importance
                     SET feature_name = CONCAT('retired_', feature_name),
-                        metadata = COALESCE(metadata, '{}'::jsonb) || CAST(:retired_at AS jsonb)
+                        metadata = COALESCE(metadata, CAST('{}' AS jsonb)) || CAST(:retired_at AS jsonb)
                     WHERE id = CAST(:id AS uuid)
                 """),
                 {

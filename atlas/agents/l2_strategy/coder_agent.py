@@ -251,9 +251,15 @@ class CoderAgent(BaseAgent):
         # Generate regime classification code block
         regime_block = self._generate_regime_classification_code(valid_regimes)
 
-        # Build code with no leading indentation on the template
-        # textwrap.dedent removes any accidental indentation from
-        # the f-string being inside an indented method
+        # Build code with no leading indentation on the template.
+        # The regime computation block is already 8-space indented in the string
+        # literal. We normalise it with dedent then re-indent to 8 spaces so it
+        # always lands correctly inside generate_signals() regardless of where
+        # this method is called from.
+        regime_code_normalised = textwrap.indent(
+            textwrap.dedent(self._regime_computation_code).strip("\n"),
+            "        ",  # 8 spaces — inside generate_signals()
+        )
         generated_code = textwrap.dedent(f"""\
 import pandas as pd
 import numpy as np
@@ -272,7 +278,7 @@ class {class_name}:
 {condition_block}
 
         # Regime classification — determines which market states are tradeable
-{self._indent_condition_block(self._regime_computation_code)}
+{regime_code_normalised}
 
         # Position state machine — prevents exit spam, enforces holding discipline
         in_position = False
@@ -291,7 +297,7 @@ class {class_name}:
             if not in_position:
                 if entry_clean.iloc[i]:
                     # Regime gate — skip entry if current regime not in valid set
-                    if VALID_REGIMES and df['_regime'].iloc[i] not in VALID_REGIMES:
+                    if self.VALID_REGIMES and df['_regime'].iloc[i] not in self.VALID_REGIMES:
                         continue
                     signals.iloc[i] = 1
                     in_position = True

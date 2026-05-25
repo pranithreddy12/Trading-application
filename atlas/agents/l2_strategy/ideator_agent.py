@@ -120,155 +120,99 @@ _llm_semaphore = asyncio.Semaphore(2)
 
 
 # Diverse fallback templates — multiple variants per (asset, archetype)
+# Phase 30 density: WIDENED templates — calibrated for 10-30% trigger rate on 1m QQQ data
+# Based on actual data distribution analysis (2800 bars QQQ)
 DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
     ("equity", "momentum"): [
-        (
-            ["ema_spread_pct > 0.001", "relative_volume > 1.3"],
-            ["ema_spread_pct < 0.0", "rsi_14 > 68"],
-        ),
-        (
-            ["price_vs_vwap_pct > 0.002", "relative_volume > 1.2"],
-            ["price_vs_vwap_pct < -0.001"],
-        ),
-        (
-            ["ema_12 > ema_26", "rsi_14 > 55", "relative_volume > 1.1"],
-            ["ema_12 < ema_26"],
-        ),
+        # ema_spread_pct > 0: ~48% | relative_volume > 0.8: ~68% → ~32% combined
+        (["ema_spread_pct > 0.0", "relative_volume > 0.8"],
+         ["ema_spread_pct < -0.0005", "rsi_14 < 50"]),
+        # price_vs_vwap_pct > 0: ~55% | rvol > 0.9: ~55% → ~30%
+        (["price_vs_vwap_pct > 0.0", "relative_volume > 0.9"],
+         ["price_vs_vwap_pct < -0.0005"]),
+        # ema_12 > ema_26: ~50% | rsi_14 > 50: ~50% → ~25%
+        (["ema_12 > ema_26", "rsi_14 > 50"],
+         ["ema_12 < ema_26"]),
     ],
     ("equity", "mean_reversion"): [
-        (
-            ["bollinger_band_position < 0.15", "rsi_14 < 38"],
-            ["bollinger_band_position > 0.75"],
-        ),
-        (["price_vs_vwap_pct < -0.002", "rsi_14 < 35"], ["price_vs_vwap_pct > 0.001"]),
-        (
-            ["bollinger_band_position < 0.2", "ema_spread_pct < -0.001"],
-            ["bollinger_band_position > 0.7"],
-        ),
+        # bb_pos < 0.3: ~13% | rvol > 0.8: ~68% → ~9%
+        (["bollinger_band_position < 0.3", "rsi_14 < 45"],
+         ["bollinger_band_position > 0.6"]),
+        # price_vs_vwap_pct < -0.0005: ~35% | rsi_14 < 45: ~30% → ~10%
+        (["price_vs_vwap_pct < -0.0005", "rsi_14 < 45"],
+         ["price_vs_vwap_pct > 0.0005"]),
+        # bb_pos < 0.35: ~18% → single condition with decent trigger
+        (["bollinger_band_position < 0.35"],
+         ["bollinger_band_position > 0.65"]),
     ],
     ("equity", "breakout"): [
-        (["bollinger_band_position > 0.92", "relative_volume > 1.8"], ["rsi_14 > 72"]),
-        (
-            [
-                "bollinger_band_position > 0.85",
-                "relative_volume > 2.0",
-                "trend_strength > 0.001",
-            ],
-            ["rsi_14 > 75"],
-        ),
-        (
-            [
-                "volatility_regime > 1.3",
-                "bollinger_band_position > 0.8",
-                "relative_volume > 1.5",
-            ],
-            ["bollinger_band_position < 0.6"],
-        ),
+        # bb_pos > 0.7: ~18% | rvol > 1.0: ~50% → ~9%
+        (["bollinger_band_position > 0.7", "relative_volume > 1.0"],
+         ["bollinger_band_position < 0.5"]),
+        # bb_pos > 0.65: ~23% | trend_strength > 0.0: ~50% → ~11%
+        (["bollinger_band_position > 0.65", "trend_strength > 0.0"],
+         ["rsi_14 > 60"]),
+        # vol_regime > 1.0: ~40% | bb_pos > 0.6: ~28% → ~11%
+        (["volatility_regime > 1.0", "bollinger_band_position > 0.6", "relative_volume > 0.9"],
+         ["bollinger_band_position < 0.55"]),
     ],
     ("equity", "trend_following"): [
-        (["ema_12 > ema_26", "price_vs_vwap_pct > 0.001"], ["ema_12 < ema_26"]),
-        (
-            ["trend_strength > 0.002", "ema_spread_pct > 0.001"],
-            ["trend_strength < 0.0", "ema_spread_pct < -0.001"],
-        ),
-        (["sma_20 > ema_12", "relative_volume > 1.2"], ["sma_20 < ema_12"]),
+        # ema_12 > ema_26: ~50% → single strong trigger
+        (["ema_12 > ema_26"],
+         ["ema_12 < ema_26"]),
+        # trend_strength > 0.0: ~50% | ema_spread_pct > 0.0: ~48% → ~24%
+        (["trend_strength > 0.0", "ema_spread_pct > 0.0"],
+         ["trend_strength < -0.0005"]),
+        # sma_20 > ema_12: ~40% | rvol > 0.9: ~55% → ~22%
+        (["sma_20 > ema_12", "relative_volume > 0.9"],
+         ["sma_20 < ema_12"]),
     ],
     ("equity", "volatility_regime"): [
-        (
-            ["volatility_regime > 1.4", "bollinger_band_position < 0.3"],
-            ["volatility_regime < 0.9"],
-        ),
-        (
-            [
-                "volatility_regime > 1.5",
-                "rsi_14 < 40",
-                "bollinger_band_position < 0.25",
-            ],
-            ["volatility_regime < 0.9", "rsi_14 > 50"],
-        ),
-        (
-            [
-                "volatility_regime > 1.3",
-                "price_vs_vwap_pct < -0.002",
-                "bollinger_band_position < 0.4",
-            ],
-            ["volatility_regime < 1.0"],
-        ),
+        # vol_regime > 1.0: ~40% | bb_pos < 0.4: ~22% → ~9%
+        (["volatility_regime > 1.0", "bollinger_band_position < 0.4"],
+         ["volatility_regime < 0.9"]),
+        # vol_regime > 0.9: ~55% | rsi_14 < 48: ~40% → ~22%
+        (["volatility_regime > 0.9", "rsi_14 < 48"],
+         ["volatility_regime < 0.9", "rsi_14 > 52"]),
+        # vol_regime > 0.9: ~55% | price_vs_vwap_pct < -0.0005: ~35% → ~19%
+        (["volatility_regime > 0.9", "price_vs_vwap_pct < -0.0005"],
+         ["volatility_regime < 0.95"]),
     ],
     ("crypto", "momentum"): [
-        (
-            ["ema_spread_pct > 0.002", "relative_volume > 1.5"],
-            ["ema_spread_pct < 0.0", "rsi_14 > 70"],
-        ),
-        (
-            ["price_vs_vwap_pct > 0.003", "relative_volume > 1.4"],
-            ["price_vs_vwap_pct < -0.002"],
-        ),
-        (
-            ["ema_12 > ema_26", "trend_strength > 0.002", "relative_volume > 1.3"],
-            ["ema_12 < ema_26"],
-        ),
+        (["ema_spread_pct > 0.0", "relative_volume > 1.0"],
+         ["ema_spread_pct < -0.0005", "rsi_14 < 50"]),
+        (["price_vs_vwap_pct > 0.0", "relative_volume > 1.0"],
+         ["price_vs_vwap_pct < -0.0005"]),
+        (["ema_12 > ema_26", "trend_strength > 0.0"],
+         ["ema_12 < ema_26"]),
     ],
     ("crypto", "mean_reversion"): [
-        (["rsi_14 < 32", "price_vs_vwap_pct < -0.004"], ["rsi_14 > 58"]),
-        (
-            ["bollinger_band_position < 0.12", "rsi_14 < 35"],
-            ["bollinger_band_position > 0.7"],
-        ),
-        (
-            [
-                "price_vs_vwap_pct < -0.005",
-                "rsi_14 < 30",
-                "bollinger_band_position < 0.2",
-            ],
-            ["price_vs_vwap_pct > 0.0"],
-        ),
+        (["rsi_14 < 42", "price_vs_vwap_pct < -0.001"],
+         ["rsi_14 > 55"]),
+        (["bollinger_band_position < 0.25", "rsi_14 < 42"],
+         ["bollinger_band_position > 0.6"]),
+        (["price_vs_vwap_pct < -0.001", "bollinger_band_position < 0.3"],
+         ["price_vs_vwap_pct > 0.0"]),
     ],
     ("crypto", "breakout"): [
-        (["bollinger_band_position > 0.9", "relative_volume > 2.0"], ["rsi_14 > 75"]),
-        (
-            [
-                "bollinger_band_position > 0.88",
-                "relative_volume > 2.2",
-                "volatility_regime > 1.5",
-            ],
-            ["rsi_14 > 78"],
-        ),
-        (
-            [
-                "price_vs_vwap_pct > 0.005",
-                "relative_volume > 1.8",
-                "bollinger_band_position > 0.85",
-            ],
-            ["price_vs_vwap_pct < 0.001"],
-        ),
+        (["bollinger_band_position > 0.75", "relative_volume > 1.2"],
+         ["bollinger_band_position < 0.5"]),
+        (["bollinger_band_position > 0.7", "relative_volume > 1.5", "volatility_regime > 1.0"],
+         ["rsi_14 > 60"]),
+        (["price_vs_vwap_pct > 0.001", "relative_volume > 1.2", "bollinger_band_position > 0.65"],
+         ["price_vs_vwap_pct < 0.0"]),
     ],
     ("crypto", "trend_following"): [
-        (["ema_12 > ema_26", "trend_strength > 0.001"], ["ema_12 < ema_26"]),
-        (
-            [
-                "trend_strength > 0.003",
-                "ema_spread_pct > 0.002",
-                "relative_volume > 1.3",
-            ],
-            ["trend_strength < 0.0"],
-        ),
-        (["sma_20 > ema_12", "price_vs_vwap_pct > 0.002"], ["sma_20 < ema_12"]),
+        (["ema_12 > ema_26"], ["ema_12 < ema_26"]),
+        (["trend_strength > 0.0", "ema_spread_pct > 0.0"], ["trend_strength < -0.0005"]),
+        (["sma_20 > ema_12", "price_vs_vwap_pct > 0.0"], ["sma_20 < ema_12"]),
     ],
     ("crypto", "volatility_regime"): [
-        (["volatility_regime > 1.5", "rsi_14 < 40"], ["volatility_regime < 0.8"]),
-        (
-            ["volatility_regime > 1.6", "bollinger_band_position < 0.2", "rsi_14 < 35"],
-            ["volatility_regime < 1.0"],
-        ),
-        (
-            [
-                "volatility_regime > 1.4",
-                "price_vs_vwap_pct < -0.004",
-                "bollinger_band_position < 0.3",
-            ],
-            ["volatility_regime < 0.9"],
-        ),
+        (["volatility_regime > 1.1", "rsi_14 < 45"], ["volatility_regime < 0.85"]),
+        (["volatility_regime > 1.2", "bollinger_band_position < 0.3", "rsi_14 < 42"],
+         ["volatility_regime < 0.9"]),
+        (["volatility_regime > 1.0", "price_vs_vwap_pct < -0.001", "bollinger_band_position < 0.35"],
+         ["volatility_regime < 0.9"]),
     ],
 }
 

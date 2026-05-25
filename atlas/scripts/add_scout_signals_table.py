@@ -18,7 +18,7 @@ code_to_add = '''
                     symbol TEXT,
                     signal_type TEXT,
                     confidence_score NUMERIC DEFAULT 0.0,
-                    signal_data JSONB DEFAULT '{}'::jsonb,
+                    signal_data JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))

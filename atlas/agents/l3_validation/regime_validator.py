@@ -201,5 +201,35 @@ class RegimeValidator(BaseAgent):
                     "os": result["over_specialized"],
                 },
             )
+
+            # Phase 28C: Persist detailed regime-conditioned fitness
+            for regime_name, metrics in result["regime_survival_map"].items():
+                if metrics["bars"] > 0:
+                    # Calculate proxy metrics since we only have basic stats here
+                    # To get real Sharpe/Sortino we'd need the full return series per regime
+                    regime_fitness_score = (metrics["return"] * 100) * (min(metrics["trades"], 10) / 10)
+                    if metrics["survived"]:
+                        regime_fitness_score += 10.0
+                    
+                    await self.db._execute_insert(
+                        """
+                        INSERT INTO regime_fitness_log
+                            (strategy_id, regime, sharpe, sortino, win_rate, max_drawdown, total_trades, regime_fitness_score, metadata)
+                        VALUES
+                            (:sid, :regime, :sharpe, :sortino, :win_rate, :max_drawdown, :total_trades, :score, :metadata)
+                        """,
+                        {
+                            "sid": strategy_id,
+                            "regime": regime_name,
+                            "sharpe": 0.0, # Placeholder, true sharpe requires full series
+                            "sortino": 0.0,
+                            "win_rate": 0.0, 
+                            "max_drawdown": 0.0,
+                            "total_trades": metrics["trades"],
+                            "score": regime_fitness_score,
+                            "metadata": json.dumps({"raw_return": metrics["return"], "bars": metrics["bars"]})
+                        }
+                    )
+
         except Exception as e:
             logger.warning(f"{self.name}: persist failed for {strategy_id}: {e}")

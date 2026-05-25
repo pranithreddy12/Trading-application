@@ -106,7 +106,7 @@ class SourceReliabilityEngine(BaseAgent):
                 text("""
                     SELECT source, COUNT(*) as contradiction_count
                     FROM scout_poison_quarantine
-                    WHERE created_at > NOW() - INTERVAL '7 days'
+                    WHERE detected_at > NOW() - INTERVAL '7 days'
                     GROUP BY source
                 """)
             )

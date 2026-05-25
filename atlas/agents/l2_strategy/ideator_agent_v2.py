@@ -8,6 +8,7 @@ from datetime import datetime
 from loguru import logger
 from redis.asyncio import Redis
 import os
+from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.messaging import MessagingClient, Channel
@@ -412,11 +413,13 @@ class IdeatorAgentV2(BaseAgent):
         self._scout_aggression_factor: float = 1.0
         self._scout_confidence_modulator: float = 1.0
         self._scout_liquidity_sensitivity: float = 1.0
+        self._ecological_state: dict[str, float | int] = {}
 
-        # Diversity governance — reject strategies with >70% feature overlap
-        # 55-70% zone: soft penalty (feature variety encouraged but not rigidly enforced)
+        # Phase 27B: Adaptive diversity governance with regime-awareness
+        # Base thresholds (dynamically adjusted based on regime and throughput)
         self.DIVERSITY_SIMILARITY_THRESHOLD = 0.70
         self.DIVERSITY_SOFT_PENALTY_START = 0.55
+        self._prev_diversity_accept_rate = 1.0  # Track diversity pass rate
         
         # Cost Intelligence Feature Flag
         self._cost_intelligence_enabled = os.environ.get(
@@ -459,14 +462,32 @@ class IdeatorAgentV2(BaseAgent):
 
                 # Diversity governance — reject if too similar to recent strategies
                 existing_combos = await self.db_client.get_recent_feature_combos(limit=50)
-                accepted, div_reason = self._check_diversity(spec, existing_combos)
+                # Phase 27B: Regime-aware, throughput-aware diversity check
+                regime_for_div = self._ctx_cache.get("regime", "neutral") if hasattr(self, '_ctx_cache') and self._ctx_cache else "neutral"
+                throughput = len(existing_combos)
+                # Phase 28G: Soft evolutionary penalties
+                accepted, div_reason, modifiers = self._check_diversity(
+                    spec, existing_combos,
+                    regime=regime_for_div,
+                    strategy_throughput=throughput,
+                    ecological_pressure=float(self._ctx_cache.get("ecological_pressure", 1.0)),
+                    active_population=int(self._ctx_cache.get("active_population", 0))
+                )
+                if modifiers:
+                    if "metadata" not in spec:
+                        spec["metadata"] = {}
+                    spec["metadata"]["evolutionary_modifiers"] = modifiers
+
                 if not accepted:
                     logger.info(f"{self.name}: Diversity reject — {div_reason}")
                     await asyncio.sleep(5)
                     continue
 
                 # Economic constraint governance — reject over-trading strategies
-                econ_ok, econ_reason = self._check_economic_constraints(spec)
+                econ_ok, econ_reason = self._check_economic_constraints(
+                    spec,
+                    ecological_pressure=float(self._ctx_cache.get("ecological_pressure", 1.0)),
+                )
                 if not econ_ok:
                     logger.info(f"{self.name}: Economic reject — {econ_reason}")
                     await asyncio.sleep(5)
@@ -521,6 +542,9 @@ class IdeatorAgentV2(BaseAgent):
 
                 # Lean agents run faster
                 sleep = 8 if self.mode == "lean" else 12
+                ecological_pressure = float(self._ctx_cache.get("ecological_pressure", 1.0))
+                if ecological_pressure > 1.0:
+                    sleep = max(3, int(sleep / min(2.5, ecological_pressure)))
                 await asyncio.sleep(sleep)
 
             except Exception as e:
@@ -684,7 +708,7 @@ class IdeatorAgentV2(BaseAgent):
 
         try:
             ctx["recent_names"] = await self.db_client.get_recent_strategy_names(
-                limit=15
+                limit=50
             )
         except Exception:
             pass
@@ -738,7 +762,12 @@ class IdeatorAgentV2(BaseAgent):
                 # Aggregate overrepresented feature families per archetype
                 from collections import Counter
                 arch_counter: dict[str, Counter] = {}
-                for features, archetype in combos:
+                for combo in combos:
+                    # Handle both 2-tuple (legacy) and 3-tuple (Phase 27 time-decay) formats
+                    if len(combo) >= 2:
+                        features, archetype = combo[0], combo[1]
+                    else:
+                        continue
                     if archetype not in arch_counter:
                         arch_counter[archetype] = Counter()
                     for feat in features:
@@ -819,6 +848,98 @@ class IdeatorAgentV2(BaseAgent):
             )
         except Exception as e:
             ctx["scout_intelligence"] = f"Scout fetch failed: {e}"
+
+        # ─────────────────────────────────────────────────────────
+        # ECOLOGICAL PRESSURE CONTEXT (Phase 29)
+        # ─────────────────────────────────────────────────────────
+        ctx["ecological_intelligence"] = "Ecological pressure unavailable."
+        ctx["ecological_pressure"] = 1.0
+        ctx["active_population"] = 0
+        ctx["ecological_generation_budget"] = 1
+        try:
+            async with self.db_client.engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT
+                            COALESCE((SELECT COUNT(*) FROM strategies WHERE status IN ('validated', 'elite', 'promoted', 'live')), 0) AS validated_count,
+                            COALESCE((SELECT COUNT(*) FROM strategies WHERE status IN ('validated', 'elite', 'promoted', 'live', 'research_candidate', 'repair_candidate')), 0) AS active_count,
+                            COALESCE((SELECT COUNT(*) FROM strategies WHERE status = 'pending_code'), 0) AS pending_code_count,
+                            COALESCE((SELECT COUNT(*) FROM strategies WHERE status = 'pending_backtest'), 0) AS pending_backtest_count,
+                            COALESCE((SELECT COUNT(*) FROM strategies WHERE status = 'pending_validation'), 0) AS pending_validation_count,
+                            COALESCE((SELECT COUNT(*) FROM backtest_trades WHERE entry_time > NOW() - INTERVAL '24 hours'), 0) AS trade_throughput,
+                            COALESCE((SELECT COUNT(DISTINCT mutation_type) FROM mutation_memory WHERE created_at > NOW() - INTERVAL '24 hours'), 0) AS mutation_diversity,
+                            COALESCE((SELECT n_strategies FROM capital_allocation ORDER BY computed_at DESC LIMIT 1), 0) AS portfolio_participants,
+                            COALESCE((SELECT n_strategies FROM portfolio_intelligence ORDER BY computed_at DESC LIMIT 1), 0) AS portfolio_intelligence_participants,
+                            COALESCE((SELECT COUNT(*) FROM scout_economic_attribution WHERE created_at > NOW() - INTERVAL '24 hours'), 0) AS attribution_records,
+                            COALESCE((SELECT MAX(dynamic_trust_score) - MIN(dynamic_trust_score) FROM source_performance_log WHERE updated_at > NOW() - INTERVAL '24 hours'), 0) AS scout_trust_divergence
+                    """))
+                row = result.fetchone()
+                if row:
+                    validated_count = int(row[0] or 0)
+                    active_count = int(row[1] or 0)
+                    pending_code_count = int(row[2] or 0)
+                    pending_backtest_count = int(row[3] or 0)
+                    pending_validation_count = int(row[4] or 0)
+                    trade_throughput = int(row[5] or 0)
+                    mutation_diversity = int(row[6] or 0)
+                    portfolio_participants = int(row[7] or 0)
+                    portfolio_intelligence_participants = int(row[8] or 0)
+                    attribution_records = int(row[9] or 0)
+                    scout_trust_divergence = float(row[10] or 0)
+
+                    ecological_pressure = 1.0
+                    if validated_count < 3:
+                        ecological_pressure += 0.5
+                    elif validated_count < 8:
+                        ecological_pressure += 0.25
+
+                    if active_count < 5:
+                        ecological_pressure += 0.25
+                    if portfolio_participants < 2 and portfolio_intelligence_participants < 2:
+                        ecological_pressure += 0.35
+                    if trade_throughput < 3:
+                        ecological_pressure += 0.40
+                    elif trade_throughput < 10:
+                        ecological_pressure += 0.15
+                    if mutation_diversity < 3:
+                        ecological_pressure += 0.25
+                    elif mutation_diversity < 6:
+                        ecological_pressure += 0.10
+
+                    ecological_pressure = min(2.5, round(ecological_pressure, 2))
+                    generation_budget = 1
+                    if ecological_pressure >= 1.35:
+                        generation_budget += 1
+                    if ecological_pressure >= 1.75:
+                        generation_budget += 1
+
+                    ctx["ecological_pressure"] = ecological_pressure
+                    ctx["active_population"] = active_count
+                    ctx["ecological_generation_budget"] = min(3, generation_budget)
+                    ctx["ecological_intelligence"] = (
+                        f"validated={validated_count}, active={active_count}, pending_code={pending_code_count}, "
+                        f"pending_backtest={pending_backtest_count}, pending_validation={pending_validation_count}, "
+                        f"trade_throughput_24h={trade_throughput}, mutation_diversity_24h={mutation_diversity}, "
+                        f"portfolio_participants={portfolio_participants}, portfolio_intel={portfolio_intelligence_participants}, "
+                        f"attribution_records_24h={attribution_records}, scout_trust_divergence={scout_trust_divergence:.3f}, "
+                        f"pressure={ecological_pressure:.2f}, generation_budget={ctx['ecological_generation_budget']}"
+                    )
+                    self._ecological_state = {
+                        "validated_count": validated_count,
+                        "active_count": active_count,
+                        "pending_code_count": pending_code_count,
+                        "pending_backtest_count": pending_backtest_count,
+                        "pending_validation_count": pending_validation_count,
+                        "trade_throughput": trade_throughput,
+                        "mutation_diversity": mutation_diversity,
+                        "portfolio_participants": portfolio_participants,
+                        "portfolio_intelligence_participants": portfolio_intelligence_participants,
+                        "attribution_records": attribution_records,
+                        "scout_trust_divergence": scout_trust_divergence,
+                        "pressure": ecological_pressure,
+                    }
+        except Exception as e:
+            logger.debug(f"{self.name}: Ecological pressure fetch failed: {e}")
 
         # SCOUT SIGNALS ENRICHMENT (Phase 25D) - only if main fetch succeeded
         if not ctx.get("scout_intelligence", "").startswith("Scout fetch failed"):
@@ -1053,87 +1174,148 @@ class IdeatorAgentV2(BaseAgent):
         return "1m"  # Default
 
 
+
+    def _compute_adaptive_threshold(
+        self,
+        regime: str = "neutral",
+        strategy_throughput: int = 0,
+        ecological_pressure: float = 1.0,
+        active_population: int = 0,
+    ) -> tuple[float, float]:
+        # Phase 30: exact clones only hard-reject; near-clones receive penalties.
+        hard_threshold = 1.0
+        soft_threshold = 0.90
+
+        regime_lower = regime.lower()
+        if "high_vol" in regime_lower or "panic" in regime_lower or "trending" in regime_lower:
+            soft_threshold += 0.10
+        elif "ranging" in regime_lower or "neutral" in regime_lower:
+            soft_threshold -= 0.05
+        elif "oversold" in regime_lower or "overbought" in regime_lower:
+            soft_threshold += 0.05
+
+        if strategy_throughput < 5:
+            soft_threshold += 0.03
+        elif strategy_throughput > 30:
+            soft_threshold -= 0.05
+
+        if active_population and active_population < 10:
+            soft_threshold += 0.04
+        if active_population and active_population < 5:
+            soft_threshold += 0.03
+
+        if ecological_pressure > 1.0:
+            soft_threshold += min(0.06, (ecological_pressure - 1.0) * 0.04)
+
+        soft_threshold = max(0.90, min(0.99, soft_threshold))
+        hard_threshold = max(1.0, min(1.0, hard_threshold))
+        return hard_threshold, soft_threshold
+
     def _check_diversity(
         self,
         spec: dict,
-        recent_combos: list[tuple[set[str], str]],
-    ) -> tuple[bool, str]:
-        """
-        Two-tier diversity governance:
-        - >= 70% overlap: HARD REJECT (too similar, collapses search space)
-        - 55-70% overlap: SOFT PENALTY (allowed but logged for monitoring)
-        - < 55%: PASS freely
-
-        Compares feature sets using Jaccard similarity.
-        Guards against Claude collapsing into 100 variants of RSI+Bollinger.
-        """
+        recent_combos: list[tuple[set[str], str]] | list[tuple],
+        regime: str = "neutral",
+        strategy_throughput: int = 0,
+        ecological_pressure: float = 1.0,
+        active_population: int = 0,
+    ) -> tuple[bool, str, dict]:
         entry = spec.get("entry_conditions", [])
         exit_ = spec.get("exit_conditions", [])
 
-        # Extract all feature names used in this strategy's conditions
         new_features: set[str] = set()
         for cond in entry + exit_:
             if isinstance(cond, str):
                 new_features |= _known_features_in(cond)
 
         if not new_features:
-            return True, "no features to compare"
+            return True, "no features to compare", {}
 
-        # Compute feature families for family-level diversity check
         new_families: set[str] = set()
         for feat in new_features:
             family = _FEATURE_FAMILIES.get(feat)
             if family:
                 new_families.add(family)
 
-        # Check for single-family collapse (e.g. ONLY oscillators)
         if len(new_families) == 1:
-            return False, (
-                f"single feature family only ({list(new_families)[0]}) — "
-                f"diverse families required"
-            )
+            return False, f"single feature family only ({list(new_families)[0]})", {}
+
+        adaptive_hard, adaptive_soft = self._compute_adaptive_threshold(
+            regime,
+            strategy_throughput,
+            ecological_pressure,
+            active_population,
+        )
+
+        # Build a condition-string signature for the candidate (used as secondary gate)
+        import hashlib as _hashlib
+        _new_cond_sig = _hashlib.md5(
+            "|".join(sorted(str(c) for c in entry + exit_)).encode()
+        ).hexdigest()
 
         max_overlap = 0.0
         worst_match = ""
-        soft_penalty_logged = False
 
-        for existing_features, archetype in recent_combos:
+        # Phase 28G: Evolutionary memory windowing / recency decay
+        # Phase 29: secondary condition-string gate prevents over-rejection of
+        #           deterministic templates that share feature names but differ in thresholds.
+        for combo in recent_combos:
+            if len(combo) >= 4:
+                existing_features, archetype, time_weight, existing_cond_sig = combo
+            elif len(combo) >= 3:
+                existing_features, archetype, time_weight = combo[0], combo[1], combo[2]
+                existing_cond_sig = None
+            elif len(combo) >= 2:
+                existing_features, archetype = combo[0], combo[1]
+                time_weight = 1.0
+                existing_cond_sig = None
+            else:
+                continue
+
             if not existing_features:
                 continue
-            # Jaccard similarity: |intersection| / |union|
+
             intersection = new_features & existing_features
             union = new_features | existing_features
-            jaccard = len(intersection) / len(union) if union else 0.0
+            raw_jaccard = len(intersection) / len(union) if union else 0.0
 
-            if jaccard > max_overlap:
-                max_overlap = jaccard
+            if raw_jaccard > max_overlap:
+                max_overlap = raw_jaccard
                 worst_match = archetype
 
-            # HARD REJECT: overlap >= 70%
-            if jaccard >= self.DIVERSITY_SIMILARITY_THRESHOLD:
-                shared = ", ".join(sorted(intersection)[:5])
-                return False, (
-                    f"feature overlap {jaccard:.0%} with recent {archetype} strategy "
-                    f"(shared: {shared}) — above {self.DIVERSITY_SIMILARITY_THRESHOLD:.0%} hard reject threshold"
-                )
+            if raw_jaccard >= adaptive_hard:
+                # Secondary gate: only hard-reject when condition strings are also identical.
+                # This prevents rejecting deterministic templates that share feature names
+                # but use different threshold values.
+                if existing_cond_sig is None or _new_cond_sig == existing_cond_sig:
+                    return False, f"exact clone overlap {raw_jaccard:.0%} with {archetype}", {}
+                # Feature-identical but threshold-distinct → treat as high-overlap, apply penalty
+                max_overlap = min(raw_jaccard, adaptive_soft + 0.01)
 
-        # Log soft penalty ONCE after loop (not per-comparison to avoid spam)
-        if not soft_penalty_logged and max_overlap >= self.DIVERSITY_SOFT_PENALTY_START:
-            soft_penalty_logged = True
-            logger.info(
-                f"{self.name}: Diversity soft penalty — {max_overlap:.0%} max overlap "
-                f"(archetype={worst_match}) — throughput allowed"
-            )
+        modifiers = {}
+        if max_overlap >= adaptive_soft:
+            modifiers = {
+                "exploration_priority_mult": 0.95,
+                "mutation_probability_mult": 1.15,
+                "evolutionary_fitness_bonus": -0.05
+            }
+            if active_population and active_population < 10:
+                modifiers = {
+                    "exploration_priority_mult": 1.15,
+                    "mutation_probability_mult": 1.35,
+                    "evolutionary_fitness_bonus": 0.0,
+                }
+            logger.info(f"{self.name}: Diversity soft penalty - {max_overlap:.0%} overlap with {worst_match}")
+        else:
+            modifiers = {
+                "exploration_priority_mult": 1.5,
+                "mutation_probability_mult": 1.5,
+                "evolutionary_fitness_bonus": 0.2
+            }
+            logger.info(f"{self.name}: Diversity boost - novel organism (overlap {max_overlap:.0%})")
 
-        # Log the best match for monitoring
-        if max_overlap > 0:
-            logger.debug(
-                f"Diversity: closest match = {max_overlap:.0%} (archetype={worst_match}), "
-                f"features={sorted(new_features)}"
-            )
-
-        return True, f"diverse (max_overlap={max_overlap:.0%})"
-
+        self._prev_diversity_accept_rate = self._prev_diversity_accept_rate * 0.9 + 0.1
+        return True, f"diverse (max_overlap={max_overlap:.0%})", modifiers
     # ─────────────────────────────────────────────────────────
     # ECONOMIC CONSTRAINT GOVERNANCE
     # ─────────────────────────────────────────────────────────
@@ -1251,7 +1433,7 @@ class IdeatorAgentV2(BaseAgent):
             return "medium", "; ".join(reasons)
         return "low", "; ".join(reasons) if reasons else "acceptable"
 
-    def _check_economic_constraints(self, spec: dict) -> tuple[bool, str]:
+    def _check_economic_constraints(self, spec: dict, ecological_pressure: float = 1.0) -> tuple[bool, str]:
         """
         Hard gateway that rejects strategies likely to fail economic survivability.
         Checks:
@@ -1263,6 +1445,13 @@ class IdeatorAgentV2(BaseAgent):
         """
         # Trade frequency check
         risk, risk_reason = self._estimate_trade_risk(spec)
+
+        if ecological_pressure >= 1.35 and risk == "high":
+            logger.info(
+                f"{self.name}: Sparse ecology override downgraded high trade-frequency risk "
+                f"for {spec.get('strategy_name', 'unknown')}"
+            )
+            risk = "medium"
 
         if risk == "high":
             return False, (
@@ -1353,6 +1542,27 @@ class IdeatorAgentV2(BaseAgent):
                     f"{archetype} -> {modulated_archetype} "
                     f"(weights={scout_weights})"
                 )
+                # Phase 26H Fix 3: Log scout influence BEFORE diversity check
+                # so influence events are visible even if the strategy is later rejected.
+                try:
+                    await self.db_client.log_scout_influence(
+                        source_scout="regime_scout",
+                        target_agent=self.name,
+                        influence_type="archetype_modulation",
+                        influence_metric=f"{archetype}->{modulated_archetype}",
+                        delta=scout_weights.get(modulated_archetype, 0) - (1.0 / max(1, len(ARCHETYPES))),
+                        confidence=0.6,
+                        regime_context=ctx.get("regime", "neutral"),
+                        entropy_context=self._scout_confidence_modulator,
+                        metadata={
+                            "all_weights": scout_weights,
+                            "from_archetype": archetype,
+                            "to_archetype": modulated_archetype,
+                            "scout_aggression": ctx.get("scout_aggression_factor", 1.0)
+                        },
+                    )
+                except Exception as e:
+                    logger.debug(f"{self.name}: Failed to log scout influence: {e}")
             archetype = modulated_archetype
             grammar = STRATEGY_GRAMMAR.get(archetype)
             if not grammar:
@@ -1506,7 +1716,9 @@ class IdeatorAgentV2(BaseAgent):
         asset = ctx["asset_class"]
         archetype = ctx["archetype"]
         regime = ctx["regime"]
-        recent = ", ".join(ctx["recent_names"][:8]) or "none"
+        import time as _time
+        _ts_suffix = str(int(_time.time()))[-4:]
+        recent = ", ".join(ctx["recent_names"][:50]) or "none"
 
         returns_range = "-0.003 to 0.003" if asset == "equity" else "-0.008 to 0.008"
 
@@ -1538,6 +1750,16 @@ Recent failures: {ctx["failure_summary"]}
 Working strategies: {ctx["success_summary"]}
 Avoid names: {recent}
 
+NAMING RULE: Your strategy_name MUST be globally unique.
+Use exactly this format: {{archetype}}_{{asset}}_{{primary_feature}}_{_ts_suffix}
+Where:
+  archetype   = the strategy type (e.g. momentum, mean_reversion, breakout)
+  asset       = ticker or asset class (e.g. nvda, spy, equity)
+  primary_feature = the dominant signal (e.g. ema_spread, bb_squeeze, rsi_slope)
+  {_ts_suffix}   = the required 4-digit suffix for this generation (HARDCODED — do not change it)
+Example: momentum_nvda_ema_spread_{_ts_suffix}
+NEVER reuse any name from the avoid list above. The suffix ensures uniqueness.
+
 Structural Intelligence (learned patterns):
 {ctx.get("pattern_intelligence", "No pattern data yet.")}
 
@@ -1549,6 +1771,9 @@ Diversity Intelligence (overused features to avoid):
 
 Scout Intelligence (live market conditions):
 {ctx.get("scout_intelligence", "Scout intelligence pending.")}
+
+Ecological Pressure (adaptive generation control):
+{ctx.get("ecological_intelligence", "Ecological pressure unavailable.")}
 
 RECOMMENDATIONS FROM SCOUT:
 - If liquidity is thin or dangerous: discourage scalping, high-frequency churn, tight exits

@@ -95,7 +95,7 @@ class HypothesisEngine(BaseAgent):
         self.db = db_client
         self._claude = claude_client
         self.run_interval = run_interval
-        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "true").lower() == "true"
+        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "false").lower() == "true"
 
     async def run(self):
         logger.info(

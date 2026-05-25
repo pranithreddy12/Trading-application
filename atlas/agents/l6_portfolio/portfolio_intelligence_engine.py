@@ -275,8 +275,8 @@ class PortfolioIntelligenceEngine(BaseAgent):
         else:
             raw_weights = np.ones(n) / n
 
-        # Apply constraints: max 30% per strategy
-        weights = np.minimum(raw_weights, 0.30)
+        # Phase 30: Reduced max allocation from 30% to 15% for tighter capital competition
+        weights = np.minimum(raw_weights, 0.15)
         weights = weights / np.sum(weights)
 
         allocations = []
@@ -435,6 +435,28 @@ class PortfolioIntelligenceEngine(BaseAgent):
                     "diversification_score": intelligence["diversification_score"],
                     "metadata": json.dumps(intelligence["metadata"]),
                 },
+            )
+
+            # Phase 28F: Portfolio-Level Evolution Log
+            await self.db._execute_insert(
+                """
+                INSERT INTO portfolio_evolution_log
+                    (portfolio_id, diversification_score, correlation_collapse_risk, 
+                     contagion_exposure, concentration_risk, portfolio_survivability, 
+                     drawdown_recovery_speed, active_strategies)
+                VALUES
+                    (:pid, :div_score, :corr_risk, :contagion, :conc_risk, :surv, :recovery, :active)
+                """,
+                {
+                    "pid": intelligence["id"],
+                    "div_score": intelligence["diversification_score"],
+                    "corr_risk": 1.0 - intelligence["diversification_score"], # Proxy for correlation collapse
+                    "contagion": intelligence["concentration_risk"] * 0.5,     # Proxy for contagion
+                    "conc_risk": intelligence["concentration_risk"],
+                    "surv": intelligence["ensemble_survivability_score"],
+                    "recovery": intelligence.get("efficiency_scores", [{"efficiency": 0.0}])[0]["efficiency"] if intelligence.get("efficiency_scores") else 0.0,
+                    "active": intelligence["n_strategies"]
+                }
             )
         except Exception as e:
             logger.warning(f"{self.name}: persist failed: {e}")

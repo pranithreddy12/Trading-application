@@ -60,6 +60,11 @@ from atlas.agents.l7_meta.agent_performance_governor import AgentPerformanceGove
 from atlas.agents.scouts.news_intelligence_engine import NewsIntelligenceEngine
 from atlas.agents.scouts.source_reliability_engine import SourceReliabilityEngine
 from atlas.agents.scouts.hypothesis_validation_engine import HypothesisValidationEngine
+from atlas.agents.l7_meta.scout_synthesis_engine import ScoutSynthesisEngine
+from atlas.agents.l7_meta.anti_poisoning_engine import AntiPoisoningEngine
+from atlas.agents.l7_meta.economic_attribution_engine import EconomicAttributionEngine
+from atlas.agents.l7_meta.economic_efficiency_engine import EconomicEfficiencyEngine
+from atlas.agents.l7_meta.entropy_governance_engine import EntropyGovernanceEngine
 from atlas.config.settings import get_settings
 from atlas.core.event_lineage import EventLineageClient
 from atlas.data.storage.timescale_client import TimescaleClient
@@ -106,11 +111,17 @@ def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
         MutationPolicyEngine(redis_client, db_client),
         FeatureEvolutionEngine(redis_client, db_client),
         AgentPerformanceGovernor(redis_client, db_client),
-        # Phase 16: External Intelligence Expansion
+        # Phase 16-26: External Intelligence & Coupling
         NewsIntelligenceEngine(redis_client, db_client),
         SourceReliabilityEngine(redis_client, db_client),
         HypothesisValidationEngine(redis_client, db_client),
+        ScoutSynthesisEngine(redis_client, db_client),
+        AntiPoisoningEngine(redis_client, db_client),
+        EconomicAttributionEngine(redis_client, db_client),
+        EconomicEfficiencyEngine(redis_client, db_client),
+        EntropyGovernanceEngine(redis_client, db_client),
         # L2-L5: Core pipeline
+
         IdeatorAgentV2(0, 0.5, redis_client, db_client, mode="rich"),
         CoderAgent(redis_client, db_client),
         MutatorAgent(redis_client, db_client),

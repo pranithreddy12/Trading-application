@@ -21,7 +21,7 @@ old = '''CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quar
                     symbol TEXT,
                     signal_type TEXT,
                     confidence_score NUMERIC DEFAULT 0.0,
-                    signal_data JSONB DEFAULT '{}'::jsonb,
+                    signal_data JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))
@@ -47,7 +47,7 @@ new = '''CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quar
                     symbol TEXT,
                     signal_type TEXT,
                     confidence_score NUMERIC DEFAULT 0.0,
-                    signal_data JSONB DEFAULT '{}'::jsonb,
+                    signal_data JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
             """))

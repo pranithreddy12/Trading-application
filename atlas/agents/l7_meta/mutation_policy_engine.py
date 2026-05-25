@@ -56,7 +56,7 @@ class MutationPolicyEngine(BaseAgent):
         self._claude = claude_client
         self._run_interval = 3600  # Every hour
         self._weights = dict(self.DEFAULT_WEIGHTS)
-        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "true").lower() == "true"
+        self._llm_enabled = os.environ.get("USE_LLM_META_ADVISOR", "false").lower() == "true"
 
     async def run(self):
         logger.info(f"{self.name}: Starting mutation policy learning")
@@ -103,6 +103,24 @@ class MutationPolicyEngine(BaseAgent):
         for mtype, outcomes in by_type.items():
             successes = sum(1 for o in outcomes if o.get("outcome_score", 0) > 0)
             success_rates[mtype] = successes / max(1, len(outcomes))
+            
+            # Phase 28E: Mutation Survival Intelligence Logging
+            avg_fitness = sum(o.get("outcome_score", 0) for o in outcomes) / max(1, len(outcomes))
+            await self.db._execute_insert(
+                """
+                INSERT INTO mutation_survival_log
+                    (mutation_type, target_agent, total_applications, survival_count, avg_fitness_contribution, survival_rate, updated_at)
+                VALUES
+                    (:mtype, 'MutatorAgent', :total, :surv, :avg_fit, :rate, NOW())
+                """,
+                {
+                    "mtype": mtype,
+                    "total": len(outcomes),
+                    "surv": successes,
+                    "avg_fit": avg_fitness,
+                    "rate": success_rates[mtype]
+                }
+            )
 
         # Update weights: higher success rate = higher weight
         total_rate = sum(success_rates.values()) or 1.0
@@ -160,10 +178,10 @@ class MutationPolicyEngine(BaseAgent):
             r = await conn.execute(
                 text("""
                     SELECT m.id, m.mutation_type, m.id as strategy_id,
-                           COALESCE(br.short_window_score, 0) as outcome_score
+                           COALESCE(br.composite_fitness_score, 0) as outcome_score
                     FROM strategies m
                     LEFT JOIN LATERAL (
-                        SELECT short_window_score
+                        SELECT composite_fitness_score
                         FROM backtest_results
                         WHERE strategy_id = m.id
                         ORDER BY start_date DESC LIMIT 1

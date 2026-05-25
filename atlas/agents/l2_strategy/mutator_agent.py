@@ -74,18 +74,18 @@ MUTATION_TYPE_FAMILY = {
     "regime_filter_adjustment": MutationFamily.REPAIR,
 }
 
-# Structural minimums — strategies below these are rejected
-MIN_ENTRY_COUNT = 3
-MIN_TRADES = 3
+# Phase 30: Relaxed structural minimums to allow more exploratory mutations
+MIN_ENTRY_COUNT = 1  # was 3
+MIN_TRADES = 1  # was 3
 
 # Candidate pool Sharpe bands
 REPAIR_SHARPE_MIN = 0.0  # repair_candidate with entries, any sharpe
 RESEARCH_SHARPE_MIN = 0.0
 VALIDATED_B_SHARPE_MIN = 0.0
 
-# Anti-clone: max Jaccard distance to reject near-duplicates
+# Phase 30: Reduced clone paranoia - allow more overlap for mutation ecology expansion
 # standardized_similarity returns 0.0=identical, 1.0=different
-MAX_DUPLICATE_DISTANCE = 0.15
+MAX_DUPLICATE_DISTANCE = 0.05  # was 0.15 - only reject near-identical clones
 
 
 def extract_json_block(text: str) -> str:
@@ -585,9 +585,9 @@ class MutatorAgent(BaseAgent):
             scout_regime_vol in ("panic_vol", "high_vol") or
             scout_corr_risk in ("panic_correlation", "regime_break")
         )
-        # Adjust max_variants based on scout intelligence
-        original_max_variants = 7
-        used_max_variants = original_max_variants + 3 if favor_economic else original_max_variants
+        # Phase 30: Increased max variants for more mutation throughput
+        original_max_variants = 12  # was 7
+        used_max_variants = original_max_variants + 5 if favor_economic else original_max_variants  # was +3
 
         # --- Phase 1: Deterministic micro-mutations ---
         deterministic_variants = deterministic_micro_mutations(params, max_variants=used_max_variants)
@@ -648,7 +648,8 @@ class MutatorAgent(BaseAgent):
                 },
             )
             score_label = classify_viability(viability)
-            if viability < 0.30:
+            # Phase 30: Lowered viability threshold from 0.30 to 0.15 for maximum mutation throughput
+            if viability < 0.15:
                 logger.info(
                     f"Skipping deterministic {mut_type}: viability={viability:.3f} ({score_label})"
                 )
@@ -706,7 +707,8 @@ class MutatorAgent(BaseAgent):
 
             if claude_validation_error:
                 logger.info(f"Skipping Claude mutation: {claude_validation_error}")
-            elif claude_viability < 0.30:
+            # Phase 30: Lowered Claude viability threshold from 0.30 to 0.15
+            elif claude_viability < 0.15:
                 logger.info(
                     f"Skipping Claude mutation: viability={claude_viability:.3f} ({classify_viability(claude_viability)})"
                 )

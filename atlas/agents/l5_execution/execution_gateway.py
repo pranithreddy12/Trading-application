@@ -234,14 +234,17 @@ class ExecutionGateway(BaseAgent):
             except Exception:
                 params = {}
 
-        symbol = params.get("symbol", "UNKNOWN")
+        asset_class = params.get("asset_class", "equity").lower()
+        default_symbol = "BTC/USD" if asset_class == "crypto" else "QQQ"
+        symbol = params.get("symbol", default_symbol)
+        
         side = params.get("side", "buy").lower()
         # Default fallback sizing if not specified
         qty = params.get("qty")
         if qty is None:
             # We would typically ask risk controller or position manager for size,
             # but we fall back to a dummy fixed size if needed
-            qty = 10.0
+            qty = 10.0 if asset_class == "equity" else 0.05
 
         return {
             "strategy_id": str(strategy.get("id")),
@@ -307,14 +310,13 @@ class ExecutionGateway(BaseAgent):
             # 2. Scout-aware dynamic adaptation (Phase 10.10)
             await self._refresh_scout_intelligence()
 
-            # 2b. Reject execution if liquidity is dangerous
+            # Phase 30: Relaxed from hard-reject to soft sizing reduction for dangerous liquidity
             if self._scout_liquidity_regime == "dangerous":
-                await self.tracker.transition(
-                    order_key, OrderState.RISK_REJECTED,
-                    metadata={"reason": f"dangerous_liquidity_regime"}
-                )
-                logger.warning(f"Execution blocked: dangerous liquidity regime")
-                return False
+                # Reduce size instead of blocking entirely
+                qty = qty * 0.25
+                logger.warning(f"Execution permitted with 75% size reduction: dangerous liquidity regime")
+            elif self._scout_liquidity_regime == "thin":
+                qty = qty * 0.5
 
             # 2c. Kill switch check
             if await KillSwitch.is_active(self.db):
@@ -455,21 +457,22 @@ class ExecutionGateway(BaseAgent):
         """Reduce order size in stressed market conditions.
         
         Phase 26D: Also reduces sizing based on entropy when available.
+        Phase 30: Less aggressive reduction to maintain trade density.
         """
         adjusted = base_qty
         if self._scout_liquidity_regime == "thin":
-            adjusted *= 0.5
+            adjusted *= 0.75  # Previously 0.5
         if self._scout_execution_regime in ("degraded", "stressed"):
-            adjusted *= 0.75
+            adjusted *= 0.85  # Previously 0.75
         if self._scout_execution_regime == "unstable":
-            adjusted *= 0.25
+            adjusted *= 0.50  # Previously 0.25
         # Phase 26D: Entropy-based sizing reduction (fetched from risk controller's state)
         try:
             entropy_val = self.risk._scout_entropy if hasattr(self.risk, '_scout_entropy') else 0.0
             if entropy_val > 0.7:
-                adjusted *= 0.5  # 50% size reduction in high entropy
+                adjusted *= 0.75  # Previously 0.5
             elif entropy_val > 0.5:
-                adjusted *= 0.75  # 25% size reduction in moderate entropy
+                adjusted *= 0.85  # Previously 0.75
         except Exception:
             pass
         return adjusted

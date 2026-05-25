@@ -82,7 +82,9 @@ class OrderTracker:
             except Exception:
                 params = {}
 
-        symbol = params.get("symbol", "UNKNOWN")
+        asset_class = params.get("asset_class", "equity").lower()
+        default_symbol = "BTC/USD" if asset_class == "crypto" else "QQQ"
+        symbol = params.get("symbol", default_symbol)
         side = params.get("side", "buy").lower()  # default entry side
         date = datetime.utcnow().strftime("%Y%m%d")
 
@@ -116,15 +118,23 @@ class OrderTracker:
         """
         Prevent concurrent execution of the same order_key.
         Uses Redis SET NX with instance_id as value for ownership tracking.
-        Returns True if lock acquired, False if already locked.
+        Returns True if lock acquired, False if already locked or Redis unavailable.
         """
         lock_key = f"{self.REDIS_LOCK_PREFIX}{order_key}"
-        acquired = await self.redis.set(lock_key, self.instance_id, nx=True, ex=ttl)
-        if acquired:
-            # Establish lease for distributed execution governance
-            await self._establish_lease(order_key, ttl)
-            await self._record_ownership(order_key)
-        return bool(acquired)
+        try:
+            acquired = await self.redis.set(lock_key, self.instance_id, nx=True, ex=ttl)
+            if acquired:
+                # Establish lease for distributed execution governance
+                try:
+                    await self._establish_lease(order_key, ttl)
+                    await self._record_ownership(order_key)
+                except Exception:
+                    pass  # Lease/ownership tracking failure is non-fatal
+            return bool(acquired)
+        except Exception as e:
+            logger.warning(f"OrderTracker.acquire_lock failed (Redis unavailable?): {e}")
+            return False
+
 
     async def acquire_lease(self, order_key: str, ttl: Optional[int] = None) -> bool:
         """
