@@ -1,0 +1,346 @@
+{
+  "checkpoints": [
+    {
+      "label": "BASELINE (t=0s)",
+      "timestamp": "2026-05-22T11:49:21.860184+00:00",
+      "scout_signals_total": 0,
+      "by_source": {},
+      "unknown_sources": 0,
+      "debug_log_total": 0,
+      "debug_by_table": {},
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=300s (5m0s)",
+      "timestamp": "2026-05-22T11:54:21.886621+00:00",
+      "scout_signals_total": 65,
+      "by_source": {
+        "regime_scout/regime": 40,
+        "liquidity_scout/liquidity": 24,
+        "correlation_scout/correlation": 1
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 65,
+      "debug_by_table": {
+        "market_regime_memory/OK": 40,
+        "liquidity_intelligence/OK": 24,
+        "correlation_memory/OK": 1
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=600s (10m0s)",
+      "timestamp": "2026-05-22T11:59:21.927932+00:00",
+      "scout_signals_total": 122,
+      "by_source": {
+        "regime_scout/regime": 80,
+        "liquidity_scout/liquidity": 40,
+        "correlation_scout/correlation": 2
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 122,
+      "debug_by_table": {
+        "market_regime_memory/OK": 80,
+        "liquidity_intelligence/OK": 40,
+        "correlation_memory/OK": 2
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=900s (15m0s)",
+      "timestamp": "2026-05-22T12:04:21.971091+00:00",
+      "scout_signals_total": 187,
+      "by_source": {
+        "regime_scout/regime": 120,
+        "liquidity_scout/liquidity": 64,
+        "correlation_scout/correlation": 3
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 187,
+      "debug_by_table": {
+        "market_regime_memory/OK": 120,
+        "liquidity_intelligence/OK": 64,
+        "correlation_memory/OK": 3
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=1200s (20m0s)",
+      "timestamp": "2026-05-22T12:09:22.068913+00:00",
+      "scout_signals_total": 244,
+      "by_source": {
+        "regime_scout/regime": 160,
+        "liquidity_scout/liquidity": 80,
+        "correlation_scout/correlation": 4
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 244,
+      "debug_by_table": {
+        "market_regime_memory/OK": 160,
+        "liquidity_intelligence/OK": 80,
+        "correlation_memory/OK": 4
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=1500s (25m0s)",
+      "timestamp": "2026-05-22T12:14:22.213938+00:00",
+      "scout_signals_total": 309,
+      "by_source": {
+        "regime_scout/regime": 200,
+        "liquidity_scout/liquidity": 104,
+        "correlation_scout/correlation": 5
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 309,
+      "debug_by_table": {
+        "market_regime_memory/OK": 200,
+        "liquidity_intelligence/OK": 104,
+        "correlation_memory/OK": 5
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=1800s (30m0s)",
+      "timestamp": "2026-05-22T12:19:22.379243+00:00",
+      "scout_signals_total": 366,
+      "by_source": {
+        "regime_scout/regime": 240,
+        "liquidity_scout/liquidity": 120,
+        "correlation_scout/correlation": 6
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 366,
+      "debug_by_table": {
+        "market_regime_memory/OK": 240,
+        "liquidity_intelligence/OK": 120,
+        "correlation_memory/OK": 6
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=2100s (35m0s)",
+      "timestamp": "2026-05-22T12:24:22.536306+00:00",
+      "scout_signals_total": 431,
+      "by_source": {
+        "regime_scout/regime": 280,
+        "liquidity_scout/liquidity": 144,
+        "correlation_scout/correlation": 7
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 431,
+      "debug_by_table": {
+        "market_regime_memory/OK": 280,
+        "liquidity_intelligence/OK": 144,
+        "correlation_memory/OK": 7
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=2400s (40m0s)",
+      "timestamp": "2026-05-22T12:29:22.713738+00:00",
+      "scout_signals_total": 488,
+      "by_source": {
+        "regime_scout/regime": 320,
+        "liquidity_scout/liquidity": 160,
+        "correlation_scout/correlation": 8
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 488,
+      "debug_by_table": {
+        "market_regime_memory/OK": 320,
+        "liquidity_intelligence/OK": 160,
+        "correlation_memory/OK": 8
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=2700s (45m0s)",
+      "timestamp": "2026-05-22T12:34:22.798961+00:00",
+      "scout_signals_total": 545,
+      "by_source": {
+        "regime_scout/regime": 352,
+        "liquidity_scout/liquidity": 184,
+        "correlation_scout/correlation": 9
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 545,
+      "debug_by_table": {
+        "market_regime_memory/OK": 353,
+        "liquidity_intelligence/OK": 184,
+        "correlation_memory/OK": 9
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=3001s (50m1s)",
+      "timestamp": "2026-05-22T12:39:22.914678+00:00",
+      "scout_signals_total": 602,
+      "by_source": {
+        "regime_scout/regime": 392,
+        "liquidity_scout/liquidity": 200,
+        "correlation_scout/correlation": 10
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 602,
+      "debug_by_table": {
+        "market_regime_memory/OK": 392,
+        "liquidity_intelligence/OK": 200,
+        "correlation_memory/OK": 10
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=3301s (55m1s)",
+      "timestamp": "2026-05-22T12:44:23.023827+00:00",
+      "scout_signals_total": 667,
+      "by_source": {
+        "regime_scout/regime": 432,
+        "liquidity_scout/liquidity": 224,
+        "correlation_scout/correlation": 11
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 667,
+      "debug_by_table": {
+        "market_regime_memory/OK": 432,
+        "liquidity_intelligence/OK": 224,
+        "correlation_memory/OK": 11
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=3601s (60m1s)",
+      "timestamp": "2026-05-22T12:49:23.134750+00:00",
+      "scout_signals_total": 724,
+      "by_source": {
+        "regime_scout/regime": 472,
+        "liquidity_scout/liquidity": 240,
+        "correlation_scout/correlation": 12
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 724,
+      "debug_by_table": {
+        "market_regime_memory/OK": 472,
+        "liquidity_intelligence/OK": 240,
+        "correlation_memory/OK": 12
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "FINAL (post-shutdown)",
+      "timestamp": "2026-05-22T12:49:29.736899+00:00",
+      "scout_signals_total": 724,
+      "by_source": {
+        "regime_scout/regime": 472,
+        "liquidity_scout/liquidity": 240,
+        "correlation_scout/correlation": 12
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 724,
+      "debug_by_table": {
+        "market_regime_memory/OK": 472,
+        "liquidity_intelligence/OK": 240,
+        "correlation_memory/OK": 12
+      },
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    }
+  ],
+  "final_score": "4/10",
+  "certified": false,
+  "criteria": {
+    "1. Zero unknown scout sources": true,
+    "2. Scout signals actively generated": true,
+    "3. Source-level attribution works (>=4 sources)": false,
+    "4. Trust evolves independently per source": false,
+    "5. Entropy calculations meaningful": false,
+    "6. Scouts materially influence organism": false,
+    "7. Attribution chains replay-safe (pipeline clean exit)": true,
+    "8. No scout identity corruption (zero unknown)": true,
+    "9. Economic attribution measurable (debug + trust active)": false,
+    "10. Epistemic memory developing (trust + debug + entropy active)": false
+  }
+}

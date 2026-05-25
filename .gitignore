@@ -22,3 +22,5 @@ demo.txt
 pre_day6_temporal_backup.sql
 *_backup.sql
 *.dump
+# Added by code-review-graph
+.code-review-graph/

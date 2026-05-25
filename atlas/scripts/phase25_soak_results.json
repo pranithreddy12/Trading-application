@@ -1,0 +1,81 @@
+{
+  "checkpoints": [
+    {
+      "label": "BASELINE (t=0s)",
+      "timestamp": "2026-05-22T11:33:43.420657+00:00",
+      "scout_signals_total": 4,
+      "by_source": {
+        "correlation_scout/correlation": 1,
+        "execution_scout/execution": 1,
+        "liquidity_scout/liquidity": 1,
+        "regime_scout/regime": 1
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 0,
+      "debug_by_table": {},
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "t=300s (5m0s)",
+      "timestamp": "2026-05-22T11:38:43.460898+00:00",
+      "scout_signals_total": 4,
+      "by_source": {
+        "correlation_scout/correlation": 1,
+        "execution_scout/execution": 1,
+        "liquidity_scout/liquidity": 1,
+        "regime_scout/regime": 1
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 0,
+      "debug_by_table": {},
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    },
+    {
+      "label": "FINAL (post-shutdown)",
+      "timestamp": "2026-05-22T11:38:43.476911+00:00",
+      "scout_signals_total": 4,
+      "by_source": {
+        "correlation_scout/correlation": 1,
+        "execution_scout/execution": 1,
+        "liquidity_scout/liquidity": 1,
+        "regime_scout/regime": 1
+      },
+      "unknown_sources": 0,
+      "debug_log_total": 0,
+      "debug_by_table": {},
+      "trust_scores": {},
+      "external_sources": {},
+      "strategies_5min": 0,
+      "paper_trades_5min": 0,
+      "scout_poison_quarantine": 0,
+      "scout_quarantine": 0,
+      "contradiction_events": 0
+    }
+  ],
+  "final_score": "4/10",
+  "certified": false,
+  "criteria": {
+    "1. Zero unknown scout sources": true,
+    "2. Scout signals actively generated": true,
+    "3. Source-level attribution works (>=4 sources)": true,
+    "4. Trust evolves independently per source": false,
+    "5. Entropy calculations meaningful": false,
+    "6. Scouts materially influence organism": false,
+    "7. Attribution chains replay-safe (pipeline clean exit)": false,
+    "8. No scout identity corruption (zero unknown)": true,
+    "9. Economic attribution measurable (debug + trust active)": false,
+    "10. Epistemic memory developing (trust + debug + entropy active)": false
+  }
+}

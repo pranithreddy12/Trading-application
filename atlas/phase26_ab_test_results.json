@@ -1,0 +1,77 @@
+{
+  "test_a_baseline": {
+    "archetype_distribution": {
+      "trend_following": 39,
+      "volatility_regime": 41,
+      "momentum": 49,
+      "mean_reversion": 40,
+      "breakout": 31
+    },
+    "archetype_entropy": 2.307,
+    "avg_aggression": 1.0,
+    "min_aggression": 1.0,
+    "max_aggression": 1.0,
+    "timeframe_distribution": {
+      "1m": 200
+    },
+    "n_strategies": 200
+  },
+  "test_b_bullish": {
+    "archetype_distribution": {
+      "trend_following": 57,
+      "breakout": 59,
+      "volatility_regime": 25,
+      "momentum": 49,
+      "mean_reversion": 10
+    },
+    "archetype_entropy": 2.1239,
+    "avg_aggression": 1.0,
+    "min_aggression": 1.0,
+    "max_aggression": 1.0,
+    "timeframe_distribution": {
+      "1m": 200
+    },
+    "n_strategies": 200
+  },
+  "test_b_high_entropy": {
+    "archetype_distribution": {
+      "volatility_regime": 78,
+      "breakout": 17,
+      "trend_following": 30,
+      "mean_reversion": 60,
+      "momentum": 15
+    },
+    "archetype_entropy": 2.044,
+    "avg_aggression": 0.2,
+    "min_aggression": 0.2,
+    "max_aggression": 0.2,
+    "timeframe_distribution": {
+      "5m": 200
+    },
+    "n_strategies": 200
+  },
+  "test_b_trending": {
+    "archetype_distribution": {
+      "mean_reversion": 36,
+      "breakout": 38,
+      "momentum": 37,
+      "volatility_regime": 47,
+      "trend_following": 42
+    },
+    "archetype_entropy": 2.3147,
+    "avg_aggression": 1.1,
+    "min_aggression": 1.1,
+    "max_aggression": 1.1,
+    "timeframe_distribution": {
+      "1m": 200
+    },
+    "n_strategies": 200
+  },
+  "verdicts": [
+    "[WARN] Momentum not boosted in bullish: 24.5% -> 24.5%",
+    "[PASS] Entropy reduces aggression: 1.000 -> 0.200",
+    "[PASS] High entropy shifts to slower timeframes: 200/200",
+    "[PASS] Archetype entropy changes: delta=0.2630"
+  ],
+  "timestamp": "2026-05-23T11:39:03.629896+00:00"
+}

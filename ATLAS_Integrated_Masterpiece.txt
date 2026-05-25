@@ -1,0 +1,450 @@
+4: ATLAS
+6: Autonomous Trading & Learning Agent System
+7: Integrated Technical Specification & Project Engagement
+10: ────────────────────────────────────────────────────────────────────────────────
+12: Shah Quantum Fund
+13: Document Classification: Confidential — Proprietary & Trade Secret
+14: Document ID: SQF-ATLAS-2026-001
+15: Version: 2.0 — Integrated Edition
+16: Date: April 19, 2026
+17: Prepared by: Amit Bhosla, Head of Data Science
+18: Issued to: Senior Engineer & Engineer (Contractors)
+22: This document contains proprietary information belonging to Shah Quantum Fund.
+Unauthorized reproduction, distribution, or disclosure is strictly prohibited.
+24: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+26: Table of Contents
+27: ────────────────────────────────────────────────────────────────────────────────
+28: Section I  —  Executive Summary
+29: Section II  —  Project Engagement Terms
+30: Section III  —  System Architecture — ATLAS Overview
+31: Section IV  —  Layer 1 — Data Ingestion, Order Flow & Enrichment
+32: Section V  —  Layer 2 — Strategy Generation Engine
+33: Section VI  —  The Scout Network — External Intelligence
+34: Section VII  —  Layer 3 — Backtesting & Validation Pipeline
+35: Section VIII  —  Layer 4 — Risk Management & Kill-Switch Framework
+36: Section IX  —  Layer 5 — Execution Layer & Multi-Broker Integration
+37: Section X  —  Layer 6 — Copy Trading & Fidelity Monitoring System
+38: Section XI  —  Layer 7 — Meta-Learning, Self-Improvement & Data Backend
+39: Section XII  —  Cross-Level Communication Architecture
+40: Section XIII  —  Dashboard Specifications & API Schema
+41: Section XIV  —  Cloud Infrastructure & Cost Model
+42: Section XV  —  Development Timeline & Milestones
+43: Section XVI  —  Claude Console Integration Plan
+44: Section XVII  —  Team, Coordination & Access Protocol
+45: Section XVIII  —  Deliverable Acceptance Criteria
+46: Section XIX  —  Intellectual Property & Confidentiality Agreement
+47: Section XX  —  General Terms & Conditions
+48: Section XXI  —  Execution & Signatures
+49: Section A  —  Appendix A — Project Summary (One Page)
+50: Section B  —  Appendix B — Founder Pre-Start Checklist
+51: Section C  —  Appendix C — Infrastructure Cost Detail
+52: Section D  —  Appendix D — Agent Registry Schema
+54: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+56: Section I — Executive Summary
+57: ────────────────────────────────────────────────────────────────────────────────
+58: Shah Quantum Fund ('SQF' or 'the Fund') is commissioning the design and construction of ATLAS — the Autonomous Trading & Learning Agent System — a production-grade, self-improving, multi-agent trading infrastructure operating across five asset classes: US equities, US options, US futures, cryptocurrency, and foreign exchange, with a sixth division for prediction markets.
+59: ATLAS is not a trading bot. It is an organism of 90+ specialized AI agents organized in seven operational layers plus a Scout Network, coordinated by a Meta-Orchestrator, with a self-improvement loop that makes the system measurably better every day it operates. The system ingests data from the fastest and most granular sources available — including Level 2 market data and order flow — stores, enriches, and enhances that data, triggers strategy entries and exits in real time, generates novel strategies autonomously, validates them with institutional-grade rigor, and feeds all outputs into a growing data backend designed to train machine learning models at scale.
+60: The target: produce thousands of validated strategies by year-end, with the top performers deployed to live capital. The compounding data advantage ATLAS accumulates daily makes the system uncatchable after six months of operation.
+62: System Census
+64: This document serves as the complete specification, project engagement terms, and binding agreement. Upon execution by both parties, it authorizes commencement of work.
+65: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+67: Section II — Project Engagement Terms
+68: ────────────────────────────────────────────────────────────────────────────────
+69: 2.1  Parties
+70: Client: Shah Quantum Fund ('SQF'), represented by Amit Bhosla, Head of Data Science.
+71: Contractors: Senior Engineer and Engineer (collectively 'the Contractors').
+72: 2.2  Rate Structure
+73: 2.3  Project Duration
+74: Preferred completion: 5 working days (April 21–25, 2026).
+75: Estimated completion: up to 7 working days (April 21–29, 2026).
+76: Start date: Monday, April 21, 2026 or Tuesday, April 22, 2026, contingent on Contractor availability and receipt of signed agreement and access credentials.
+77: 2.4  Project Cost
+78: 2.5  Performance Bonus
+79: 2.6  Total Engagement Value
+80: 2.7  Payment Schedule & Method
+81: Payment 1 — 50% of base cost: payable upon commencement of Day 1. Processed via Fiverr platform for transactional security and escrow protection.
+82: Payment 2 — remaining 50% of base cost: payable upon written acceptance of all deliverables (per Section XVIII). Transferred directly to the Contractors' PKR bank account.
+83: Performance bonus (if earned): payable within 3 business days of deliverable acceptance, via PKR bank transfer.
+84: The Fiverr transaction serves as the initial trust mechanism. Upon successful completion and payment of the second installment via bank transfer, the working relationship transitions to direct engagement for any future work.
+85: 2.8  Additional Developer Option
+86: If the Contractors determine that adding a third developer (junior tier) would accelerate delivery, they may propose this to SQF's Head of Data Science. Rate: $15–20/hr (PKR 4,170–5,560/hr). Approval required before engagement. Budget adjusted proportionally.
+87: 2.9  Full-Time Employment Pathway
+88: Upon system profitability — defined as three or more ATLAS-generated strategies producing net positive P&L over a 30-calendar-day live trading period — SQF will initiate full-time employment discussions with both Contractors. Terms to be negotiated separately.
+89: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+91: Section III — ATLAS System Architecture
+92: ────────────────────────────────────────────────────────────────────────────────
+93: 3.1  Architecture Philosophy
+94: ATLAS is built on five architectural principles that govern every design decision in this document.
+96: Principle 1 — Agents Communicate Across Levels, Not Just Within
+97: Every agent has both vertical outputs (to the next layer in the pipeline) and horizontal outputs (to agents in other layers that benefit from its signal). A Data Collector does not merely hand data to a Feature Engineer — it simultaneously signals Strategy Ideators when anomalies appear, and alerts Risk Controllers when data feeds degrade. This cross-level mesh creates compound intelligence: the output of the whole system exceeds the sum of individual agents.
+99: Principle 2 — Agents Spawn Agents
+100: The Meta-Orchestrator does not manage a fixed roster. When backtest volume exceeds capacity, it spawns additional Backtest Runner instances. When a new asset class is added, it spawns the corresponding Data Collectors, Feature Engineers, and Ideators automatically. The system scales by multiplication, not by manual configuration.
+102: Principle 3 — The Data Backend Is a First-Class Product
+103: Every data point ATLAS touches — raw market data, enhanced features, strategy performance, agent behavior, validation results, execution quality, scout intelligence — is stored, indexed, and available for ML training. The data backend is not an afterthought; it is one of the system's three primary outputs alongside trading P&L and strategy generation. Within 12 months, this database will be the largest proprietary repository of enhanced, quality-verified trading data and strategy performance data in existence. It is the fuel for machine learning models that will compound ATLAS's advantage indefinitely.
+105: Principle 4 — Every Layer Self-Improves
+106: Self-improvement is not limited to the Meta-Learning layer. Every layer feeds performance data back to its own agents and to the Meta-Learner. Data Collectors track their own latency and accuracy. Ideators track which hypothesis patterns produce validated strategies. Validators track their false-positive and false-negative rates. Execution agents track slippage and optimize routing. The entire system is a learning organism, not a static pipeline.
+108: Principle 5 — Security Through Lifecycle Management
+109: Agents that operate on trader laptops (the Fidelity Monitoring Agents) follow strict lifecycle rules: they activate at market open, monitor during trading hours, and are killed at market close. Only the cloud-based data feed agent persists overnight, collecting news and pre-market data to generate opening hypotheses. This architecture ensures that no sensitive trading data persists on local machines outside of active trading hours.
+111: 3.2  System Layer Diagram
+112: Text-based architecture diagram. Contractors should reproduce this as an interactive visualization on Day 1.
+114: ┌─────────────────────────────────────────────────────────────────────────┐
+115: │                      META-ORCHESTRATOR (L7-MO-01)                      │
+116: │         Coordinates all agents · Spawns/kills · Allocates compute      │
+117: │         Produces system reports · Manages agent lifecycle              │
+118: └──────────┬──────────────────────────────────────────────────┬──────────┘
+119:            │                                                  │           
+120: ┌──────────▼──────────┐                          ┌───────────▼──────────┐
+121: │   SCOUT NETWORK     │──── External Hypotheses ──▶│  L2 STRATEGY GEN    │
+122: │  9 agents           │                           │  14 agents           │
+123: │  YouTube · Discord  │                           │  7 Ideators          │
+124: │  Telegram · Twitter │                           │  4 Builders          │
+125: │  Reddit · Instagram │                           │  3 Researchers       │
+126: │  Upwork · Kaggle    │                           │                      │
+127: │  Competitions       │                           │  ┌──────────────┐    │
+128: └─────────────────────┘                           │  │ Mad Scientist │    │
+129:                                                   │  │ Mode: ON      │    │
+130: ┌─────────────────────┐                           │  └──────────────┘    │
+131: │  L1 DATA INGESTION  │─── Features + Signals ───▶│                      │
+132: │  22 agents          │                           └──────────┬───────────┘
+133: │  Level 2 + OrdFlow  │                                      │            
+134: │  6 Market Collectors│                           ┌──────────▼───────────┐
+135: │  5 Intel Collectors │                           │  L3 BACKTESTING      │
+136: │  7 Feature Engineers│                           │  12 agents           │
+137: │  4 Quality Monitors │                           │  6 Runners           │
+138: │                     │                           │  6 Validators        │
+139: │  ┌───────────────┐  │                           └──────────┬───────────┘
+140: │  │ ENHANCED DATA │  │                                      │            
+141: │  │ BACKEND (ML)  │◀─┼──── All layers feed data ────────────┤            
+142: │  └───────────────┘  │                           ┌──────────▼───────────┐
+143: └─────────────────────┘                           │  L4 RISK MGMT       │
+144:                                                   │  8 agents            │
+145: ┌─────────────────────┐                           │  ┌──────────────┐    │
+146: │  L6 COPY TRADING    │                           │  │ KILL SWITCH  │    │
+147: │  + FIDELITY MONITOR │                           │  │ (Supreme)    │    │
+148: │  7 agents           │                           │  └──────────────┘    │
+149: │  API/Screen/Signal  │                           └──────────┬───────────┘
+150: │  Fidelity Laptop    │                                      │            
+151: │  Agents (lifecycle  │                           ┌──────────▼───────────┐
+152: │  managed: killed    │                           │  L5 EXECUTION        │
+153: │  at market close)   │◀── Mirror ────────────────│  11 agents           │
+154: └─────────────────────┘                           │  Multi-broker        │
+155:                                                   │  Smart routing       │
+156: ┌─────────────────────┐                           └──────────────────────┘
+157: │  L7 META-LEARNING   │                                                   
+158: │  10 agents          │◀──── All layers feed performance data ────────────
+159: │  Self-improvement   │                                                   
+160: │  Daily Intel Brief  │                                                   
+161: │  ML Data Pipeline   │                                                   
+162: └─────────────────────┘                                                   
+164: ▸  The diagram above is the nervous system. Every arrow is a real data flow. Every box is a cluster of agents. The Contractors' first task on Day 1 is to reproduce this as an interactive Miro board or equivalent, with every agent as a clickable node showing its status, inputs, outputs, and cross-level connections.
+165: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+167: Section IV — Layer 1: Data Ingestion, Order Flow & Enrichment
+168: ────────────────────────────────────────────────────────────────────────────────
+169: 22 agents. The sensory system. Everything ATLAS knows about the world flows through this layer. The quality, speed, and granularity of data ingestion determines the ceiling of every other layer.
+170: 4.1  Design Imperative: Level 2 & Order Flow First
+171: ATLAS is not built on delayed OHLCV bars. The primary data sources are Level 2 market data (full order book depth) and order flow (time & sales, trade prints, volume at price). These are the fastest and most accurate representations of market state available to non-HFT participants. All other data sources (OHLCV, news, sentiment, macro) are supplementary.
+172: ⚠  Level 2 and order flow data generate significantly higher data volumes than OHLCV. TimescaleDB hypertable partitioning and Redis hot-layer caching are essential to prevent the database from becoming the bottleneck. Size the infrastructure accordingly — see Section XIV.
+174: 4.2  Market Data Collectors (7 agents)
+175: 4.3  Intelligence Collectors (5 agents)
+176: 4.4  Feature Engineers (6 agents)
+177: ▸  L1-FE-06 (Pattern Recognition Engine) is a critical addition. This agent does not compute known indicators — it runs unsupervised anomaly detection and statistical pattern recognition across the full enriched feature set, looking for structures that no predefined indicator would capture. These are fed to the Strategy Ideators as raw alpha signals alongside traditional features. This is the 'enhanced data feeding pattern recognition for entries and exits' you specified.
+178: 4.5  Data Quality & Monitoring (4 agents)
+179: Layer 1 Total: 22 agents. Scaling: +1 Collector per new data source, +1 Feature Engineer per new feature category, +1 Pattern Recognition variant per asset class.
+180: 4.6  The Enhanced Data Backend (ML Training Store)
+181: Every data point that enters L1 — raw, enriched, and enhanced — is stored in a purpose-built backend designed for future ML model training. This is not a log archive. It is a structured, indexed, queryable data warehouse that will become the most valuable asset ATLAS produces after trading P&L itself.
+182: Raw market data: Level 2 snapshots, order flow, OHLCV (all timeframes), options chains, futures term structure — partitioned by date and symbol in TimescaleDB hypertables.
+183: Enhanced features: the full 400+ feature library, computed and stored at every timestep, in PostgreSQL + Redis.
+184: Strategy performance: every strategy hypothesis, its code, backtest results, validation outcomes, paper/live P&L — all linked to the market conditions at the time. This is the training data for 'what strategies work in what regimes.'
+185: Agent behavior: every agent action, decision, and error — linked to outcomes. This is the training data for 'what agent behaviors correlate with profitability.'
+186: Scout intelligence: every external hypothesis sourced, its origin, its validation outcome. This is the training data for 'which external sources produce real alpha.'
+187: Execution data: every order, fill, slippage measurement, latency — linked to market conditions at execution time. This is the training data for 'optimal execution under different conditions.'
+189: Schema design: star schema with fact tables (trades, signals, features, agent_events) and dimension tables (strategies, agents, instruments, regimes). Optimized for analytical queries and batch ML training jobs. See Appendix D for full schema.
+190: ⚠  Data volume estimate: with Level 2 + order flow for 200+ US equities, ATLAS will generate approximately 50-100 GB of raw data per trading day. TimescaleDB compression (typically 10-20x) reduces storage needs, but the infrastructure must be sized accordingly. Budget for 2 TB storage in Month 1, scaling to 10 TB by Month 6.
+191: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+193: Section V — Layer 2: Strategy Generation Engine
+194: ────────────────────────────────────────────────────────────────────────────────
+195: 14 agents. The creative engine. Where alpha is born. This is the layer that must 'think like a mad scientist' — aggressive exploration of every possible edge, combined with mathematical rigor in risk parameterization. The philosophy: everything is possible until proven otherwise by data. But every hypothesis is tested with uncompromising statistical discipline before a single dollar is deployed.
+196: 5.1  Strategy Ideators (7 agents)
+197: Each Ideator specializes in one asset class or strategy archetype, receives the full feature library plus Pattern Recognition signals from L1, external hypotheses from the Scout Network, and failure/success patterns from the Meta-Learner.
+198: The 'Mad Scientist' Protocol
+199: Each Ideator agent is configured with an aggressive exploration mandate:
+200: Temperature: set high (0.9-1.0) for initial hypothesis generation — explore widely.
+201: Constraint: every hypothesis must include explicit mathematical risk parameters (stop loss, position size formula, max drawdown limit, regime filter). Creativity in signal; discipline in risk.
+202: Volume target: each Ideator produces 10-20 hypotheses per day. Across 7 Ideators, that is 70-140 hypotheses daily, 500-1,000 weekly.
+203: Mutation integration: every 5th hypothesis is a deliberate mutation of a previously validated strategy — change one parameter, one filter, one universe constraint, and re-test.
+204: Failure analysis: every Ideator receives a daily feed from L7 of the top 10 failure patterns from yesterday's rejected strategies. The prompt: 'Do not generate strategies that would fail for these reasons.'
+205: ▸  The 'mad scientist' approach works because the cost of generating a bad hypothesis is near-zero (one Claude API call, ~$0.01-0.05). The cost of missing a profitable strategy is infinite opportunity cost. Generate aggressively, validate ruthlessly.
+206: 5.2  Strategy Builders (4 agents)
+207: 5.3  Research Agents (3 agents)
+208: 5.4  Generation Volume Targets
+209: Validation pass rate is intentionally 10-15%. Most generated strategies SHOULD fail. The value is in the survivors. Volume is the strategy.
+210: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+212: Section VI — The Scout Network
+213: ────────────────────────────────────────────────────────────────────────────────
+214: 9 agents. ATLAS does not only learn from price data. The Scout Network monitors every surface where trading alpha might be discussed, shared, or inadvertently revealed — extracting testable hypotheses and feeding them into the Strategy Generation Engine at speed.
+215: Every Scout agent feeds into the L2 Strategy Ideators via a standardized External Hypothesis Queue. The queue is prioritized by source reliability score — a score the Meta-Learner maintains and updates based on historical validation rates per source.
+216: ▸  The Scout Network is ATLAS's information advantage. No competing quant firm systematically mines YouTube transcripts, Discord signals, Telegram calls, and freelancer proposals for testable alpha. Every hypothesis costs near-zero to test. The upside of finding one profitable strategy from an unlikely source compounds forever.
+217: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+219: Section VII — Layer 3: Backtesting & Validation
+220: ────────────────────────────────────────────────────────────────────────────────
+221: 12 agents. The adversary layer. Their singular purpose: break strategies before capital does.
+222: Minimum Passing Criteria
+223: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+225: Section VIII — Layer 4: Risk Management & Kill Switch
+226: ────────────────────────────────────────────────────────────────────────────────
+227: 8 agents. The immune system. Non-negotiable. The Kill Switch has supreme authority — no agent in the system can override it.
+228: ⚠  The Kill Switch runs independently on a separate process. It cannot be paused, modified, or overridden by any other agent including the Meta-Orchestrator. Only a named human (Head of Data Science) can restart trading after a kill-switch activation, via authenticated API call with 2FA.
+229: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+231: Section IX — Layer 5: Execution (Multi-Broker)
+232: ────────────────────────────────────────────────────────────────────────────────
+233: 11 agents. Precise, fast, accountable for every fill.
+234: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+236: Section X — Layer 6: Copy Trading & Fidelity Monitoring
+237: ────────────────────────────────────────────────────────────────────────────────
+238: 7 agents. Mirror human trader edge with machine precision. The Fidelity Monitoring Agent is a new addition — a specialized agent that lives on trader laptops during market hours, monitors every action, and is killed at market close for security.
+239: Fidelity Monitoring Agent — Detailed Specification
+240: The Fidelity Monitoring Agent (L6-FM-01) is the manual trading side's connection to ATLAS. One instance runs on each Fidelity trading laptop. Its responsibilities:
+241: Capture every order entry, fill, modification, and cancellation in real-time
+242: Cross-reference each trade against ATLAS's own data stream (Level 2 + order flow from L1) to identify whether the trade aligns with any ATLAS strategy signals
+243: Log all trading activity to the cloud backend for the Enhanced Data Store (feeding ML training)
+244: Monitor for compliance: position size limits, drawdown limits, unauthorized symbol trading
+245: Generate post-session trade journal automatically: every trade with entry/exit times, P&L, notes on market conditions
+246: Lifecycle Management (Security Protocol)
+247: PRE-MARKET: The Meta-Orchestrator spawns L6-FM-01 instances at 9:25 AM ET (5 minutes before market open). Each instance connects to its assigned laptop and begins monitoring.
+248: MARKET HOURS: Full monitoring active. All data streams live.
+249: POST-MARKET: At 4:05 PM ET (5 minutes after close), each L6-FM-01 instance uploads final session data to cloud, then self-terminates. No monitoring agent runs on any laptop outside market hours.
+250: OVERNIGHT: Only L6-FM-02 (cloud agent) persists. It collects overnight news, pre-market data, and generates the opening hypothesis document for the next trading day.
+251: NEXT MORNING: Meta-Orchestrator spawns fresh L6-FM-01 instances at 9:25 AM ET. Clean lifecycle. No stale state.
+252: ⚠  This lifecycle ensures no sensitive trading credentials or real-time position data persists on local machines outside market hours. All persistent data lives in the encrypted cloud backend only.
+253: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+255: Section XI — Layer 7: Meta-Learning & Self-Improvement
+256: ────────────────────────────────────────────────────────────────────────────────
+257: 10 agents. The brain. The layer that makes ATLAS better every day. This is the layer you make immortal — the compounding advantage that separates ATLAS from every static system.
+258: The Self-Improvement Compound Loop
+259: Every day ATLAS operates, it collects data that makes it better the next day. This is not aspirational — it is architectural. The specific feedback loops:
+260: Loop 1: Generation → Validation → Meta-Learner → Generation. Ideators learn which hypothesis patterns produce validated strategies. Daily update.
+261: Loop 2: Live Performance → Meta-Learner → Risk Adjustment. Risk parameters auto-adjust based on actual vs expected performance.
+262: Loop 3: Feature Importance → Feature Engineers → Ideators. The features that actually predict profitability get prioritized. Features that don't get deprecated.
+263: Loop 4: Agent Behavior → Agent Evaluator → Meta-Orchestrator. Agents that produce better outcomes get cloned. Agents that underperform get reconfigured or killed.
+264: Loop 5: Scout Reliability → Scout Prioritization. Sources that produce strategies that actually validate get higher priority in the External Hypothesis Queue.
+265: Loop 6: Execution Quality → Slippage Model → Backtesting. Real slippage data feeds back to make backtests more realistic, which makes validation more accurate, which makes live deployment less surprising.
+267: ▸  After 30 days of operation, ATLAS has 30 days of compound learning. After 90 days, no competitor starting from zero can catch up. After 180 days, the data moat is permanent. This is not about being smart on Day 1 — it is about being unchallengeable by Day 180.
+268: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+270: Section XII — Cross-Level Communication
+271: ────────────────────────────────────────────────────────────────────────────────
+272: Every agent communicates with agents in its own layer AND with agents in other layers. This mesh creates compound intelligence. Infrastructure:
+273: Redis Pub/Sub: real-time inter-agent signals (anomalies, regime shifts, risk events). Sub-millisecond.
+274: AWS SQS: queued work items (strategy specs → coding → backtesting). Guaranteed delivery, ordered.
+275: AWS SNS: broadcast notifications (kill switch, system alerts). Fan-out to all subscribers.
+276: Redis Streams: time-ordered event log for all inter-agent communications. Enables replay and debugging.
+277: WebSocket: live dashboard feeds (positions, trades, system health).
+278: PostgreSQL: persistent state and source of truth for all durable data.
+279: Adding a new agent requires only: (1) register with Meta-Orchestrator, (2) subscribe to relevant Redis channels, (3) publish to relevant SQS queues. No changes to existing agents.
+280: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+282: Section XIII — Dashboard Specifications
+283: ────────────────────────────────────────────────────────────────────────────────
+284: SQF's internal developer (Shakir) builds the frontend. The Contractors build the REST APIs and WebSocket feeds that serve data to the dashboards. If an additional developer is needed, SQF will provide one.
+285: Dashboard Views
+286: Key API Endpoints (Contractors Deliver)
+287: GET /api/system/health — all agent statuses, heartbeats, error counts
+288: GET /api/strategies/pipeline — funnel counts by stage
+289: GET /api/strategies/{id} — full strategy detail with backtest + live metrics
+290: GET /api/portfolio/positions — current positions with unrealized P&L
+291: GET /api/risk/status — portfolio-level risk state, kill-switch status
+292: GET /api/copy-trading/status — source trader activity, copy latency
+293: GET /api/fidelity-monitor/{laptop_id} — per-laptop trading activity
+294: GET /api/intelligence/brief — daily intelligence brief
+295: GET /api/scouts/performance — source reliability scores, hypothesis queue depth
+296: POST /api/strategies/{id}/promote — promote strategy (paper → live)
+297: POST /api/system/kill-switch — activate/deactivate (requires auth)
+298: WebSocket: ws://api/stream/positions, ws://api/stream/trades, ws://api/stream/system
+299: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+301: Section XIV — Cloud Infrastructure
+302: ────────────────────────────────────────────────────────────────────────────────
+303: Spot instances for batch backtesting reduce compute costs 60-70%. Region: us-east-1 for lowest latency to NYSE/NASDAQ.
+304: Future migration: execution layer moves to Mac Mini M4 Pro cluster (3 units) once proven in cloud. Cloud remains for generation, backtesting, meta-learning.
+305: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+307: Section XV — Development Timeline
+308: ────────────────────────────────────────────────────────────────────────────────
+309: Start: Monday, April 21, 2026 (or Tuesday, April 22). Preferred completion: 5 working days. Maximum: 7.
+310: Daily Coordination
+311: Daily standup: 15 min, 10:00 AM PKT
+312: EOD review: 30 min, 6:00 PM PKT — demo of day's deliverables
+313: Slack (primary), Zoom (reviews), WhatsApp (urgent)
+314: Code: private GitHub, all via PR, reviewed before merge
+315: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+317: Section XVI — Claude Console Integration
+318: ────────────────────────────────────────────────────────────────────────────────
+319: After Phase 1, SQF will build a parallel ATLAS variant using the Anthropic Claude Console for agent orchestration. This variant will test whether a fully Claude-native stack — using Claude as both reasoning engine and orchestration layer — outperforms the LangGraph-based Phase 1 architecture.
+320: Integration Options (Evaluate During Phase 1)
+321: Option A: Claude as Meta-Orchestrator replacement — Claude manages agent lifecycle via tool-use and multi-turn conversation, replacing the custom LangGraph orchestrator
+322: Option B: Claude as Strategy Ideator upgrade — replace the current Claude API calls in L2 Ideators with Claude Console's extended thinking and tool-use for deeper strategy reasoning
+323: Option C: Full Claude-native stack — both orchestration and reasoning via Claude Console, with LangGraph as fallback only
+324: The Contractors should architect Phase 1 with this integration in mind: modular agent interfaces that allow the orchestration layer to be swapped without touching individual agent code.
+325: If Claude integration into Phase 1 directly is feasible without impacting timeline, the Contractors should propose this during Day 1 standup. The Head of Data Science will approve or defer.
+326: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+328: Section XVII — Team & Access
+329: ────────────────────────────────────────────────────────────────────────────────
+330: Access Provisioned Before Day 1
+331: AWS IAM credentials (role-based)
+332: Anthropic API key (Claude Sonnet 4)
+333: OpenAI API key (GPT-4o backup)
+334: Polygon.io API key (Stocks + Crypto + Options)
+335: Binance API key (read-only + paper trading)
+336: Alpaca API key (paper trading)
+337: OANDA API key (demo account)
+338: Private GitHub repository
+339: Slack workspace invitation
+340: Physical Workspace
+341: SQF office in Karachi is available if the Contractors prefer in-person work. Remote equally acceptable.
+342: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+344: Section XVIII — Deliverable Acceptance
+345: ────────────────────────────────────────────────────────────────────────────────
+346: 23 deliverables. Each verified by Head of Data Science in the final review session.
+347: Acceptance process: final review session (~2 hrs). Items not meeting standard → 24-hr remediation. Written acceptance via Slack/email triggers final payment.
+348: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+350: Section XIX — Intellectual Property & Confidentiality
+351: ────────────────────────────────────────────────────────────────────────────────
+352: This section constitutes the binding Non-Disclosure and Intellectual Property Assignment Agreement.
+353: 19.1  Definitions
+354: 'Confidential Information' means all information disclosed by SQF or created during this engagement, including: trading strategies, generation methodologies, agent architectures, source code, data, algorithms, financial information, trader identities, account information, performance metrics, and any information marked or reasonably understood to be confidential.
+355: 'Work Product' means all code, documentation, designs, architectures, configurations, models, agents, and materials created during or in connection with this engagement.
+356: 19.2  Intellectual Property Assignment
+357: All Work Product is the sole and exclusive property of Shah Quantum Fund from the moment of creation. The Contractors irrevocably assign to SQF all right, title, and interest in all Work Product, including all intellectual property rights (patents, copyrights, trade secrets, trademarks).
+358: The Contractors retain no rights — express, implied, or otherwise — to use, modify, distribute, sublicense, sell, or exploit any Work Product after conclusion of this engagement.
+359: 19.3  Non-Disclosure
+360: The Contractors shall not, during or after this engagement:
+361: Disclose Confidential Information to any third party
+362: Use Confidential Information for any purpose other than this engagement
+363: Store Confidential Information on unapproved devices or systems
+364: Reverse-engineer or derive methodologies from the Work Product for external use
+365: These obligations survive termination: indefinitely for trade secrets, 5 years for other Confidential Information.
+366: 19.4  Non-Compete
+367: For 12 months following this engagement, the Contractors shall not build or consult on any AI-agent-based trading system substantially similar to ATLAS for any competing proprietary trading firm, hedge fund, or quantitative fund. General software, data, or AI work unrelated to agent-based trading systems is unrestricted.
+368: 19.5  Return of Materials
+369: Upon completion or termination, the Contractors shall immediately return or destroy all Confidential Information and Work Product, and certify in writing. This includes local copies, cloud storage, version control forks, backups, and derivatives.
+370: 19.6  Remedies
+371: Breach of this Section would cause irreparable harm for which monetary damages are inadequate. SQF is entitled to injunctive relief, specific performance, and any other equitable remedies, plus monetary damages.
+372: 19.7  Permitted Portfolio Reference
+373: The Contractors may state: 'Designed and built a multi-agent AI trading infrastructure for a proprietary quantitative fund.' They may NOT reference Shah Quantum Fund by name, disclose agent counts, describe agent types, reference strategies, or share code, screenshots, or architectural diagrams.
+374: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+376: Section XX — General Terms
+377: ────────────────────────────────────────────────────────────────────────────────
+378: 20.1  Independent Contractor
+379: This engagement creates an independent contractor relationship, not employment, partnership, or agency. Contractors are responsible for their own taxes and statutory obligations.
+380: 20.2  Termination
+381: Either party may terminate with 24 hours written notice. Upon termination: (a) SQF pays for all hours worked, (b) all Work Product assigns to SQF per Section 19.2, (c) all Confidential Information returned per 19.5. Sections 19 and 20.4 survive termination.
+382: 20.3  Warranties
+383: Contractors warrant that: (a) they have capacity to enter this agreement, (b) Work Product is original and does not infringe third-party IP, (c) no conflicting agreements prevent performance, (d) no open-source software incorporated without prior written SQF approval specifying license type.
+384: 20.4  Dispute Resolution
+385: Disputes resolved first through good-faith negotiation (30 days), then binding arbitration per Pakistan Centre for Dispute Resolution rules, in English, seated in Karachi.
+386: 20.5  Limitation of Liability
+387: SQF total liability: capped at total compensation paid. Contractor liability for breach of Section 19: unlimited.
+388: 20.6  Entire Agreement
+389: This document, together with the accompanying ATLAS Architecture addendum, constitutes the entire agreement. No oral modifications are effective unless written and signed by both parties.
+390: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+392: Section XXI — Execution & Signatures
+393: ────────────────────────────────────────────────────────────────────────────────
+394: By signing below, the parties acknowledge they have read, understood, and agree to all terms including the intellectual property and confidentiality obligations in Section XIX.
+396: Shah Quantum Fund
+397: ────────────────────────────────────────────────────────────────────────────────
+398: Name: _______________________________________________
+399: Title: Head of Data Science
+400: Date: _______________________________________________
+401: Signature: _______________________________________________
+403: Contractor — Senior Engineer
+404: ────────────────────────────────────────────────────────────────────────────────
+405: Full Legal Name: _______________________________________________
+406: CNIC / Passport No.: _______________________________________________
+407: Bank Account (for PKR transfers): _______________________________________________
+408: Date: _______________________________________________
+409: Signature: _______________________________________________
+411: Contractor — Engineer
+412: ────────────────────────────────────────────────────────────────────────────────
+413: Full Legal Name: _______________________________________________
+414: CNIC / Passport No.: _______________________________________________
+415: Bank Account (for PKR transfers): _______________________________________________
+416: Date: _______________________________________________
+417: Signature: _______________________________________________
+419: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+421: Appendix A — Project Summary
+422: ────────────────────────────────────────────────────────────────────────────────
+423: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+425: Appendix B — Founder Pre-Start Checklist
+426: ────────────────────────────────────────────────────────────────────────────────
+427: Non-technical. Simple. Complete all items before Monday April 21.
+428: Once all 17 items are checked, the Contractors have everything they need to begin. No further instructions from the Founder are required until the Day 5 final review.
+429: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+431: Appendix C — Infrastructure Cost Detail
+432: ────────────────────────────────────────────────────────────────────────────────
+433: Borne by SQF. Provided for Contractor cost-awareness during architecture decisions.
+434: See Section XIV for full breakdown. Total estimated monthly infrastructure: $2,845 (PKR 790,910). Primary cost drivers: compute ($1,050), LLM APIs ($550), market data ($400), databases ($525).
+435: Cost optimization levers: Spot instances for backtesting (saves 60-70%), aggressive TimescaleDB compression (10-20x on historical data), Claude API usage optimization (batch strategy generation vs real-time).
+436: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+438: Appendix D — Agent Registry Schema
+439: ────────────────────────────────────────────────────────────────────────────────
+440: -- Agent Registry: maintained by Meta-Orchestrator (L7-MO-01)
+441: CREATE TABLE agent_registry (
+442:   agent_id        VARCHAR(12) PRIMARY KEY,
+443:   agent_name      VARCHAR(100) NOT NULL,
+444:   layer           INT NOT NULL,
+445:   agent_type      VARCHAR(50) NOT NULL,
+446:   status          VARCHAR(20) DEFAULT 'spawning',
+447:   spawned_at      TIMESTAMP DEFAULT NOW(),
+448:   last_heartbeat  TIMESTAMP,
+449:   tasks_completed INT DEFAULT 0,
+450:   error_count     INT DEFAULT 0,
+451:   config_json     JSONB,
+452:   parent_id       VARCHAR(12),  -- NULL for originals, agent_id for clones
+453:   version         VARCHAR(20) NOT NULL,
+454:   host            VARCHAR(50),  -- 'cloud' | 'laptop-{id}' | 'mac-mini-{id}'
+455:   lifecycle       VARCHAR(20) DEFAULT 'persistent'  -- 'persistent' | 'market-hours-only'
+456: );
+458: -- Strategy Registry
+459: CREATE TABLE strategy_registry (
+460:   strategy_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+461:   name            VARCHAR(200) NOT NULL,
+462:   asset_class     VARCHAR(50) NOT NULL,
+463:   timeframe       VARCHAR(50),
+464:   status          VARCHAR(20) DEFAULT 'hypothesis',
+465:   created_at      TIMESTAMP DEFAULT NOW(),
+466:   author_agent    VARCHAR(12) REFERENCES agent_registry(agent_id),
+467:   spec_json       JSONB NOT NULL,
+468:   code_version    VARCHAR(50),
+469:   backtest_json   JSONB,
+470:   validation_json JSONB,
+471:   paper_metrics   JSONB,
+472:   live_metrics    JSONB,
+473:   promoted_at     TIMESTAMP,
+474:   retired_at      TIMESTAMP,
+475:   retirement_reason VARCHAR(200)
+476: );
+478: -- Enhanced Data Backend: example fact table
+479: CREATE TABLE fact_trades (
+480:   trade_id        BIGSERIAL PRIMARY KEY,
+481:   timestamp       TIMESTAMPTZ NOT NULL,
+482:   strategy_id     UUID REFERENCES strategy_registry,
+483:   agent_id        VARCHAR(12) REFERENCES agent_registry,
+484:   symbol          VARCHAR(20) NOT NULL,
+485:   direction       VARCHAR(5) NOT NULL,  -- 'long' | 'short'
+486:   quantity        DECIMAL NOT NULL,
+487:   entry_price     DECIMAL NOT NULL,
+488:   exit_price      DECIMAL,
+489:   pnl             DECIMAL,
+490:   slippage_bps    DECIMAL,
+491:   signal_time     TIMESTAMPTZ,
+492:   order_time      TIMESTAMPTZ,
+493:   fill_time       TIMESTAMPTZ,
+494:   broker          VARCHAR(50),
+495:   regime_at_entry JSONB,
+496:   features_at_entry JSONB
+497: );
+499: -- TimescaleDB hypertable for market data
+500: SELECT create_hypertable('market_data_l2', 'timestamp',
+501:   chunk_time_interval => INTERVAL '1 day',
+502:   partitioning_column => 'symbol');
+504: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001
+509: End of Document
+511: SQF-ATLAS-2026-001  ·  Version 2.0  ·  Integrated Edition  ·  April 19, 2026
+513: © 2026 Shah Quantum Fund. All rights reserved.
+515: CONFIDENTIAL  —  Shah Quantum Fund  —  Proprietary & Trade Secret  —  SQF-ATLAS-2026-001

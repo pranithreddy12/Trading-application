@@ -1,0 +1,197 @@
+{
+  "database_row_counts": {
+    "strategies": 1806,
+    "backtest_results": 1307,
+    "backtest_trades": 584606,
+    "lifecycle_events": 5641,
+    "event_store": 4457,
+    "audit_ledger": 5301,
+    "execution_log": 0,
+    "paper_trades": 1,
+    "positions": 0,
+    "copy_execution_log": 7,
+    "capital_allocation": 9,
+    "mutation_policy_state": 0,
+    "feature_importance": 22,
+    "drift_detection": 10,
+    "scout_signals": 0,
+    "external_scout_memory": 0,
+    "scout_quarantine": 0,
+    "failed_inserts": 53,
+    "pattern_memory": 2467,
+    "agent_registry": 0,
+    "system_logs": 3238
+  },
+  "database_total_rows": 608925,
+  "database_table_count": 21,
+  "backtest": {
+    "total": 1307,
+    "scored": 1307,
+    "avg_short_window_score": 35.0806,
+    "avg_sharpe": 0,
+    "avg_win_rate": 0.1922
+  },
+  "top_strategies": [
+    {
+      "name": "nvda_rsi_bb_vwap_breakout_v3",
+      "status": "failed_validation",
+      "score": 42.6,
+      "sharpe": 0,
+      "win_rate": 0.5296950240770465
+    },
+    {
+      "name": "breakout_equity_tmpl_155542",
+      "status": "failed_validation",
+      "score": 42.3,
+      "sharpe": 0,
+      "win_rate": 0.5294117647058824
+    },
+    {
+      "name": "breakout_equity_tmpl_154809",
+      "status": "failed_validation",
+      "score": 42.3,
+      "sharpe": 0,
+      "win_rate": 0.5294117647058824
+    },
+    {
+      "name": "breakout_crypto_tmpl_154810",
+      "status": "failed_validation",
+      "score": 42.0,
+      "sharpe": 0,
+      "win_rate": 0.523972602739726
+    },
+    {
+      "name": "nvda_volume_surge_momentum",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5299837925445705
+    },
+    {
+      "name": "nvda_volume_surge_momentum",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5299837925445705
+    },
+    {
+      "name": "btc_rsi_bb_meanrev_relaxed_v7",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5289982425307557
+    },
+    {
+      "name": "btc_rsi_bb_meanrev_relaxed_v6",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5289982425307557
+    },
+    {
+      "name": "btc_volregime_low_vol_rsi_vwap_v2",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5272727272727272
+    },
+    {
+      "name": "btc_rsi_bb_meanrev_relaxed_v6",
+      "status": "failed_validation",
+      "score": 41.9,
+      "sharpe": 0,
+      "win_rate": 0.5289982425307557
+    }
+  ],
+  "paper_trades": {
+    "buy": {
+      "count": 1,
+      "avg_price": 737.71,
+      "total_pnl": 0
+    }
+  },
+  "copy_execution_count": 7,
+  "total_pnl": 0.0,
+  "scout_signals_count": 0,
+  "scout_by_source": {},
+  "external_scout_memory_count": 0,
+  "scout_quarantine_count": 0,
+  "capital_allocation": {
+    "strategies_allocated": 50,
+    "total_allocation": 9.01
+  },
+  "event_store": {
+    "total": 4457,
+    "hashed": 4457
+  },
+  "audit_ledger": {
+    "total": 5301,
+    "hashed": 5301
+  },
+  "failed_inserts": 53,
+  "failed_inserts_breakdown": [
+    {
+      "table": "feature_importance",
+      "reason": "zero_rowcount",
+      "count": 2
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 28, 52, 306486, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 479dbfee-5c53-4bbb-b932-d16017f6e6c3: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v5>, line 31)', '{\"strategy_id\": \"479dbfee-5c53-4bbb-b932-d16017f6e6c3\", \"strategy_name\": \"btc_rsi_bb_meanrev_v5\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3984 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 13, 34, 98719, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 2d46cf4e-c9b4-4169-b0f5-6724a7a6c5ff: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_relaxed_v7>, line 31)', '{\"strategy_id\": \"2d46cf4e-c9b4-4169-b0f5-6724a7a6c5ff\", \"strategy_name\": \"btc_rsi_bb_meanrev_relaxed_v7\", \"error_type\": \"IndentationError\", \"error\":  ... (3988 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 3\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 15, 24, 522529, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 7b3dce28-a538-49a6-8e23-234b1a3082d3: IndentationError: unexpected indent (<strategy_btc_volregime_low_vol_rsi_vwap_v2>, line 32)', '{\"strategy_id\": \"7b3dce28-a538-49a6-8e23-234b1a3082d3\", \"strategy_name\": \"btc_volregime_low_vol_rsi_vwap_v2\", \"error_type\": \"IndentationError\", \"erro ... (4060 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 13, 54, 273192, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 36b3da32-6835-4c39-b059-ca5c1335cf2c: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v5>, line 31)', '{\"strategy_id\": \"36b3da32-6835-4c39-b059-ca5c1335cf2c\", \"strategy_name\": \"btc_rsi_bb_meanrev_v5\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3984 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 28, 2, 117517, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 7e634e30-4c34-4fe0-9fea-39d8d71c3ad7: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v5>, line 31)', '{\"strategy_id\": \"7e634e30-4c34-4fe0-9fea-39d8d71c3ad7\", \"strategy_name\": \"btc_rsi_bb_meanrev_v5\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3967 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 22, 8, 831320, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for fc09e1dd-12da-483a-9787-af22d95abc2d: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_relaxed_v6>, line 31)', '{\"strategy_id\": \"fc09e1dd-12da-483a-9787-af22d95abc2d\", \"strategy_name\": \"btc_rsi_bb_meanrev_relaxed_v6\", \"error_type\": \"IndentationError\", \"error\":  ... (3988 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 3\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 32, 2, 598372, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 41485fd0-49fa-4930-a9a1-999793c97f5c: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v6>, line 31)', '{\"strategy_id\": \"41485fd0-49fa-4930-a9a1-999793c97f5c\", \"strategy_name\": \"btc_rsi_bb_meanrev_v6\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3967 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 28, 52, 321508, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for e5e4d07d-1d77-4a84-9e1c-cce8f9f9b001: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v5>, line 30)', '{\"strategy_id\": \"e5e4d07d-1d77-4a84-9e1c-cce8f9f9b001\", \"strategy_name\": \"btc_rsi_bb_meanrev_v5\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3919 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 13, 34, 86043, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 4d4031f7-ea4c-4b23-b269-9af3264a23e2: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_relaxed_v7>, line 31)', '{\"strategy_id\": \"4d4031f7-ea4c-4b23-b269-9af3264a23e2\", \"strategy_name\": \"btc_rsi_bb_meanrev_relaxed_v7\", \"error_type\": \"IndentationError\", \"error\":  ... (3988 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    }
+  ],
+  "agent_lifecycle": {
+    "starts": 5641,
+    "stops": 0,
+    "crashes": 0,
+    "unique_agents": 13
+  },
+  "summary": {
+    "passed": 6,
+    "failed": 0,
+    "warnings": 2,
+    "total_checks": 8,
+    "soak_ready": true
+  }
+}
