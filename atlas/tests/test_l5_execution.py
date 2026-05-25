@@ -91,6 +91,7 @@ async def test_binance_quantity_precision_rounding(redis_client, db_client):
 
         await executor._process_signal(signal_data)
 
-        db_client.save_paper_trade.assert_called_once()
-
-        assert params["qty"] == 1.123457 # Expected to be rounded to 6 decimal places
+        db_client._execute_insert.assert_called_once()
+        call_args, call_kwargs = db_client._execute_insert.call_args
+        params = call_args[1] if len(call_args) > 1 else {}
+        assert params.get("qty", 0) == 1.123457 # Expected to be rounded to 6 decimal places

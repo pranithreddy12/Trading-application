@@ -31,7 +31,24 @@ def mock_db():
 @pytest.mark.asyncio
 async def test_kill_switch_persists_after_restart(mock_redis, mock_db):
     ks = KillSwitch(mock_redis, mock_db)
-    
+
+    # Set up async context manager for db_client.engine.begin() and connect()
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    # Mock result row with _mapping for _load_portfolio_risk_state
+    mock_row = MagicMock()
+    mock_row._mapping = {"halted": True, "reason": "restored from DB", "activated_at": None, "released_at": None}
+    mock_result = MagicMock()
+    mock_result.fetchone.return_value = mock_row
+    mock_conn.execute.return_value = mock_result
+    mock_engine = MagicMock()
+    # __aenter__/__aexit__ must be AsyncMock so they can be awaited
+    mock_engine.begin.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_engine.begin.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_engine.connect.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_engine.connect.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_db.engine = mock_engine
+
     with patch("atlas.agents.l4_risk.kill_switch.settings") as mock_settings, \
          patch("atlas.agents.l4_risk.kill_switch.aiohttp.ClientSession"):
         mock_settings.slack_webhook_url = "http://test"
@@ -46,6 +63,23 @@ async def test_kill_switch_persists_after_restart(mock_redis, mock_db):
 
 @pytest.mark.asyncio
 async def test_kill_switch_restores_state_on_startup(mock_redis, mock_db):
+    # Set up async context manager for db_client.engine.connect()
+    mock_conn = AsyncMock()
+    mock_conn.execute = AsyncMock()
+    # Mock result row with _mapping for _load_portfolio_risk_state
+    mock_row = MagicMock()
+    mock_row._mapping = {"halted": True, "reason": "restored from DB", "activated_at": None, "released_at": None}
+    mock_result = MagicMock()
+    mock_result.fetchone.return_value = mock_row
+    mock_conn.execute.return_value = mock_result
+    mock_engine = MagicMock()
+    # __aenter__/__aexit__ must be AsyncMock so they can be awaited
+    mock_engine.begin.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_engine.begin.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_engine.connect.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_engine.connect.return_value.__aexit__ = AsyncMock(return_value=None)
+    mock_db.engine = mock_engine
+    
     mock_redis.hget.side_effect = lambda key, field: b"1" if field == "active" else None
     mock_db.get_agent_metadata.return_value = {"active": True}
     

@@ -20,6 +20,9 @@ async def test_malformed_scout_signal():
             return False
         if not isinstance(sig.get("sentiment"), valid_schema["sentiment"]):
             return False
+        expected_keys = {"source", "sentiment"}
+        if set(sig.keys()) != expected_keys:
+            return False
         return True
 
     for sig in bad_signals:

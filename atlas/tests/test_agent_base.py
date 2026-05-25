@@ -50,7 +50,9 @@ async def test_heartbeat_writes_redis_keys(mock_redis):
     mock_redis.hset.assert_called_with(key, mapping={
         "status": "running",
         "layer": "L1",
-        "name": "TestAgent"
+        "name": "TestAgent",
+        "agent_type": "Dummy",
+        "advisory_only": "False",
     })
     mock_redis.expire.assert_called_with(key, 30)
     

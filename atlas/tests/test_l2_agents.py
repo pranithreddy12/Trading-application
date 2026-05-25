@@ -67,7 +67,18 @@ async def test_ideator_parses_valid_claude_json(
         mock_msg_instance = MockMsg.return_value
         mock_msg_instance.publish = AsyncMock()
 
-        spec, prompt, raw = await agent._generate_strategy({"BTC/USD": {"rsi": 50}})
+        context = {
+            "asset_class": "crypto",
+            "archetype": "momentum",
+            "market_snapshot": {"rsi": 50},
+            "regime": "neutral",
+            "failed_patterns": [],
+            "successful_patterns": [],
+            "recent_names": [],
+            "bars_available": {},
+            "primary_symbol": "BTC/USD",
+        }
+        spec, prompt, raw = await agent._generate_strategy(context)
 
         assert spec["strategy_name"] == "test_strat"
 
@@ -81,10 +92,21 @@ async def test_ideator_handles_malformed_json_with_retry(mock_redis, mock_db):
 
     agent.client.messages.create = AsyncMock(return_value=mock_message_invalid)
 
-    with patch("atlas.agents.l2_strategy.ideator_agent.MessagingClient") as MockMsg:
-        spec, prompt, raw = await agent._generate_strategy({"BTC/USD": {"rsi": 50}})
+    context = {
+        "asset_class": "crypto",
+        "archetype": "momentum",
+        "market_snapshot": {"rsi": 50},
+        "regime": "neutral",
+        "failed_patterns": [],
+        "successful_patterns": [],
+        "recent_names": [],
+        "bars_available": {},
+        "primary_symbol": "BTC/USD",
+    }
+    with patch("atlas.agents.l2_strategy.ideator_agent.MessagingClient"):
+        spec, prompt, raw = await agent._generate_strategy(context)
 
-        assert agent.client.messages.create.call_count == 1
+        assert agent.client.messages.create.call_count == 3
         assert spec["strategy_name"] is not None
 
 
@@ -97,9 +119,20 @@ async def test_ideator_gives_up_after_3_failures(mock_redis, mock_db):
 
     agent.client.messages.create = AsyncMock(return_value=mock_message_invalid)
 
-    spec, prompt, raw = await agent._generate_strategy({"BTC/USD": {"rsi": 50}})
+    context = {
+        "asset_class": "crypto",
+        "archetype": "momentum",
+        "market_snapshot": {"rsi": 50},
+        "regime": "neutral",
+        "failed_patterns": [],
+        "successful_patterns": [],
+        "recent_names": [],
+        "bars_available": {},
+        "primary_symbol": "BTC/USD",
+    }
+    spec, prompt, raw = await agent._generate_strategy(context)
 
-    assert agent.client.messages.create.call_count == 1
+    assert agent.client.messages.create.call_count == 3
     assert spec["strategy_name"] is not None
 
 
@@ -155,8 +188,8 @@ async def test_combiner_skips_when_fewer_than_2_strategies(mock_redis, mock_db):
     ]
     agent = CombinerAgent(mock_redis, mock_db)
 
-    agent.client.messages.create = AsyncMock()
+    with patch("atlas.agents.l2_strategy.combiner_agent._claude") as mock_claude:
+        mock_claude.complete = AsyncMock()
+        await agent._combine_top_strategies()
 
-    await agent._combine_top_strategies()
-
-    agent.client.messages.create.assert_not_called()
+        mock_claude.complete.assert_not_called()
