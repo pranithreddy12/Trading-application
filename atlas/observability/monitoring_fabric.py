@@ -14,6 +14,7 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict, deque
+from atlas.core.persistence_integrity import canonical_uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -109,7 +110,7 @@ class MonitoringFabric:
                     (:id, :recorded_at, CAST(:counters AS jsonb), CAST(:latencies AS jsonb))
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": canonical_uuid(None, field_name="id", context="monitoring_metrics"),
                     "recorded_at": now,
                     "counters": json.dumps(snapshot["counters"]),
                     "latencies": json.dumps(snapshot["latencies"]),

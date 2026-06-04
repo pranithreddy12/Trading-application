@@ -166,8 +166,8 @@ class StressTestEngine(BaseAgent):
                  :worst_scenario, :min_prob, :max_dd,
                  :avg_recovery, CAST(:results AS jsonb))
             """,
-            {
-                "id": uuid.uuid4().hex[:16],
+                {
+                "id": self.select_trace_id(),
                 "n_scenarios": len(results),
                 "n_positions": len(positions),
                 "worst_scenario": worst["scenario"],

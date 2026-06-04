@@ -86,8 +86,8 @@ class SystemicRiskEngine(BaseAgent):
                  :fragility, :corr_regime, :concentration,
                  :n_strategies, CAST(:details AS jsonb))
             """,
-            {
-                "id": uuid.uuid4().hex[:16],
+                {
+                "id": self.select_trace_id(),
                 "sys_risk": composite,
                 "contagion_prob": contagion_prob,
                 "fragility": fragility_score,

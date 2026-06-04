@@ -113,7 +113,7 @@ class CapitalPreservationEngine(BaseAgent):
                  :pnl, :exposure)
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "drawdown": round(drawdown, 4),
                 "action": action,
                 "exposure_cut": exposure_cut,

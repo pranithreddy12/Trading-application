@@ -17,6 +17,7 @@ from atlas.config.settings import settings
 from atlas.data.storage.timescale_client import TimescaleClient
 from atlas.agents.l2_strategy.strategy_normalizer import (
     normalize_strategy,
+    normalize_conditions,
     validate_strategy,
     compute_strategy_signature,
     _known_features_in,
@@ -28,6 +29,7 @@ from atlas.core.execution_cost_intelligence import (
     classify_cost_profile,
     get_cost_governance_thresholds,
 )
+from atlas.agents.l3_backtest.regime_selector import RegimeSelector
 
 ARCHETYPES = [
     "momentum",
@@ -367,6 +369,57 @@ STRATEGY_GRAMMAR = {
     },
 }
 
+# =====================================================
+# ARCHETYPE-SPECIFIC RISK PROFILES — replaces hardcoded SL/TP
+# =====================================================
+ARCHETYPE_RISK_PROFILES = {
+    "momentum": {
+        "sl_pct": 0.3, "tp_pct": 1.5, "hold_min": 5, "hold_max": 60,
+        "cooldown": 8, "rr_ratio": 5.0,
+    },
+    "mean_reversion": {
+        "sl_pct": 0.8, "tp_pct": 0.6, "hold_min": 3, "hold_max": 30,
+        "cooldown": 5, "rr_ratio": 0.75,
+    },
+    "breakout": {
+        "sl_pct": 0.5, "tp_pct": 2.0, "hold_min": 8, "hold_max": 80,
+        "cooldown": 10, "rr_ratio": 4.0,
+    },
+    "trend_following": {
+        "sl_pct": 0.4, "tp_pct": 1.8, "hold_min": 10, "hold_max": 100,
+        "cooldown": 12, "rr_ratio": 4.5,
+    },
+    "volatility_regime": {
+        "sl_pct": 0.6, "tp_pct": 1.2, "hold_min": 5, "hold_max": 40,
+        "cooldown": 6, "rr_ratio": 2.0,
+    },
+    "volatility_expansion": {
+        "sl_pct": 0.6, "tp_pct": 1.2, "hold_min": 5, "hold_max": 40,
+        "cooldown": 6, "rr_ratio": 2.0,
+    },
+    "liquidity_absorption": {
+        "sl_pct": 0.4, "tp_pct": 0.8, "hold_min": 3, "hold_max": 25,
+        "cooldown": 4, "rr_ratio": 2.0,
+    },
+}
+
+# =====================================================
+# CONDITION COMPATIBILITY — prevents contradictory combos
+# Maps (feature, direction) to incompatible (feature, direction) pairs
+# =====================================================
+CONDITION_COMPATIBILITY = {
+    # If RSI is oversold, bollinger should be low too (not high)
+    ("rsi_14", "<"): [("bollinger_band_position", ">", 0.7)],
+    # If RSI is overbought, bollinger should be high (not low)
+    ("rsi_14", ">"): [("bollinger_band_position", "<", 0.3)],
+    # If price is below VWAP, EMA spread should not be strongly positive
+    ("price_vs_vwap_pct", "<"): [("ema_spread_pct", ">", 0.003)],
+    # If price is above VWAP, EMA spread should not be strongly negative
+    ("price_vs_vwap_pct", ">"): [("ema_spread_pct", "<", -0.003)],
+    # If volatility regime is low, relative volume shouldn't be extreme
+    ("volatility_regime", "<"): [("relative_volume", ">", 2.5)],
+}
+
 
 class IdeatorAgentV2(BaseAgent):
     """
@@ -432,6 +485,12 @@ class IdeatorAgentV2(BaseAgent):
         self._llm_meta_advisor = os.environ.get(
             "USE_LLM_META_ADVISOR", "false"
         ).lower() == "true"
+
+        # === IMPROVEMENT: Failure anti-memory ===
+        # Threshold ranges that consistently produce failing strategies
+        # Format: {(archetype, feature, op): {"failing_range": (lo, hi), "winning_range": (lo, hi), "sample_count": N}}
+        self._failure_anti_memory: dict[tuple, dict] = {}
+        self._failure_anti_memory_cycle: int = 0
 
     async def run(self):
         logger.info(
@@ -623,6 +682,8 @@ class IdeatorAgentV2(BaseAgent):
                     else:
                         ctx["regime"] = "ranging"
 
+            ctx["feature_distribution"] = await self._build_feature_distribution(symbols)
+
         except Exception as e:
             logger.warning(f"{self.name}: Feature fetch: {e}")
 
@@ -688,6 +749,7 @@ class IdeatorAgentV2(BaseAgent):
                 min_score=30, max_score=100, limit=3
             )
             if wins:
+                ctx["threshold_memory"] = self._build_threshold_memory(wins)
                 lines = []
                 for w in wins:
                     params = w.get("parameters", {})
@@ -700,11 +762,14 @@ class IdeatorAgentV2(BaseAgent):
                     score = round(float(w.get("short_window_score", 0)), 1)
                     lines.append(f"entry={entry} temporal_score={score}")
                 ctx["success_summary"] = " | ".join(lines)
+            else:
+                ctx["threshold_memory"] = {}
 
         except Exception as e:
             if not self._failure_warned:
                 logger.warning(f"{self.name}: Success fetch: {e}")
                 self._failure_warned = True
+            ctx["threshold_memory"] = {}
 
         try:
             ctx["recent_names"] = await self.db_client.get_recent_strategy_names(
@@ -1063,7 +1128,471 @@ class IdeatorAgentV2(BaseAgent):
             ctx["scout_timeframe_preference"] = "1m"
 
 
+        # ─────────────────────────────────────────────────────────
+        # REGIME-WEIGHTED STRATEGY RANKING (Phase 36+)
+        # ─────────────────────────────────────────────────────────
+        try:
+            selector = RegimeSelector()
+            regime = ctx.get("regime", "ranging")
+            top = await selector.get_regime_weighted_ranking(
+                self.db_client, regime, limit=5
+            )
+            ctx["top_regime_strategies"] = top
+        except Exception as e:
+            logger.debug(f"{self.name}: Regime-weighted ranking failed: {e}")
+            ctx["top_regime_strategies"] = []
+
+        # ─────────────────────────────────────────────────────────
+        # FAILURE ANTI-MEMORY (Component 2)
+        # Build per-archetype threshold corridors from failed vs. winning strategies
+        # ─────────────────────────────────────────────────────────
+        if self._failure_anti_memory_cycle % (self._CACHE_TTL * 3) == 0:
+            try:
+                self._failure_anti_memory = await self._analyze_failure_patterns()
+                if self._failure_anti_memory:
+                    logger.info(
+                        f"{self.name}: Anti-memory updated — "
+                        f"{len(self._failure_anti_memory)} threshold corridors"
+                    )
+            except Exception as e:
+                logger.debug(f"{self.name}: Anti-memory build failed: {e}")
+        self._failure_anti_memory_cycle += 1
+        ctx["failure_anti_memory"] = self._failure_anti_memory
+
         return ctx
+
+    # ─────────────────────────────────────────────────────────
+    # COMPONENT 2: FAILURE ANTI-MEMORY
+    # ─────────────────────────────────────────────────────────
+
+    async def _analyze_failure_patterns(self) -> dict[tuple, dict]:
+        """
+        Analyze failed vs winning strategies to build threshold corridors.
+        Returns {(archetype, feature, op): {"failing_range": (lo, hi), "winning_range": (lo, hi), "sample_count": N}}
+        """
+        import re
+        anti_memory: dict[tuple, dict] = {}
+        cond_pattern = re.compile(
+            r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*([<>]=?)\s*(-?\d+(?:\.\d+)?)$"
+        )
+
+        try:
+            # Fetch failed strategies with backtest data
+            failed = await self.db_client.get_strategies_with_backtest(
+                statuses=["failed_validation", "repair_candidate", "permanently_failed"],
+                limit=30,
+            )
+            # Fetch winning strategies
+            wins = await self.db_client.get_strategies_with_backtest(
+                statuses=["validated", "elite", "promoted", "live"],
+                limit=30,
+            )
+
+            # Extract threshold values grouped by (archetype, feature, op)
+            def _extract_thresholds(strategies, label):
+                result: dict[tuple, list[float]] = {}
+                for s in strategies:
+                    params = s.get("parameters", {})
+                    if isinstance(params, str):
+                        try:
+                            params = json.loads(params)
+                        except Exception:
+                            params = {}
+                    archetype = ""
+                    for tag in params.get("tags", []):
+                        if tag in ARCHETYPES:
+                            archetype = tag
+                            break
+                    if not archetype:
+                        name = s.get("name", "")
+                        for a in ARCHETYPES:
+                            if a in name.lower():
+                                archetype = a
+                                break
+                    if not archetype:
+                        continue
+
+                    for cond in params.get("entry_conditions", []) + params.get(
+                        "exit_conditions", []
+                    ):
+                        if not isinstance(cond, str):
+                            continue
+                        match = cond_pattern.match(cond.strip())
+                        if not match:
+                            continue
+                        feature, op, raw_val = match.groups()
+                        try:
+                            val = float(raw_val)
+                        except ValueError:
+                            continue
+                        key = (archetype, feature, op)
+                        result.setdefault(key, []).append(val)
+                return result
+
+            failed_thresholds = _extract_thresholds(failed, "fail")
+            winning_thresholds = _extract_thresholds(wins, "win")
+
+            # Build corridors: for each key present in both, compute ranges
+            all_keys = set(failed_thresholds.keys()) | set(winning_thresholds.keys())
+            for key in all_keys:
+                f_vals = failed_thresholds.get(key, [])
+                w_vals = winning_thresholds.get(key, [])
+
+                entry = {}
+                if f_vals:
+                    entry["failing_range"] = (min(f_vals), max(f_vals))
+                    entry["failing_mean"] = sum(f_vals) / len(f_vals)
+                if w_vals:
+                    entry["winning_range"] = (min(w_vals), max(w_vals))
+                    entry["winning_mean"] = sum(w_vals) / len(w_vals)
+                entry["sample_count"] = len(f_vals) + len(w_vals)
+
+                if entry.get("sample_count", 0) >= 2:
+                    anti_memory[key] = entry
+
+        except Exception as e:
+            logger.debug(f"{self.name}: Failure pattern analysis failed: {e}")
+
+        return anti_memory
+
+    # ─────────────────────────────────────────────────────────
+    # COMPONENT 1: INTELLIGENT THRESHOLD SAMPLING
+    # ─────────────────────────────────────────────────────────
+
+    def _sample_threshold_intelligent(
+        self,
+        feature: str,
+        op: str,
+        grammar_range: tuple[float, float],
+        asset: str,
+        archetype: str,
+        ctx: dict,
+    ) -> float:
+        """
+        Intelligent threshold sampling with priority chain:
+        1. Winner threshold memory (if available) → sample from normal dist
+        2. Anti-memory avoidance (shift away from failing ranges)
+        3. Feature distribution P10-P90 (empirical data) → sample within
+        4. Grammar range (fallback) → random uniform
+
+        Returns a single threshold value.
+        """
+        import random as rng
+
+        lo, hi = grammar_range
+        # Asset-class adjustment for crypto (wider thresholds)
+        if asset == "crypto" and feature in (
+            "ema_spread_pct", "price_vs_vwap_pct", "trend_strength"
+        ):
+            lo *= 1.5
+            hi *= 1.5
+        elif asset == "crypto" and feature == "relative_volume":
+            lo = max(lo, 1.3)
+            hi = max(hi, lo + 0.5)
+
+        # === PRIORITY 1: Winner threshold memory ===
+        threshold_memory = ctx.get("threshold_memory", {}).get(feature, {})
+        if threshold_memory and threshold_memory.get("sample_count", 0) >= 2:
+            mean = threshold_memory["weighted_mean"]
+            std = max(0.001, threshold_memory.get("weighted_std", 0.01))
+            # Sample from truncated normal centered on winning mean
+            sampled = rng.gauss(mean, std * 0.8)
+            # Clamp to grammar range (expanded slightly)
+            sampled = max(lo * 0.8, min(hi * 1.2, sampled))
+            logger.debug(
+                f"{self.name}: Threshold for {feature} {op}: "
+                f"winner-guided {sampled:.6f} (mean={mean:.6f}, std={std:.6f})"
+            )
+            candidate = sampled
+        else:
+            # === PRIORITY 3: Feature distribution P10-P90 ===
+            dist = ctx.get("feature_distribution", {}).get(feature, {})
+            if dist and dist.get("sample_count", 0) > 10:
+                if op in (">", ">="):
+                    # For "greater than" conditions: sample between P50 and P90
+                    p50 = float(dist.get("p50", lo))
+                    p90 = float(dist.get("p90", hi))
+                    candidate = rng.uniform(p50, p90)
+                else:
+                    # For "less than" conditions: sample between P10 and P50
+                    p10 = float(dist.get("p10", lo))
+                    p50 = float(dist.get("p50", hi))
+                    candidate = rng.uniform(p10, p50)
+                logger.debug(
+                    f"{self.name}: Threshold for {feature} {op}: "
+                    f"distribution-guided {candidate:.6f}"
+                )
+            else:
+                # === PRIORITY 4: Grammar range fallback ===
+                candidate = rng.uniform(lo, hi)
+
+        # === PRIORITY 2: Anti-memory avoidance ===
+        anti_memory = ctx.get("failure_anti_memory", {})
+        anti_key = (archetype, feature, op)
+        if anti_key in anti_memory:
+            entry = anti_memory[anti_key]
+            failing_range = entry.get("failing_range")
+            winning_range = entry.get("winning_range")
+
+            if failing_range and winning_range:
+                f_lo, f_hi = failing_range
+                w_lo, w_hi = winning_range
+
+                # If candidate is in failing range but not in winning range, shift it
+                if f_lo <= candidate <= f_hi and not (w_lo <= candidate <= w_hi):
+                    # Shift toward winning mean
+                    w_mean = entry.get("winning_mean", (w_lo + w_hi) / 2)
+                    candidate = candidate * 0.3 + w_mean * 0.7
+                    logger.debug(
+                        f"{self.name}: Anti-memory shifted {feature} {op} "
+                        f"toward winning range ({w_lo:.4f}-{w_hi:.4f})"
+                    )
+            elif failing_range and not winning_range:
+                f_lo, f_hi = failing_range
+                # Avoid failing range entirely — shift to edge
+                if f_lo <= candidate <= f_hi:
+                    if op in (">", ">="):
+                        candidate = f_hi * 1.05  # Go slightly above failing max
+                    else:
+                        candidate = f_lo * 0.95  # Go slightly below failing min
+
+        # Final clamp to prevent extreme values
+        candidate = self._apply_threshold_memory(
+            feature, op, candidate, ctx, asset
+        )
+        return candidate if candidate is not None else rng.uniform(lo, hi)
+
+    # ─────────────────────────────────────────────────────────
+    # COMPONENT 1b: CONDITION COMPATIBILITY CHECK
+    # ─────────────────────────────────────────────────────────
+
+    def _check_condition_compatibility(
+        self, conditions: list[str]
+    ) -> bool:
+        """
+        Check if conditions are logically compatible (not contradictory).
+        E.g., rsi_14 < 30 AND bollinger_band_position > 0.85 is contradictory.
+        Returns True if compatible, False if contradictory.
+        """
+        import re
+        cond_pattern = re.compile(
+            r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*([<>]=?)\s*(-?\d+(?:\.\d+)?)$"
+        )
+
+        parsed: list[tuple[str, str, float]] = []
+        for cond in conditions:
+            if not isinstance(cond, str):
+                continue
+            match = cond_pattern.match(cond.strip())
+            if match:
+                feature, op, val = match.groups()
+                parsed.append((feature, op, float(val)))
+
+        # Check each parsed condition against compatibility rules
+        for feature, op, val in parsed:
+            direction = "<" if "<" in op else ">"
+            compat_key = (feature, direction)
+            if compat_key not in CONDITION_COMPATIBILITY:
+                continue
+
+            for incompat_feat, incompat_op, incompat_threshold in CONDITION_COMPATIBILITY[compat_key]:
+                # Check if any other condition matches the incompatible pattern
+                for other_feat, other_op, other_val in parsed:
+                    if other_feat != incompat_feat:
+                        continue
+                    other_dir = "<" if "<" in other_op else ">"
+                    if other_dir != incompat_op:
+                        continue
+                    # Check if the value crosses the incompatibility threshold
+                    if incompat_op == ">" and other_val > incompat_threshold:
+                        logger.debug(
+                            f"{self.name}: Incompatible conditions: "
+                            f"{feature} {op} {val} vs {other_feat} {other_op} {other_val}"
+                        )
+                        return False
+                    if incompat_op == "<" and other_val < incompat_threshold:
+                        logger.debug(
+                            f"{self.name}: Incompatible conditions: "
+                            f"{feature} {op} {val} vs {other_feat} {other_op} {other_val}"
+                        )
+                        return False
+
+        return True
+
+    # ─────────────────────────────────────────────────────────
+    # COMPONENT 4: ADAPTIVE RISK PARAMETERS
+    # ─────────────────────────────────────────────────────────
+
+    def _compute_adaptive_risk_params(
+        self, archetype: str, regime: str, asset: str
+    ) -> dict:
+        """
+        Compute archetype-specific risk parameters scaled by market regime.
+        Returns dict with sl_pct, tp_pct, hold_min, hold_max, cooldown, rr_ratio.
+        """
+        profile = ARCHETYPE_RISK_PROFILES.get(archetype, ARCHETYPE_RISK_PROFILES["momentum"])
+
+        sl_pct = profile["sl_pct"]
+        tp_pct = profile["tp_pct"]
+        hold_min = profile["hold_min"]
+        hold_max = profile["hold_max"]
+        cooldown = profile["cooldown"]
+        rr_ratio = profile["rr_ratio"]
+
+        # Volatility scaling
+        regime_lower = regime.lower()
+        if "high_vol" in regime_lower or "panic" in regime_lower:
+            sl_pct *= 1.5
+            tp_pct *= 1.5
+            hold_max = int(hold_max * 0.7)  # Exit faster in high vol
+            cooldown = max(3, int(cooldown * 1.3))
+        elif "low_vol" in regime_lower or "ranging" in regime_lower:
+            sl_pct *= 0.7
+            tp_pct *= 0.7
+            hold_max = int(hold_max * 1.3)  # Hold longer in low vol
+
+        # Asset class scaling
+        if asset == "crypto":
+            sl_pct *= 1.3  # Crypto is more volatile
+            tp_pct *= 1.3
+
+        return {
+            "stop_loss": f"{sl_pct:.1f}% below entry",
+            "take_profit": f"{tp_pct:.1f}% above entry",
+            "stop_loss_pct": round(sl_pct, 2),
+            "take_profit_pct": round(tp_pct, 2),
+            "hold_time_min": hold_min,
+            "hold_time_max": hold_max,
+            "cooldown_bars": cooldown,
+            "rr_ratio": round(rr_ratio, 2),
+        }
+
+    # ─────────────────────────────────────────────────────────
+    # COMPONENT 5: CANDIDATE PRE-SCORING
+    # ─────────────────────────────────────────────────────────
+
+    def _pre_score_candidate(self, spec: dict, ctx: dict) -> float:
+        """
+        Score a candidate strategy [0.0, 1.0] across multiple quality dimensions.
+        Higher = better candidate. Used to select best from multiple candidates.
+        """
+        score = 0.0
+        total_weight = 0.0
+
+        entry = spec.get("entry_conditions", [])
+        exit_ = spec.get("exit_conditions", [])
+        all_conds = entry + exit_
+        archetype = spec.get("tags", [""])[0] if spec.get("tags") else ""
+
+        # === 1. Feature Diversity (weight: 3) ===
+        features_used: set[str] = set()
+        families_used: set[str] = set()
+        for cond in all_conds:
+            if isinstance(cond, str):
+                feats = _known_features_in(cond)
+                features_used |= feats
+                for f in feats:
+                    fam = _FEATURE_FAMILIES.get(f)
+                    if fam:
+                        families_used.add(fam)
+
+        diversity_score = min(1.0, len(families_used) / 3.0)
+        score += diversity_score * 3.0
+        total_weight += 3.0
+
+        # === 2. Threshold Realism (weight: 4) ===
+        import re
+        cond_pattern = re.compile(
+            r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*([<>]=?)\s*(-?\d+(?:\.\d+)?)$"
+        )
+        realism_scores: list[float] = []
+        dist = ctx.get("feature_distribution", {})
+
+        for cond in all_conds:
+            if not isinstance(cond, str):
+                continue
+            match = cond_pattern.match(cond.strip())
+            if not match:
+                continue
+            feature, op, raw_val = match.groups()
+            val = float(raw_val)
+
+            feat_dist = dist.get(feature, {})
+            if not feat_dist:
+                realism_scores.append(0.5)  # Unknown — neutral
+                continue
+
+            p10 = float(feat_dist.get("p10", 0))
+            p90 = float(feat_dist.get("p90", 0))
+            p_range = max(0.001, p90 - p10)
+
+            # How close is the threshold to the P10-P90 range?
+            if p10 <= val <= p90:
+                # Inside range — good
+                realism_scores.append(0.9)
+            elif val < p10:
+                distance = (p10 - val) / p_range
+                realism_scores.append(max(0.1, 0.8 - distance))
+            else:
+                distance = (val - p90) / p_range
+                realism_scores.append(max(0.1, 0.8 - distance))
+
+        if realism_scores:
+            avg_realism = sum(realism_scores) / len(realism_scores)
+            score += avg_realism * 4.0
+        total_weight += 4.0
+
+        # === 3. Anti-Failure Score (weight: 3) ===
+        anti_memory = ctx.get("failure_anti_memory", {})
+        anti_score = 1.0
+        anti_count = 0
+        for cond in all_conds:
+            if not isinstance(cond, str):
+                continue
+            match = cond_pattern.match(cond.strip())
+            if not match:
+                continue
+            feature, op, raw_val = match.groups()
+            val = float(raw_val)
+            anti_key = (archetype, feature, op)
+            if anti_key in anti_memory:
+                entry_am = anti_memory[anti_key]
+                failing_range = entry_am.get("failing_range")
+                winning_range = entry_am.get("winning_range")
+                if failing_range and winning_range:
+                    f_lo, f_hi = failing_range
+                    w_lo, w_hi = winning_range
+                    if w_lo <= val <= w_hi:
+                        anti_score += 0.3  # In winning range — boost
+                    elif f_lo <= val <= f_hi:
+                        anti_score -= 0.4  # In failing range — penalty
+                    anti_count += 1
+
+        if anti_count > 0:
+            anti_score = max(0.0, min(1.0, anti_score / max(1, anti_count)))
+        score += anti_score * 3.0
+        total_weight += 3.0
+
+        # === 4. Condition Count Balance (weight: 2) ===
+        # Prefer 2-3 entry + 1-2 exit — penalize extremes
+        n_entry = len(entry)
+        n_exit = len(exit_)
+        balance_score = 0.5  # default neutral
+        if 2 <= n_entry <= 3 and 1 <= n_exit <= 2:
+            balance_score = 1.0  # ideal
+        elif n_entry == 1 or n_exit == 0:
+            balance_score = 0.1  # too few
+        elif n_entry >= 4 or n_exit >= 3:
+            balance_score = 0.3  # too many
+        score += balance_score * 2.0
+        total_weight += 2.0
+
+        # === 5. Condition Compatibility (weight: 2) ===
+        compat = 1.0 if self._check_condition_compatibility(all_conds) else 0.0
+        score += compat * 2.0
+        total_weight += 2.0
+
+        return round(score / max(1.0, total_weight), 4)
 
     # ─────────────────────────────────────────────────────────
     # DIVERSITY GOVERNANCE
@@ -1573,13 +2102,94 @@ class IdeatorAgentV2(BaseAgent):
         aggression = ctx.get("scout_aggression_factor", 1.0)
         timeframe = ctx.get("scout_timeframe_preference", "1m")
 
+        # =================================================================
+        # MULTI-CANDIDATE GENERATION
+        # Generate 5 candidates with diverse strategies, pre-score, pick best
+        # =================================================================
+        NUM_CANDIDATES = 5
+        candidates: list[tuple[dict, float]] = []
 
+        for candidate_idx in range(NUM_CANDIDATES):
+            try:
+                spec = self._build_single_candidate(
+                    grammar, archetype, asset, regime, timeframe, ctx, candidate_idx
+                )
+                if spec is None:
+                    continue
+
+                # Pre-score the candidate across quality dimensions
+                pre_score = self._pre_score_candidate(spec, ctx)
+                candidates.append((spec, pre_score))
+                logger.debug(
+                    f"{self.name}: Candidate {candidate_idx}: "
+                    f"{spec['strategy_name']} score={pre_score:.3f} "
+                    f"entry={spec.get('entry_conditions')}"
+                )
+            except Exception as e:
+                logger.debug(
+                    f"{self.name}: Candidate {candidate_idx} generation failed: {e}"
+                )
+
+        if not candidates:
+            return None, None, None
+
+        # Select the highest-scoring candidate
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        best_spec, best_score = candidates[0]
+
+        logger.info(
+            f"{self.name}: ✅ Selected best of {len(candidates)} candidates "
+            f"(score={best_score:.3f}, entries={len(best_spec.get('entry_conditions',[]))}): "
+            f"{best_spec['strategy_name']}"
+        )
+
+        return best_spec, "deterministic_grammar_v2", None
+
+    def _build_single_candidate(
+        self,
+        grammar: dict,
+        archetype: str,
+        asset: str,
+        regime: str,
+        timeframe: str,
+        ctx: dict,
+        candidate_idx: int,
+    ) -> dict | None:
+        """Build a single strategy candidate using intelligent sampling."""
         # Select entry conditions from grammar templates
         entry_pool = list(grammar["entry_templates"])
         exit_pool = list(grammar["exit_templates"])
 
-        # Shuffle for diversity
-        random.shuffle(entry_pool)
+        # ─── Diverse candidate strategies ───
+        # Each candidate uses a different selection + sizing approach
+        if candidate_idx == 0:
+            # Candidate 0: anti-memory biased — sort by anti-memory avoidance
+            # Put templates whose features have winning ranges first
+            anti_mem = ctx.get("failure_anti_memory", {})
+            def _anti_score(tmpl):
+                feat = tmpl[0]
+                for key, entry_am in anti_mem.items():
+                    if key[1] == feat and "winning_range" in entry_am:
+                        return 1.0
+                return 0.0
+            entry_pool.sort(key=_anti_score, reverse=True)
+        elif candidate_idx == 1:
+            # Candidate 1: standard shuffle
+            random.shuffle(entry_pool)
+        elif candidate_idx == 2:
+            # Candidate 2: reversed order for novelty
+            random.shuffle(entry_pool)
+            entry_pool = entry_pool[::-1]
+        elif candidate_idx == 3:
+            # Candidate 3: force 3 entry conditions (broader signal)
+            random.shuffle(entry_pool)
+            n_entry = 3
+        else:
+            # Candidate 4: minimal — exactly 2 entry, 1 exit (tighter)
+            random.shuffle(entry_pool)
+            n_entry = 2
+            n_exit = 1
+
         random.shuffle(exit_pool)
 
         # Pick 2-3 entry conditions, 1-2 exit conditions
@@ -1588,52 +2198,117 @@ class IdeatorAgentV2(BaseAgent):
 
         entry_conditions = []
         for tmpl in entry_pool[:n_entry]:
-            cond = self._resolve_grammar_template(tmpl, asset)
+            cond = self._resolve_grammar_template_v2(
+                tmpl, asset, archetype, ctx
+            )
             if cond:
                 entry_conditions.append(cond)
 
         exit_conditions = []
         for tmpl in exit_pool[:n_exit]:
-            cond = self._resolve_grammar_template(tmpl, asset)
+            cond = self._resolve_grammar_template_v2(
+                tmpl, asset, archetype, ctx
+            )
             if cond:
                 exit_conditions.append(cond)
 
         if not entry_conditions or not exit_conditions:
-            return None, None, None
+            return None
+
+        # ─── Condition compatibility check (Component 1b) ───
+        if not self._check_condition_compatibility(entry_conditions + exit_conditions):
+            logger.debug(
+                f"{self.name}: Candidate {candidate_idx} rejected — "
+                f"incompatible conditions"
+            )
+            return None
+
+        entry_conditions = self._constrain_conditions_to_reality(
+            entry_conditions, asset, ctx
+        )
+        exit_conditions = self._constrain_conditions_to_reality(
+            exit_conditions, asset, ctx
+        )
+
+        if not entry_conditions or not exit_conditions:
+            logger.debug(
+                f"{self.name}: Candidate {candidate_idx} rejected — "
+                f"threshold realism check failed"
+            )
+            return None
 
         # Build valid_regimes from grammar + regime context
         valid_regimes = list(grammar.get("valid_regimes", []))
+
+        # ─── Archetype-adaptive risk parameters (Component 4) ───
+        risk_params = self._compute_adaptive_risk_params(archetype, regime, asset)
 
         # Construct spec
         suffix = datetime.utcnow().strftime("%H%M%S") + f"_{random.randint(10, 99)}"
         spec = {
             "strategy_name": f"{archetype}_{asset}_det_{suffix}",
-            "hypothesis": f"Deterministic {archetype} on {asset} 1m — grammar-generated",
-            "reasoning": f"Grammar engine: {archetype} archetype with {', '.join(grammar['families'])} families",
+            "hypothesis": f"Deterministic {archetype} on {asset} 1m — grammar-v2",
+            "reasoning": (
+                f"Grammar-v2 engine: {archetype} archetype "
+                f"with {', '.join(grammar['families'])} families "
+                f"(regime={regime}, candidate={candidate_idx})"
+            ),
             "entry_conditions": entry_conditions,
             "exit_conditions": exit_conditions,
             "valid_regimes": valid_regimes,
-            "stop_loss": "0.5% below entry",
-            "take_profit": "1.0% above entry",
+            "stop_loss": risk_params["stop_loss"],
+            "take_profit": risk_params["take_profit"],
+            "stop_loss_pct": risk_params["stop_loss_pct"],
+            "take_profit_pct": risk_params["take_profit_pct"],
+            "hold_time_min": risk_params["hold_time_min"],
+            "hold_time_max": risk_params["hold_time_max"],
+            "cooldown_bars": risk_params["cooldown_bars"],
+            "rr_ratio": risk_params["rr_ratio"],
             "position_sizing": "10% of portfolio",
-            "timeframe": "1m",
+            "timeframe": timeframe,
             "asset_class": asset,
             "expected_sharpe": 1.0,
             "expected_win_rate": 0.50,
             "risk_level": "medium",
-            "tags": [archetype, asset, "deterministic", "grammar"],
+            "tags": [archetype, asset, "deterministic", "grammar_v2"],
         }
 
         spec = normalize_strategy(spec)
         valid, reason = validate_strategy(spec)
         if not valid:
-            logger.debug(f"{self.name}: Grammar spec invalid: {reason}")
-            return None, None, None
+            logger.debug(
+                f"{self.name}: Candidate {candidate_idx} invalid: {reason}"
+            )
+            return None
 
-        return spec, "deterministic_grammar", None
+        return spec
+
+
+
+    def _resolve_grammar_template_v2(
+        self, tmpl: tuple, asset: str, archetype: str, ctx: dict
+    ) -> str | None:
+        """
+        Resolve a grammar template to a concrete condition string
+        using INTELLIGENT threshold sampling (Component 1).
+        """
+        feature, op, threshold = tmpl
+
+        # Cross-feature comparison (e.g., ema_12 > ema_26)
+        if isinstance(threshold, str):
+            return f"{feature} {op} {threshold}"
+
+        # Numeric range — use intelligent sampling instead of random.uniform
+        if isinstance(threshold, tuple) and len(threshold) == 2:
+            val = self._sample_threshold_intelligent(
+                feature, op, threshold, asset, archetype, ctx
+            )
+            return f"{feature} {op} {round(val, 4)}"
+
+        return None
 
     def _resolve_grammar_template(
-        self, tmpl: tuple, asset: str
+        self, tmpl: tuple, asset: str, ctx: dict
     ) -> str | None:
         """Resolve a grammar template to a concrete condition string."""
         feature, op, threshold = tmpl
@@ -1654,10 +2329,192 @@ class IdeatorAgentV2(BaseAgent):
                     lo = max(lo, 1.3)
                     hi = max(hi, lo + 0.5)
 
-            val = round(random.uniform(lo, hi), 4)
-            return f"{feature} {op} {val}"
+            val = random.uniform(lo, hi)
+            clamped = self._apply_threshold_memory(
+                feature, op, val, ctx, asset
+            )
+            if clamped is not None:
+                return f"{feature} {op} {round(clamped, 4)}"
+            return f"{feature} {op} {round(val, 4)}"
 
         return None
+
+    def _condition_threshold_pattern(self):
+        import re
+        return re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*([<>]=?)\s*(-?\d+(?:\.\d+)?)$")
+
+    async def _build_feature_distribution(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        features = [
+            "rsi_14",
+            "price_vs_vwap_pct",
+            "ema_spread_pct",
+            "relative_volume",
+            "bollinger_band_position",
+            "volatility_regime",
+            "trend_strength",
+        ]
+        try:
+            async with self.db_client.engine.connect() as conn:
+                result = await conn.execute(
+                    text("""
+                        SELECT feature_name,
+                               MIN(value) AS min_value,
+                               MAX(value) AS max_value,
+                               AVG(value) AS mean_value,
+                               COALESCE(STDDEV(value), 0) AS std_value,
+                               PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY value) AS p10,
+                               PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY value) AS p50,
+                               PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY value) AS p90,
+                               COUNT(*) AS sample_count
+                        FROM (
+                            SELECT feature_name, value
+                            FROM features
+                            WHERE symbol = ANY(:symbols)
+                              AND feature_name = ANY(:features)
+                            ORDER BY time DESC
+                            LIMIT 5000
+                        ) recent
+                        GROUP BY feature_name
+                    """),
+                    {"symbols": symbols, "features": features},
+                )
+                out: dict[str, dict[str, float]] = {}
+                for row in result.fetchall():
+                    out[str(row[0])] = {
+                        "min": float(row[1]) if row[1] is not None else 0.0,
+                        "max": float(row[2]) if row[2] is not None else 0.0,
+                        "mean": float(row[3]) if row[3] is not None else 0.0,
+                        "std": float(row[4]) if row[4] is not None else 0.0,
+                        "p10": float(row[5]) if row[5] is not None else 0.0,
+                        "p50": float(row[6]) if row[6] is not None else 0.0,
+                        "p90": float(row[7]) if row[7] is not None else 0.0,
+                        "sample_count": float(row[8]) if row[8] is not None else 0.0,
+                    }
+                return out
+        except Exception as exc:
+            logger.debug(f"{self.name}: feature distribution fetch failed: {exc}")
+            return {}
+
+    def _build_threshold_memory(self, wins: list[dict]) -> dict[str, dict[str, float]]:
+        import re
+
+        memory: dict[str, list[float]] = {}
+        weights: dict[str, list[float]] = {}
+        cond_pattern = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*([<>]=?)\s*(-?\d+(?:\.\d+)?)$")
+        tracked = {
+            "rsi_14",
+            "price_vs_vwap_pct",
+            "ema_spread_pct",
+            "relative_volume",
+            "bollinger_band_position",
+            "volatility_regime",
+            "trend_strength",
+        }
+
+        for winner in wins:
+            params = winner.get("parameters", {})
+            if isinstance(params, str):
+                try:
+                    params = json.loads(params)
+                except Exception:
+                    params = {}
+
+            weight = float(winner.get("short_window_score", 0) or 0)
+            for cond in params.get("entry_conditions", []) + params.get("exit_conditions", []):
+                if not isinstance(cond, str):
+                    continue
+                match = cond_pattern.match(cond.strip())
+                if not match:
+                    continue
+                feature, _op, raw_value = match.groups()
+                if feature not in tracked:
+                    continue
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    continue
+                memory.setdefault(feature, []).append(value)
+                weights.setdefault(feature, []).append(max(1.0, weight))
+
+        summary: dict[str, dict[str, float]] = {}
+        for feature, values in memory.items():
+            if not values:
+                continue
+            w = weights.get(feature, [1.0] * len(values))
+            total_w = sum(w)
+            weighted_mean = sum(v * wt for v, wt in zip(values, w)) / max(1.0, total_w)
+            variance = sum(wt * ((v - weighted_mean) ** 2) for v, wt in zip(values, w)) / max(1.0, total_w)
+            summary[feature] = {
+                "weighted_mean": float(weighted_mean),
+                "weighted_std": float(variance ** 0.5),
+                "sample_count": float(len(values)),
+            }
+        return summary
+
+    def _realistic_threshold_bounds(self, feature: str, op: str, ctx: dict, asset: str) -> tuple[float, float] | None:
+        dist = ctx.get("feature_distribution", {}).get(feature, {})
+        mem = ctx.get("threshold_memory", {}).get(feature, {})
+
+        if not dist and not mem:
+            return None
+
+        if op in (">", ">="):
+            lower = float(dist.get("p50", dist.get("p10", dist.get("min", 0.0))))
+            upper = float(dist.get("p90", dist.get("max", lower)))
+        else:
+            lower = float(dist.get("p10", dist.get("min", 0.0)))
+            upper = float(dist.get("p50", dist.get("p90", dist.get("max", lower))))
+
+        if mem:
+            anchor = mem.get("weighted_mean")
+            spread = max(0.0, float(mem.get("weighted_std", 0.0)))
+            if anchor is not None:
+                lower = max(lower, anchor - spread)
+                upper = min(upper, anchor + spread)
+
+        if asset == "crypto" and feature in ("ema_spread_pct", "price_vs_vwap_pct", "trend_strength"):
+            if op in (">", ">="):
+                upper = max(upper, lower)
+            else:
+                lower = min(lower, upper)
+
+        if lower > upper:
+            return None
+        return lower, upper
+
+    def _apply_threshold_memory(self, feature: str, op: str, candidate: float, ctx: dict, asset: str) -> float | None:
+        bounds = self._realistic_threshold_bounds(feature, op, ctx, asset)
+        if bounds is None:
+            # Cold-start: no feature distribution data yet — accept candidate as-is
+            return candidate
+        lo, hi = bounds
+        return max(lo, min(hi, candidate))
+
+    def _constrain_conditions_to_reality(self, conditions: list[str], asset: str, ctx: dict) -> list[str]:
+        import re
+
+        out: list[str] = []
+        pattern = self._condition_threshold_pattern()
+        for cond in conditions:
+            if not isinstance(cond, str):
+                continue
+            match = pattern.match(cond.strip())
+            if not match:
+                out.append(cond)
+                continue
+
+            feature, op, raw_value = match.groups()
+            try:
+                candidate = float(raw_value)
+            except ValueError:
+                continue
+
+            clamped = self._apply_threshold_memory(feature, op, candidate, ctx, asset)
+            if clamped is None:
+                return []
+            out.append(f"{feature} {op} {round(clamped, 4)}")
+
+        return normalize_conditions(out)
 
     async def _llm_advisory_enrichment(
         self, spec: dict, ctx: dict
@@ -1739,9 +2596,21 @@ class IdeatorAgentV2(BaseAgent):
     - excessive crossover frequency
     - hyper-reactive RSI bands
     - ultra-tight exits
-"""
+"""            # Format regime-weighted strategies for Claude prompt
+            regime_strats = ctx.get("top_regime_strategies", [])
+            if regime_strats:
+                regime_lines = []
+                for s in regime_strats[:5]:
+                    name = s.get("name", "?")[:40]
+                    score = float(s.get("regime_weighted_score", 0))
+                    arch = s.get("archetype", "?")[:20]
+                    mult = float(s.get("regime_multiplier", 1.0))
+                    regime_lines.append(f"  - {name} (archetype={arch}, score={score:.1f}, regime_mult={mult:.1f}x)")
+                regime_block = "\n".join(regime_lines)
+            else:
+                regime_block = "  No regime-ranked strategies available yet."
 
-        user_prompt = f"""Design ONE {archetype} strategy for 1-minute {asset} data.
+            user_prompt = f"""Design ONE {archetype} strategy for 1-minute {asset} data.
 
 Market: {ctx["snapshot_line"] or "no live data"}
 Regime: {regime}
@@ -1759,6 +2628,9 @@ Where:
   {_ts_suffix}   = the required 4-digit suffix for this generation (HARDCODED — do not change it)
 Example: momentum_nvda_ema_spread_{_ts_suffix}
 NEVER reuse any name from the avoid list above. The suffix ensures uniqueness.
+
+Regime-Weighted Strategy Rankings (proven winners in current regime):
+{regime_block}
 
 Structural Intelligence (learned patterns):
 {ctx.get("pattern_intelligence", "No pattern data yet.")}
@@ -1929,6 +2801,11 @@ Output ONLY this JSON:
                 for c in entry
             ]
 
+        entry = self._constrain_conditions_to_reality(entry, asset, ctx)
+        exit_ = self._constrain_conditions_to_reality(exit_, asset, ctx)
+        if not entry or not exit_:
+            return None, None, None
+
         # Regime-aware valid_regimes per archetype
         _REGIME_MAP = {
             "momentum": ["bullish", "trending", "high_vol"],
@@ -1947,8 +2824,7 @@ Output ONLY this JSON:
             "entry_conditions": entry,
             "exit_conditions": exit_,
             "valid_regimes": valid_regimes,
-            "stop_loss": "0.5% below entry",
-            "take_profit": "1.0% above entry",
+            **self._compute_adaptive_risk_params(archetype, regime, asset),
             "position_sizing": "10% of portfolio",
             "timeframe": "1m",
             "asset_class": asset,

@@ -57,7 +57,7 @@ class EventLineageClient:
         metadata: Optional[dict] = None,
     ) -> str:
         """Generate a new trace_id and create the first lifecycle event. Returns trace_id."""
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = str(uuid.uuid4())
         await self.create_event(
             trace_id=trace_id,
             stage=stage,
@@ -79,7 +79,7 @@ class EventLineageClient:
         metadata: Optional[dict] = None,
     ) -> str:
         """Create a lifecycle event and return its ID."""
-        event_id = uuid.uuid4().hex[:16]
+        event_id = str(uuid.uuid4())
         from sqlalchemy.sql import text
 
         async with self.db.engine.begin() as conn:
@@ -154,6 +154,13 @@ class EventLineageClient:
     async def get_trace_by_strategy(self, strategy_id: str) -> Optional[str]:
         """Get the trace_id for a strategy (first matching event)."""
         from sqlalchemy.sql import text
+        import uuid
+        
+        try:
+            # Validate UUID to prevent asyncpg DataError
+            uuid.UUID(strategy_id)
+        except ValueError:
+            return None
 
         async with self.db.engine.connect() as conn:
             result = await conn.execute(
@@ -166,7 +173,16 @@ class EventLineageClient:
                 {"strategy_id": strategy_id},
             )
             row = result.fetchone()
-            return str(row[0]) if row else None
+            if not row:
+                return None
+            
+            trace_id_val = str(row[0])
+            try:
+                # Ensure the retrieved trace_id is a valid UUID
+                uuid.UUID(trace_id_val)
+                return trace_id_val
+            except ValueError:
+                return None
 
     async def get_lineage_summary(self, trace_id: str) -> dict:
         """

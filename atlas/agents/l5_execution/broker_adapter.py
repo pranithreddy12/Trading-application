@@ -21,10 +21,11 @@ import time
 import urllib.request
 import uuid
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 from loguru import logger
+from sqlalchemy.sql import text
 
 from atlas.config.settings import settings
 
@@ -367,15 +368,41 @@ class SimulatorAdapter(BrokerAdapter):
     Local fill simulator — no network calls.
     Used for testing, CI/CD, and development.
     Compatible with CopyTrader's LocalSimulatorAdapter pattern.
+
+    When db_client is provided, fills use real market prices from
+    market_data_l1 instead of a static default_price.
     """
 
     broker_name = "simulator"
 
-    def __init__(self, default_price: float = 500.0, fill_latency_ms: int = 50):
+    def __init__(
+        self,
+        default_price: float = 500.0,
+        fill_latency_ms: int = 50,
+        db_client: Any = None,
+    ):
         self._default_price = default_price
         self._fill_latency = fill_latency_ms / 1000.0
         self._orders: dict[str, dict] = {}
         self._positions: list[dict] = []
+        self._db = db_client
+
+    async def _get_real_price(self, symbol: str) -> float | None:
+        """Fetch latest close price from market_data_l1, falling back to default_price."""
+        if self._db is None:
+            return None
+        try:
+            async with self._db.engine.connect() as conn:
+                res = await conn.execute(
+                    text("SELECT close FROM market_data_l1 WHERE symbol = :sym ORDER BY time DESC LIMIT 1"),
+                    {"sym": symbol},
+                )
+                row = res.fetchone()
+                if row is not None:
+                    return float(row[0])
+        except Exception as exc:
+            logger.debug(f"SimulatorAdapter: price fetch failed for {symbol}: {exc}")
+        return None
 
     async def submit_order(
         self,
@@ -387,6 +414,15 @@ class SimulatorAdapter(BrokerAdapter):
         time_in_force: str = "day",
     ) -> dict:
         await asyncio.sleep(self._fill_latency)
+
+        # Use real market price when available, fall back to default_price
+        fill_price = await self._get_real_price(symbol)
+        if fill_price is None:
+            fill_price = self._default_price
+            logger.debug(f"SimulatorAdapter: using default_price={self._default_price} for {symbol}")
+        else:
+            logger.debug(f"SimulatorAdapter: using real price {fill_price} for {symbol}")
+
         order_id = str(uuid.uuid4())
         order = {
             "id": order_id,
@@ -396,13 +432,13 @@ class SimulatorAdapter(BrokerAdapter):
             "qty": qty,
             "status": "filled",
             "filled_qty": qty,
-            "filled_avg_price": self._default_price,
+            "filled_avg_price": fill_price,
         }
         self._orders[order_id] = order
         # Track simulated position
         self._positions.append({
             "symbol": symbol, "qty": qty, "side": side,
-            "avg_price": self._default_price, "market_value": qty * self._default_price,
+            "avg_price": fill_price, "market_value": qty * fill_price,
         })
         return order
 
@@ -424,6 +460,10 @@ class SimulatorAdapter(BrokerAdapter):
         return list(self._positions)
 
     async def get_current_price(self, symbol: str) -> float | None:
+        # Try real price first, fall back to default
+        real = await self._get_real_price(symbol)
+        if real is not None:
+            return real
         return self._default_price
 
     async def get_open_orders(self) -> list[dict]:

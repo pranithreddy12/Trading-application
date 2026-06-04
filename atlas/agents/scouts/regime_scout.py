@@ -19,7 +19,6 @@ Integrations:
 
 import asyncio
 import json
-import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -67,8 +66,8 @@ class RegimeScout(BaseAgent):
     RVOL_HIGH = 1.5
 
     # Bollinger compression (band width as % of mid)
-    COMPRESSION_THRESHOLD = 0.02       # 2% band width = compressed
-    EXPANSION_THRESHOLD = 0.08         # 8% band width = expanding
+    COMPRESSION_THRESHOLD = 0.02  # 2% band width = compressed
+    EXPANSION_THRESHOLD = 0.08  # 8% band width = expanding
 
     # Minimum bars for meaningful computation
     MIN_BARS = 30
@@ -90,12 +89,18 @@ class RegimeScout(BaseAgent):
 
         # Default symbols to analyze
         self.symbols = symbols or [
-            "BTCUSDT", "ETHUSDT", "SOLUSDT",
-            "SPY", "QQQ", "AAPL", "MSFT", "NVDA",
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "SPY",
+            "QQQ",
+            "AAPL",
+            "MSFT",
+            "NVDA",
         ]
 
-        # Cache last payload for Ideator consumption
-        self._latest_payload: Optional[RegimePayload] = None
+        # Per-symbol payload cache for Ideator consumption
+        self._latest_payloads: dict[str, RegimePayload] = {}
 
     async def run(self):
         logger.info(f"{self.name} started — monitoring {len(self.symbols)} symbols")
@@ -114,7 +119,9 @@ class RegimeScout(BaseAgent):
         try:
             df = await self.db.fetch_recent_bars(symbol, limit=500)
             if df is None or len(df) < self.MIN_BARS:
-                logger.debug(f"{self.name}: {symbol} — insufficient data ({len(df) if df is not None else 0} bars)")
+                logger.debug(
+                    f"{self.name}: {symbol} — insufficient data ({len(df) if df is not None else 0} bars)"
+                )
                 return None
 
             # Compute all regime classifications
@@ -126,8 +133,8 @@ class RegimeScout(BaseAgent):
             # Publish to Redis
             await self._publish(payload)
 
-            # Cache latest for Ideator
-            self._latest_payload = payload
+            # Cache per-symbol for Ideator summary
+            self._latest_payloads[symbol] = payload
 
             logger.info(
                 f"{self.name}: {symbol} → vol={payload.volatility_regime}, "
@@ -161,10 +168,22 @@ class RegimeScout(BaseAgent):
 
         # Realized vol (rolling 20-bar std of returns)
         returns = np.diff(np.log(close + 1e-10))
-        realized_vol = np.std(returns[-20:]) * np.sqrt(252 * 390) if len(returns) >= 20 else np.std(returns) * np.sqrt(252 * 390)
+        if len(returns) >= 20:
+            realized_vol = np.std(returns[-20:]) * np.sqrt(252 * 390)
+        else:
+            realized_vol = np.std(returns) * np.sqrt(252 * 390)
+
+        # Build rolling volatility history for percentile-based panic detection
+        vol_history = []
+        if len(returns) >= 40:
+            for i in range(20, len(returns)):
+                vol_history.append(np.std(returns[i - 20 : i]) * np.sqrt(252 * 390))
+            panic_threshold = np.percentile(vol_history, self.VOL_PANIC_PCT)
+        else:
+            panic_threshold = float("inf")
 
         # Classify volatility
-        if realized_vol > np.percentile(returns, self.VOL_PANIC_PCT) * np.sqrt(252 * 390) * 2:
+        if vol_history and realized_vol > panic_threshold:
             vol_regime = "panic_vol"
         elif len(close) > 30:
             # Build ATR percentile distribution from history
@@ -213,11 +232,16 @@ class RegimeScout(BaseAgent):
         else:
             trend_regime = "mean_reverting"
 
-        # --- Liquidity Regime (from RVOL) ---
+        # --- Liquidity Regime (RVOL + absolute volume gate) ---
         avg_volume = np.mean(volume[-50:]) if len(volume) >= 50 else np.mean(volume)
         rvol = volume[-1] / max(avg_volume, 1)
+        min_adv_threshold = (
+            10000.0  # minimum 10k units avg daily volume to be considered liquid
+        )
 
-        if rvol > self.RVOL_HIGH * 1.5:
+        if avg_volume < min_adv_threshold:
+            liq_regime = "dangerous"
+        elif rvol > self.RVOL_HIGH * 1.5:
             liq_regime = "deep_liquid"
         elif rvol > self.RVOL_HIGH:
             liq_regime = "normal"
@@ -227,35 +251,93 @@ class RegimeScout(BaseAgent):
             liq_regime = "dangerous"
 
         # --- Compression / Expansion ---
-        bb_upper = self._sma(close, 20) + 2 * np.std(close[-20:]) if len(close) >= 20 else close[-1] * 1.02
-        bb_lower = self._sma(close, 20) - 2 * np.std(close[-20:]) if len(close) >= 20 else close[-1] * 0.98
+        bb_upper = (
+            self._sma(close, 20) + 2 * np.std(close[-20:])
+            if len(close) >= 20
+            else close[-1] * 1.02
+        )
+        bb_lower = (
+            self._sma(close, 20) - 2 * np.std(close[-20:])
+            if len(close) >= 20
+            else close[-1] * 0.98
+        )
         bb_width = (bb_upper - bb_lower) / max(close[-1], 1e-10)
 
         compression = bool(bb_width < self.COMPRESSION_THRESHOLD)
         expansion = bool(bb_width > self.EXPANSION_THRESHOLD)
 
-        # --- VWAP Deviation ---
-        vwap = np.sum(close * volume) / max(np.sum(volume), 1)
+        # --- VWAP Deviation (session-aware: last 390 bars ≈ 1 trading day at 1m) ---
+        session_bars = min(390, len(close))
+        session_close = close[-session_bars:]
+        session_volume = volume[-session_bars:]
+        vwap = np.sum(session_close * session_volume) / max(np.sum(session_volume), 1)
         vwap_dev = (close[-1] - vwap) / max(vwap, 1e-10) * 100
 
-        # --- Confidence Score ---
-        confidence = min(1.0, len(close) / 500)
+        # --- Confidence Score (multi-factor) ---
+        n_bars = len(close)
+        sample_score = min(1.0, n_bars / 500)
+        vol_stability = (
+            1.0
+            - min(
+                1.0, np.std(returns[-50:]) / max(np.mean(np.abs(returns[-50:])), 1e-10)
+            )
+            if len(returns) >= 50
+            else 0.5
+        )
+        trend_agreement = (
+            abs(ema_spread) / max(self.TREND_STRONG, 1e-10)
+            if trend_regime in ("trending_up", "trending_down")
+            else 0.3
+        )
+        trend_agreement = min(1.0, trend_agreement)
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                round(
+                    0.4 * sample_score + 0.35 * vol_stability + 0.25 * trend_agreement,
+                    4,
+                ),
+            ),
+        )
 
-        # --- Correlation regime (simplified: uses RRG-style cross-asset heuristic) ---
-        if "BTC" in symbol or "ETH" in symbol:
-            corr_regime = "clustered"
-        elif vol_regime == "panic_vol":
-            corr_regime = "panic_correlation"
-        else:
-            corr_regime = "diversified"
+        # --- Correlation regime (rolling cross-asset pairwise) ---
+        # Use cached payloads from previously analyzed symbols to compute
+        # a real correlation snapshot rather than hardcoded labels.
+        corr_regime = "diversified"
+        if self._latest_payloads:
+            vol_regimes = []
+            trend_regimes = []
+            for sym, p in self._latest_payloads.items():
+                if p is not None:
+                    vol_regimes.append(p.volatility_regime)
+                    trend_regimes.append(p.trend_regime)
+            if vol_regimes:
+                # If >50% of analyzed symbols are in extreme vol → panic_correlation
+                extreme_vol = sum(
+                    1 for v in vol_regimes if v in ("panic_vol", "high_vol")
+                )
+                if extreme_vol / len(vol_regimes) > 0.5:
+                    corr_regime = "panic_correlation"
+                else:
+                    # If >50% share the same trend → clustered
+                    trending = sum(
+                        1
+                        for t in trend_regimes
+                        if t in ("trending_up", "trending_down")
+                    )
+                    if trending / len(trend_regimes) > 0.5:
+                        corr_regime = "clustered"
+                    else:
+                        corr_regime = "diversified"
 
-        # Build ATR percentile
-        atr_percentile = 50.0  # default
+        # ATR percentile (vectorized sliding window)
+        atr_percentile = 50.0
         if len(tr) >= 50:
-            atr_series = [np.mean(tr[max(0, i-14):i+1]) for i in range(14, len(tr))]
-            atr_percentile = (sum(1 for a in atr_series if a <= atr) / len(atr_series)) * 100
+            windows = np.lib.stride_tricks.sliding_window_view(tr, window_shape=14)
+            atr_series = np.mean(windows, axis=1)
+            atr_percentile = float(np.mean(atr_series <= atr) * 100)
 
-        # Determine correlation regime for metadata
         asset_class = "crypto" if "USDT" in symbol else "equity"
 
         return RegimePayload(
@@ -321,15 +403,23 @@ class RegimeScout(BaseAgent):
         await self._redis.publish(channel, json.dumps(payload.to_dict()))
 
     async def _publish_summary(self):
-        """Publish a compressed regime summary for Ideator consumption."""
-        if self._latest_payload is None:
+        """Publish a combined regime summary for Ideator consumption.
+        Sends the most extreme volatility regime as the representative payload.
+        """
+        if not self._latest_payloads:
             return
-        summary = scout_summary_for_ideator(regime=self._latest_payload)
+        # Pick the most extreme volatility regime as the representative snapshot
+        vol_priority = {"panic_vol": 4, "high_vol": 3, "normal_vol": 2, "low_vol": 1}
+        representative = max(
+            self._latest_payloads.values(),
+            key=lambda p: vol_priority.get(p.volatility_regime, 0),
+        )
+        summary = scout_summary_for_ideator(regime=representative)
         await self._redis.set("scout:regime_summary", summary, ex=120)
 
-    def get_latest(self) -> Optional[RegimePayload]:
-        """Return cached latest payload for cross-agent consumption."""
-        return self._latest_payload
+    def get_latest_payloads(self) -> dict[str, RegimePayload]:
+        """Return all cached payloads for cross-agent consumption."""
+        return dict(self._latest_payloads)
 
     # ------------------------------------------------------------------
     # Technical Helpers

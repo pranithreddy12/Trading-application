@@ -4,6 +4,7 @@ import uuid
 from enum import Enum
 from loguru import logger
 from redis.asyncio import Redis
+from atlas.core.persistence_integrity import strict_identity_contracts_enabled, IdentityContractViolation
 
 
 class AgentLayer(str, Enum):
@@ -37,6 +38,7 @@ class BaseAgent(ABC):
         layer: str | AgentLayer,
         redis_client: Redis,
         advisory_only: bool = False,
+        execution_context: object | None = None,
     ):
         self.agent_id: str = str(uuid.uuid4())
         self.name: str = name
@@ -61,6 +63,8 @@ class BaseAgent(ABC):
 
         self._heartbeat_task: asyncio.Task | None = None
         self._main_task: asyncio.Task | None = None
+        # Optional governance execution context (set by orchestrator)
+        self.execution_context = execution_context
 
     def _enforce_advisory_guard(self, action: str = "unknown") -> None:
         """Raise GovernanceViolation if this agent is advisory-only.
@@ -209,6 +213,19 @@ class BaseAgent(ABC):
                     # we're running in, causing RecursionError during shutdown.
                     # The parent supervisor loop handles stopping dead agents.
                     break
+
+    def select_trace_id(self) -> str:
+        """Return a trace id preferring governance-provided context; enforce strictness when configured."""
+        ctx = getattr(self, "execution_context", None)
+        if ctx is not None:
+            tid = getattr(ctx, "trace_id", None)
+            if tid:
+                return tid
+            if strict_identity_contracts_enabled():
+                raise IdentityContractViolation(
+                    f"Agent {self.name}: GovernanceExecutionContext provided but missing trace_id under strict mode"
+                )
+        return str(uuid.uuid4())
 
     @abstractmethod
     async def run(self):

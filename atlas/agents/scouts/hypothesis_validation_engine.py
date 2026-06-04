@@ -82,7 +82,7 @@ class HypothesisValidationEngine(BaseAgent):
                  :score, 'neutral', CAST(:details AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "sentiment": round(
                     sum(r["survivability_score"] for r in validated) / max(1, len(validated)), 3
                 ),

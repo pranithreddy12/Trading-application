@@ -1,0 +1,201 @@
+{
+  "database_row_counts": {
+    "strategies": 3551,
+    "backtest_results": 2893,
+    "backtest_trades": 1535210,
+    "lifecycle_events": 36039,
+    "event_store": 4457,
+    "audit_ledger": 5301,
+    "execution_log": 107,
+    "paper_trades": 7,
+    "positions": 0,
+    "copy_execution_log": 7,
+    "capital_allocation": 46,
+    "mutation_policy_state": 211,
+    "feature_importance": 514,
+    "drift_detection": 484,
+    "scout_signals": 16762,
+    "external_scout_memory": 0,
+    "scout_quarantine": 0,
+    "failed_inserts": 364,
+    "pattern_memory": 6433,
+    "agent_registry": 0,
+    "system_logs": 6816
+  },
+  "database_total_rows": 1619202,
+  "database_table_count": 21,
+  "backtest": {
+    "total": 2893,
+    "scored": 2893,
+    "avg_short_window_score": 29.1299,
+    "avg_sharpe": 13.2427,
+    "avg_win_rate": 0.1319
+  },
+  "top_strategies": [
+    {
+      "name": "volatility_regime_equity_det_101354_32",
+      "status": "validated",
+      "score": 41.0,
+      "sharpe": 282.69189380788464,
+      "win_rate": 0.5789473684210527
+    },
+    {
+      "name": "volatility_regime_equity_det_101345_65",
+      "status": "validated",
+      "score": 39.1,
+      "sharpe": 263.71544476878483,
+      "win_rate": 0.5333333333333333
+    },
+    {
+      "name": "volatility_regime_equity_det_180729_27",
+      "status": "validated",
+      "score": 39.1,
+      "sharpe": 0,
+      "win_rate": 0.5333333333333333
+    },
+    {
+      "name": "volatility_regime_equity_det_191958_71",
+      "status": "validated",
+      "score": 38.4,
+      "sharpe": 0,
+      "win_rate": 0.5151515151515151
+    },
+    {
+      "name": "volatility_regime_equity_det_201055_35",
+      "status": "validated",
+      "score": 37.9,
+      "sharpe": 0,
+      "win_rate": 0.5
+    },
+    {
+      "name": "volatility_regime_equity_det_172120_29",
+      "status": "validated",
+      "score": 37.7,
+      "sharpe": 0,
+      "win_rate": 0.5
+    },
+    {
+      "name": "volatility_regime_equity_det_173009_46",
+      "status": "validated",
+      "score": 37.6,
+      "sharpe": 0,
+      "win_rate": 0.5
+    },
+    {
+      "name": "momentum_equity_det_171011_71",
+      "status": "validated",
+      "score": 37.5,
+      "sharpe": 0,
+      "win_rate": 0.48717948717948717
+    },
+    {
+      "name": "momentum_equity_det_173946_67",
+      "status": "validated",
+      "score": 37.5,
+      "sharpe": 0,
+      "win_rate": 0.48717948717948717
+    },
+    {
+      "name": "momentum_equity_det_171741_69",
+      "status": "validated",
+      "score": 37.5,
+      "sharpe": 0,
+      "win_rate": 0.48717948717948717
+    }
+  ],
+  "paper_trades": {
+    "buy": {
+      "count": 7,
+      "avg_price": 0,
+      "total_pnl": 0
+    }
+  },
+  "copy_execution_count": 7,
+  "total_pnl": 0.0,
+  "scout_signals_count": 16762,
+  "scout_by_source": {
+    "regime_scout": 10646,
+    "liquidity_scout": 5831,
+    "correlation_scout": 285
+  },
+  "external_scout_memory_count": 0,
+  "scout_quarantine_count": 0,
+  "capital_allocation": {
+    "strategies_allocated": 50,
+    "total_allocation": 46.04
+  },
+  "event_store": {
+    "total": 4457,
+    "hashed": 4457
+  },
+  "audit_ledger": {
+    "total": 5301,
+    "hashed": 5301
+  },
+  "failed_inserts": 364,
+  "failed_inserts_breakdown": [
+    {
+      "table": "feature_importance",
+      "reason": "zero_rowcount",
+      "count": 114
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: '948700bfcb0d4f66' (invalid UUID '948700bfcb0d4f66': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('948700bfcb0d4f66', 24, datetime.datetime(2026, 5, 24, 11, 36, 45, 702087, tzinfo=datetime.timezone.utc), 13, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: '70556550b09a4a97' (invalid UUID '70556550b09a4a97': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('70556550b09a4a97', 24, datetime.datetime(2026, 5, 25, 20, 41, 12, 57494, tzinfo=datetime.timezone.utc), 1545, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: 'b90c61cbb85645a3' (invalid UUID 'b90c61cbb85645a3': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('b90c61cbb85645a3', 6, datetime.datetime(2026, 5, 25, 19, 41, 7, 906869, tzinfo=datetime.timezone.utc), 1127, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: 'bb7f0fee4141435f' (invalid UUID 'bb7f0fee4141435f': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('bb7f0fee4141435f', 6, datetime.datetime(2026, 5, 25, 21, 51, 18, 968236, tzinfo=datetime.timezone.utc), 2009, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: 'd1e2ebc5ea7f401f' (invalid UUID 'd1e2ebc5ea7f401f': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('d1e2ebc5ea7f401f', 6, datetime.datetime(2026, 5, 25, 21, 1, 13, 244046, tzinfo=datetime.timezone.utc), 1666, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 15, 4, 509627, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for 500f5c74-af5d-4afd-acf5-8e5350c65ee9: IndentationError: unexpected indent (<strategy_btc_rsi_bb_meanrev_v6>, line 31)', '{\"strategy_id\": \"500f5c74-af5d-4afd-acf5-8e5350c65ee9\", \"strategy_name\": \"btc_rsi_bb_meanrev_v6\", \"error_type\": \"IndentationError\", \"error\": \"unexpec ... (3967 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "system_logs",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $2: 'CoderAgent' (invalid UUID 'CoderAgent': length must be between 32..36 characters, got 10)\n[SQL: \n            INSERT INTO system_logs (time, agent_id, level, message, metadata)\n            VALUES ($1, $2, $3, $4, $5)\n        ]\n[parameters: (datetime.datetime(2026, 5, 22, 7, 15, 4, 423054, tzinfo=datetime.timezone.utc), 'CoderAgent', 'ERROR', 'Compile failed for f902b59a-4bd2-44f2-a068-c9166ceb783d: IndentationError: unexpected indent (<strategy_momentum_equity_det_071457_37>, line 28)', '{\"strategy_id\": \"f902b59a-4bd2-44f2-a068-c9166ceb783d\", \"strategy_name\": \"momentum_equity_det_071457_37\", \"error_type\": \"IndentationError\", \"error\":  ... (3943 characters truncated) ...  -1\\\\n                    in_position = False\\\\n                    bars_held = 0\\\\n                    cooldown = 5\\\\n\\\\n        return signals\\\\n\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: '6521080086e44d3d' (invalid UUID '6521080086e44d3d': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('6521080086e44d3d', 1, datetime.datetime(2026, 5, 25, 21, 51, 18, 968236, tzinfo=datetime.timezone.utc), 412, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    },
+    {
+      "table": "economic_fitness_windows",
+      "reason": "(sqlalchemy.dialects.postgresql.asyncpg.Error) <class 'asyncpg.exceptions.DataError'>: invalid input for query argument $1: '99f1e656b01e403b' (invalid UUID '99f1e656b01e403b': length must be between 32..36 characters, got 16)\n[SQL: \n                    INSERT INTO economic_fitness_windows\n                        (id, window_hours, computed_at, n_strategies, avg_composite_fitness,\n                         avg_sharpe, avg_sortino, avg_calmar, avg_expectancy,\n                         median_composite_fitness, top_decile_fitness, bottom_decile_fitness,\n                         fitness_trend, mutation_survival_rate, scout_attribution_quality, metadata)\n                    VALUES\n                        ($1, $2, $3, $4, $5,\n                         $6, $7, $8, $9,\n                         $10, $11, $12,\n                         $13, $14, $15, $16)\n                    ]\n[parameters: ('99f1e656b01e403b', 1, datetime.datetime(2026, 5, 25, 22, 11, 20, 771979, tzinfo=datetime.timezone.utc), 413, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, '{\"agent\": \"EconomicEfficiencyEngine\"}')]\n(Background on this error at: https://sqlalche.me/e/20/dbapi)",
+      "count": 1
+    }
+  ],
+  "agent_lifecycle": {
+    "starts": 23139,
+    "stops": 0,
+    "crashes": 0,
+    "unique_agents": 14
+  },
+  "summary": {
+    "passed": 7,
+    "failed": 0,
+    "warnings": 1,
+    "total_checks": 8,
+    "soak_ready": true
+  }
+}

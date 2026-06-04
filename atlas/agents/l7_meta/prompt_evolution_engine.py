@@ -146,7 +146,7 @@ class PromptEvolutionEngine(BaseAgent):
         parent_id: Optional[str] = None,
     ):
         """Register a new prompt variant."""
-        prompt_id = uuid.uuid4().hex[:16]
+        prompt_id = self.select_trace_id()
         await self.db._execute_insert(
             """
             INSERT INTO prompt_templates
@@ -195,7 +195,7 @@ class PromptEvolutionEngine(BaseAgent):
                  :score, NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "prompt_id": prompt_id,
                 "strategy_id": strategy_id,
                 "success": success,

@@ -1,4 +1,5 @@
 from redis.asyncio import Redis
+from loguru import logger
 
 class AgentRegistry:
     def __init__(self, redis: Redis, db_client):
@@ -24,8 +25,8 @@ class AgentRegistry:
             """
             try:
                 await self.db.execute(query, agent.agent_id, agent.name, agent.layer, agent.status)
-            except Exception:
-                pass # mock/ignore if db fails
+            except Exception as exc:
+                logger.warning(f"AgentRegistry register DB write failed for {agent.agent_id}: {exc}")
 
     async def deregister(self, agent_id: str) -> None:
         # Set status=stopped in Redis and DB
@@ -36,8 +37,8 @@ class AgentRegistry:
             query = "UPDATE agent_registry SET status = 'stopped' WHERE agent_id = $1"
             try:
                 await self.db.execute(query, agent_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"AgentRegistry deregister DB write failed for {agent_id}: {exc}")
 
     async def get_agent(self, agent_id: str) -> dict:
         key = f"agent:{agent_id}"
@@ -51,8 +52,8 @@ class AgentRegistry:
                 row = await self.db.fetchrow(query, agent_id)
                 if row:
                     return dict(row)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"AgentRegistry DB lookup failed for {agent_id}: {exc}")
         return {}
         
     async def list_agents(self, layer=None, status=None) -> list[dict]:
@@ -84,8 +85,8 @@ class AgentRegistry:
                     exists = await self.redis.exists(f"agent:{agent_id}")
                     if not exists:
                         dead_agents.append(dict(row))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"AgentRegistry health_check DB query failed: {exc}")
         return dead_agents
         
     async def update_heartbeat(self, agent_id: str) -> None:

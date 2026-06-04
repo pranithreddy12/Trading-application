@@ -190,7 +190,9 @@ class DominantOrganismTracker(BaseAgent):
                 for r in rows:
                     sid = str(r[0])
                     results_raw = r[14]
-                    if isinstance(results_raw, str):
+                    if results_raw is None:
+                        results_raw = {}
+                    elif isinstance(results_raw, str):
                         try:
                             results_raw = json.loads(results_raw)
                         except Exception:

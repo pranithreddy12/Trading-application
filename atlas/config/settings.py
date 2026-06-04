@@ -4,8 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from loguru import logger
 from dotenv import load_dotenv
 
+# Construct the path to the .env file
+dotenv_path = os.path.join(os.path.dirname(__file__), ".env")
+
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(dotenv_path=dotenv_path)
 
 
 class Settings(BaseSettings):
@@ -22,9 +25,17 @@ class Settings(BaseSettings):
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     polygon_delayed: bool = True
+    # If True, attempt to fetch 1m bars from yfinance when Polygon returns DELAYED/no-results
+    polygon_fallback_yfinance: bool = False
+    youtube_api_key: str = ""
+    discord_user_token: str = ""
+    discord_guild_ids: str = ""
+    scout_groups: str = ""  # JSON: [{"name":"Dummy","discord":[{"guild_id":"...","channels":["..."]}],"youtube":["..."]}]
+    kaggle_username: str = ""
+    kaggle_api_key: str = ""
 
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=dotenv_path, env_file_encoding="utf-8", extra="ignore"
     )
 
 

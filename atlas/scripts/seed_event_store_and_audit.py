@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from atlas.config.settings import settings
 from atlas.data.storage.timescale_client import TimescaleClient
+from atlas.core.persistence_integrity import canonical_uuid
 from loguru import logger
 from sqlalchemy.sql import text
 
@@ -132,7 +133,7 @@ async def seed_event_store(db: TimescaleClient) -> dict:
                 except Exception:
                     metadata = {}
 
-            event_id = uuid.uuid4().hex[:16]
+            event_id = canonical_uuid(None, field_name="id", context="seed_event_store")
 
             # Content for hash — uses ISO strings for deterministic serialization
             content = {
@@ -270,7 +271,7 @@ async def seed_audit_ledger(db: TimescaleClient) -> dict:
         author = str(st[3]) if st[3] else "system"
         created_at = _ensure_utc(st[4])
         created_iso = created_at.isoformat()
-        trace_id = str(st[5]) if st[5] else uuid.uuid4().hex[:16]
+        trace_id = canonical_uuid(st[5], field_name="trace_id", context="seed_audit_ledger")
 
         # Use per-strategy hash chain (like event_store aggregates)
         # Sequence numbers ensure deterministic ordering within each strategy
@@ -279,7 +280,7 @@ async def seed_audit_ledger(db: TimescaleClient) -> dict:
         seq: int = 1
 
         # Entry 1: Strategy creation
-        eid = uuid.uuid4().hex[:16]
+        eid = canonical_uuid(None, field_name="id", context="seed_audit_ledger")
         c1 = {"id": eid, "event_type": "strategy_created", "actor": author,
               "action": f"Created strategy '{strategy_name}'",
               "resource_type": "strategy", "resource_id": strategy_id,
@@ -302,7 +303,7 @@ async def seed_audit_ledger(db: TimescaleClient) -> dict:
         # Entry 2: Code generation
         if status in ("backtest_ready", "backtest_failed", "pending_backtest",
                       "failed_validation", "repair_candidate"):
-            eid2 = uuid.uuid4().hex[:16]
+            eid2 = canonical_uuid(None, field_name="id", context="seed_audit_ledger")
             c2 = {"id": eid2, "event_type": "code_generated", "actor": "CoderAgent",
                   "action": f"Generated code for strategy '{strategy_name}'",
                   "resource_type": "strategy", "resource_id": strategy_id,
@@ -328,7 +329,7 @@ async def seed_audit_ledger(db: TimescaleClient) -> dict:
             for bt in bt_map[strategy_id]:
                 bt_ts = bt["created_at"]
                 bt_iso = bt_ts.isoformat()
-                eid3 = uuid.uuid4().hex[:16]
+                eid3 = canonical_uuid(None, field_name="id", context="seed_audit_ledger")
                 pstr = "passed" if bt["passed"] else "failed"
                 c3 = {"id": eid3, "event_type": "backtest_completed",
                       "actor": "BacktestRunner",
@@ -365,7 +366,7 @@ async def seed_audit_ledger(db: TimescaleClient) -> dict:
         elif status == "backtest_failed":
             sev = "error"
 
-        eid4 = uuid.uuid4().hex[:16]
+        eid4 = canonical_uuid(None, field_name="id", context="seed_audit_ledger")
         c4 = {"id": eid4, "event_type": "lifecycle_transition",
               "actor": "ValidatorAgent", "action": at,
               "resource_type": "strategy", "resource_id": strategy_id,
@@ -456,7 +457,7 @@ async def seed_event_snapshots(db: TimescaleClient) -> dict:
         created_at = _ensure_utc(sd[8])
 
         snapshot_rows.append({
-            "id": uuid.uuid4().hex[:16],
+            "id": canonical_uuid(None, field_name="id", context="event_snapshots"),
             "aggregate_id": aggregate_id,
             "version": version,
             "state": json.dumps({

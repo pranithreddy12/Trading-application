@@ -30,6 +30,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
+from atlas.core.persistence_integrity import canonical_uuid
 
 
 class ScoutDivergenceEngine(BaseAgent):
@@ -98,7 +99,7 @@ class ScoutDivergenceEngine(BaseAgent):
         )
 
         tracking = {
-            "id": str(uuid.uuid4()),
+            "id": canonical_uuid(None, field_name="id", context="ScoutDivergenceEngine._divergence_cycle"),
             "tracked_at": datetime.now(timezone.utc),
             "n_attributions_analyzed": len(attributions),
             "n_scouts_tracked": len(set(a.get("source_scout", "unknown") for a in attributions)),
@@ -282,7 +283,7 @@ class ScoutDivergenceEngine(BaseAgent):
 
     def _compute_regime_usefulness(self, attributions: list[dict], outcomes: dict) -> dict:
         """Compute regime-specific scout usefulness."""
-        regime_scout = defaultdict(lambda: defaultdict(lambda: {"success": 0, "failure": 0, "neutral": 0}))
+        regime_scout = defaultdict(lambda: defaultdict(lambda: {"successful": 0, "failed": 0, "neutral": 0}))
 
         for a in attributions:
             scout = a["source_scout"]
@@ -290,20 +291,19 @@ class ScoutDivergenceEngine(BaseAgent):
             sid = a["strategy_id"]
             outcome = outcomes.get(sid, {}).get("outcome", "neutral")
 
-            regime_scout[regime][scout][outcome] += 1
+            regime_scout[regime][scout][outcome] = regime_scout[regime][scout].get(outcome, 0) + 1
 
         regime_usefulness = {}
         for regime, scout_data in regime_scout.items():
             scout_scores = {}
             for scout, counts in scout_data.items():
-                total = counts["success"] + counts["failure"] + counts["neutral"]
+                total = counts.get("successful", 0) + counts.get("failed", 0) + counts.get("neutral", 0)
                 if total >= self.MIN_ATTRIBUTIONS_FOR_SCORE:
-                    usefulness = (counts["success"] - counts["failure"]) / total
+                    usefulness = (counts.get("successful", 0) - counts.get("failed", 0)) / total
                     scout_scores[scout] = {
                         "usefulness_score": round(usefulness, 4),
                         "n_attributions": total,
-                        "n_success": counts["success"],
-                        "n_failure": counts["failure"],
+                        "n_success": counts.get("successful", 0), "n_failure": counts.get("failed", 0),
                     }
             if scout_scores:
                 regime_usefulness[regime] = scout_scores

@@ -87,6 +87,20 @@ class DeadLetterManager:
             res = await conn.execute(text(query), {"limit": limit})
             return [dict(r._mapping) for r in res.fetchall()]
 
+    def _classify(self, dead_letter: dict) -> str:
+        reason = (dead_letter.get("failure_reason") or "").lower()
+        state = (dead_letter.get("last_state") or "").lower()
+
+        if any(token in reason for token in ("timeout", "tempor", "network", "connection", "rate limit")):
+            return "transient"
+        if any(token in reason for token in ("broker", "reject", "rejected", "service unavailable", "503")):
+            return "broker"
+        if any(token in reason for token in ("malformed", "invalid payload", "schema", "parse", "json")):
+            return "malformed"
+        if any(token in state for token in ("pending", "submitted", "ack", "retry")):
+            return "transient"
+        return "reconciliation_mismatch"
+
     async def resolve(self, dead_letter_id: str, resolution: str):
         """Mark as resolved with explanation."""
         query = """
@@ -143,7 +157,7 @@ class DeadLetterManager:
                 client_order_id=dl["client_order_id"],
                 symbol=dl["symbol"],
                 side=dl["side"],
-                qty=dl["quantity"]
+                qty=float(dl["quantity"])
             )
             
             await self.resolve(dead_letter_id, f"Replayed successfully. Broker ID: {order.get('id')}")
@@ -156,3 +170,53 @@ class DeadLetterManager:
             async with self.db.engine.begin() as conn:
                 await conn.execute(text(update_q), {"id": dead_letter_id})
             return False
+
+    async def reconcile_unresolved(self, gateway, limit: int = 50) -> dict:
+        """Replay-safe reconciliation pass for unresolved dead letters."""
+        unresolved = await self.get_unresolved(limit=limit)
+        summary = {
+            "checked": len(unresolved),
+            "replayed": 0,
+            "classified_transient": 0,
+            "classified_broker": 0,
+            "classified_malformed": 0,
+            "classified_mismatch": 0,
+            "resolved_without_replay": 0,
+            "failed": 0,
+        }
+
+        for dead_letter in unresolved:
+            classification = self._classify(dead_letter)
+            if classification == "transient":
+                summary["classified_transient"] += 1
+                if await self.replay(str(dead_letter["id"]), gateway):
+                    summary["replayed"] += 1
+                else:
+                    summary["failed"] += 1
+            elif classification == "broker":
+                summary["classified_broker"] += 1
+                if await self.replay(str(dead_letter["id"]), gateway):
+                    summary["replayed"] += 1
+                else:
+                    summary["failed"] += 1
+            elif classification == "malformed":
+                summary["classified_malformed"] += 1
+                await self.resolve(
+                    str(dead_letter["id"]),
+                    "classified malformed payload; manual remediation required",
+                )
+                summary["resolved_without_replay"] += 1
+            else:
+                summary["classified_mismatch"] += 1
+                await self.resolve(
+                    str(dead_letter["id"]),
+                    "reconciliation mismatch; manual review required",
+                )
+                summary["resolved_without_replay"] += 1
+
+        logger.info(
+            f"Dead-letter reconciliation: checked={summary['checked']} replayed={summary['replayed']} "
+            f"transient={summary['classified_transient']} broker={summary['classified_broker']} "
+            f"malformed={summary['classified_malformed']} mismatch={summary['classified_mismatch']}"
+        )
+        return summary

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import redis.asyncio as redis
 from sqlalchemy import text
+from loguru import logger
 
 from atlas.config.settings import settings
 from atlas.data.storage.timescale_client import TimescaleClient
@@ -60,6 +61,8 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
 
         is_options = request.method == "OPTIONS"
         is_health = request.url.path == "/health"
+        is_root = request.url.path == "/"
+        is_favicon = request.url.path == "/favicon.ico"
         auth_header = request.headers.get("Authorization", "")
         has_auth = bool(auth_header and auth_header.startswith("Bearer "))
 
@@ -107,7 +110,7 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
 
             return JSONResponse(status_code=401, content={"error": "invalid_api_key"})
 
-        if is_health:
+        if is_health or is_root or is_favicon:
             response = await call_next(request)
             return response
 
@@ -125,11 +128,15 @@ async def auth_and_rate_limit_middleware(request: Request, call_next):
 @app.on_event("startup")
 async def startup_event():
     global auth_service
+    await db_client.connect()
+    await db_client.validate_schema_contracts(strict=False)
     try:
-        await db_client.connect()
-        auth_service = AuthService(db_client)
-    except Exception:
-        pass
+        seeded = await db_client.sync_paper_trades_from_executions()
+        if seeded:
+            logger.info(f"Seeded paper_trades from execution history: {seeded} rows")
+    except Exception as exc:
+        logger.warning(f"paper_trades bootstrap sync failed: {exc}")
+    auth_service = AuthService(db_client)
 
 
 @app.on_event("shutdown")
@@ -162,6 +169,16 @@ async def get_health():
             "redis": "healthy",
             "api": "healthy",
         },
+    }
+
+
+@app.get("/")
+async def get_root():
+    return {
+        "service": "ATLAS Dashboard API",
+        "status": "running",
+        "health": "/health",
+        "auth": "required for protected endpoints",
     }
 
 
@@ -259,7 +276,26 @@ async def get_positions():
 
 @app.get("/paper_trades")
 async def get_paper_trades():
-    return [{"strategy_name": "SMA_Crossover", "symbol": "AAPL", "pnl": 50.0}]
+    async with db_client.engine.connect() as conn:
+        result = await conn.execute(
+            text(
+                """
+                SELECT
+                    id, time, strategy_id, symbol, side, quantity,
+                    price, fill_price, status, pnl
+                FROM paper_trades
+                ORDER BY time DESC
+                LIMIT 100
+                """
+            )
+        )
+        rows = []
+        for row in result.fetchall():
+            data = dict(row._mapping)
+            data["id"] = str(data["id"]) if data.get("id") is not None else None
+            data["strategy_id"] = str(data["strategy_id"]) if data.get("strategy_id") is not None else None
+            rows.append(data)
+        return rows
 
 
 @app.get("/features/{symbol}")

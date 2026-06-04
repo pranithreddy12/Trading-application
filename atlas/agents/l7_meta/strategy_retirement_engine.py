@@ -18,7 +18,7 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -114,7 +114,7 @@ class StrategyRetirementEngine(BaseAgent):
 
         report = {
             "id": str(uuid.uuid4()),
-            "analyzed_at": datetime.utcnow().isoformat(),
+            "analyzed_at": datetime.now(timezone.utc),
             "n_strategies_analyzed": len(strategies),
             "n_active": sum(1 for l in lifecycle_states.values() if l["state"] == "active"),
             "n_monitor": sum(1 for l in lifecycle_states.values() if l["state"] == "monitor"),
@@ -348,6 +348,9 @@ class StrategyRetirementEngine(BaseAgent):
         if not self.db:
             return
         try:
+            analyzed_at = report["analyzed_at"]
+            if isinstance(analyzed_at, str):
+                analyzed_at = datetime.fromisoformat(analyzed_at)
             await self.db._execute_insert(
                 """
                 INSERT INTO strategy_retirement
@@ -363,7 +366,7 @@ class StrategyRetirementEngine(BaseAgent):
                 """,
                 {
                     "id": report["id"],
-                    "analyzed_at": report["analyzed_at"],
+                    "analyzed_at": analyzed_at,
                     "n_strategies_analyzed": report["n_strategies_analyzed"],
                     "n_active": report["n_active"],
                     "n_monitor": report["n_monitor"],
@@ -385,7 +388,7 @@ class StrategyRetirementEngine(BaseAgent):
         try:
             signal = {
                 "type": "strategy_retirement",
-                "analyzed_at": report["analyzed_at"],
+                "analyzed_at": report["analyzed_at"].isoformat() if hasattr(report["analyzed_at"], "isoformat") else str(report["analyzed_at"]),
                 "n_retirement_pending": report["n_retirement_pending"],
                 "n_retired": report["n_retired"],
                 "withdrawal_signals": report["capital_withdrawal_signals"][:5],

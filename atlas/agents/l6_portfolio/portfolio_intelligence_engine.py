@@ -441,13 +441,14 @@ class PortfolioIntelligenceEngine(BaseAgent):
             await self.db._execute_insert(
                 """
                 INSERT INTO portfolio_evolution_log
-                    (portfolio_id, diversification_score, correlation_collapse_risk, 
+                    (id, portfolio_id, diversification_score, correlation_collapse_risk, 
                      contagion_exposure, concentration_risk, portfolio_survivability, 
                      drawdown_recovery_speed, active_strategies)
                 VALUES
-                    (:pid, :div_score, :corr_risk, :contagion, :conc_risk, :surv, :recovery, :active)
+                    (:id, :pid, :div_score, :corr_risk, :contagion, :conc_risk, :surv, :recovery, :active)
                 """,
                 {
+                    "id": str(uuid.uuid4()),
                     "pid": intelligence["id"],
                     "div_score": intelligence["diversification_score"],
                     "corr_risk": 1.0 - intelligence["diversification_score"], # Proxy for correlation collapse

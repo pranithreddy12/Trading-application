@@ -2,6 +2,7 @@ import json
 import asyncio
 from enum import Enum
 from redis.asyncio import Redis
+from loguru import logger
 
 class Channel(str, Enum):
     MARKET_DATA = "market_data"

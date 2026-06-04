@@ -1,0 +1,14 @@
+{
+  "session_id": "4a4d0fdf04214ccd90559123d22c15da",
+  "generated_at": "2026-05-28T12:20:46.356380Z",
+  "summary": {
+    "operations": {
+      "VALIDATE": 2508
+    },
+    "top_violations": [],
+    "repair_hotspots": [],
+    "bypass_hotspots": [],
+    "lineage_fractures": [],
+    "trace_discontinuities": []
+  }
+}

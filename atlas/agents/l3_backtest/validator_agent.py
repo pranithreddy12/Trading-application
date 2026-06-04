@@ -134,6 +134,7 @@ class ValidatorAgent(BaseAgent):
 
     async def run(self):
         print("=== VALIDATOR RUN LOOP ENTERED ===", flush=True)
+        self.status = "running"
         logger.info("ValidatorAgent polling for pending_validation strategies")
         while self.status == "running":
             try:

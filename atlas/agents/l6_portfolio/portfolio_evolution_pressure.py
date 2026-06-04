@@ -113,8 +113,9 @@ class PortfolioEvolutionPressure(BaseAgent):
             "pressured_allocations": pressured_allocations,
             "migration_signals": migration_signals,
             "evolution_pressure_stats": {
-                "n_weak_penalized": sum(1 for a in pressured_allocations if a.get("evolution_adjustment", 0) < -0.1),
-                "n_dominant_boosted": sum(1 for a in pressured_allocations if a.get("evolution_adjustment", 0) > 0.1),
+                # Count adjustments more sensitively (>=1% change) so selection pressure is visible
+                "n_weak_penalized": sum(1 for a in pressured_allocations if a.get("evolution_adjustment", 0) < -0.01),
+                "n_dominant_boosted": sum(1 for a in pressured_allocations if a.get("evolution_adjustment", 0) > 0.01),
                 "n_correlated_penalized": len(correlation_penalties),
                 "total_capital_migrated": round(sum(abs(a.get("evolution_adjustment", 0)) for a in pressured_allocations) / 2, 4),
                 "stress_diversification_active": stress_active,
@@ -230,6 +231,7 @@ class PortfolioEvolutionPressure(BaseAgent):
 
     def _compute_organism_strength(self, portfolio: list[dict]) -> list[dict]:
         """Compute strength scores for each organism."""
+        # Compute raw multi-factor strength first
         scores = []
         for o in portfolio:
             score = o.get("score", 0)
@@ -237,7 +239,6 @@ class PortfolioEvolutionPressure(BaseAgent):
             win_rate = o.get("win_rate", 0.5)
             dd = abs(o.get("max_drawdown", 0.01))
 
-            # Multi-factor strength
             strength = (
                 min(1.0, score / 100) * 0.30
                 + max(0, min(1.0, sharpe / 3)) * 0.25
@@ -249,10 +250,25 @@ class PortfolioEvolutionPressure(BaseAgent):
                 "strategy_id": o["id"],
                 "strategy_name": o["name"],
                 "strength_score": round(strength, 4),
-                "is_weak": strength < 0.3,
-                "is_strong": strength > 0.7,
                 "current_weight": o.get("current_weight", 0),
             })
+
+        # Apply percentile-based thresholds so selection adapts to current score distribution
+        try:
+            values = np.array([s["strength_score"] for s in scores])
+            if len(values) > 0:
+                p20 = float(np.percentile(values, 20))
+                p80 = float(np.percentile(values, 80))
+            else:
+                p20 = 0.3
+                p80 = 0.7
+        except Exception:
+            p20 = 0.3
+            p80 = 0.7
+
+        for s in scores:
+            s["is_weak"] = s["strength_score"] <= p20
+            s["is_strong"] = s["strength_score"] >= p80
 
         scores.sort(key=lambda x: -x["strength_score"])
         return scores

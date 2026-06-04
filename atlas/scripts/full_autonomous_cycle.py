@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 from loguru import logger
 from redis.asyncio import Redis
 
+from atlas.agents.l1_data.binance_rest_agent import BinanceWebSocketAgent
+from atlas.agents.l1_data.polygon_rest_agent import PolygonRestAgent
+from atlas.agents.l1_data.feature_agent import FeatureAgent
 from atlas.agents.l2_strategy.coder_agent import CoderAgent
 from atlas.agents.l2_strategy.ideator_agent_v2 import IdeatorAgentV2
 from atlas.agents.l2_strategy.mutator_agent import MutatorAgent
@@ -58,6 +62,11 @@ from atlas.agents.l7_meta.mutation_policy_engine import MutationPolicyEngine
 from atlas.agents.l7_meta.feature_evolution_engine import FeatureEvolutionEngine
 from atlas.agents.l7_meta.agent_performance_governor import AgentPerformanceGovernor
 from atlas.agents.scouts.news_intelligence_engine import NewsIntelligenceEngine
+from atlas.agents.scouts.reddit_scout import RedditScout
+from atlas.agents.scouts.discord_scout import DiscordScout
+from atlas.agents.scouts.youtube_scout import YouTubeScout
+from atlas.agents.scouts.podcast_scout import PodcastScout
+from atlas.agents.scouts.competition_scout import CompetitionScout
 from atlas.agents.scouts.source_reliability_engine import SourceReliabilityEngine
 from atlas.agents.scouts.hypothesis_validation_engine import HypothesisValidationEngine
 from atlas.agents.l7_meta.scout_synthesis_engine import ScoutSynthesisEngine
@@ -72,11 +81,15 @@ from atlas.scripts.soak.phase24_monitor import SoakMonitor
 
 
 def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
-    broker = SimulatorAdapter(default_price=100.0, fill_latency_ms=10)
+    broker = SimulatorAdapter(default_price=100.0, fill_latency_ms=10, db_client=db_client)
     risk = RiskController(redis_client, db_client)
     lineage = EventLineageClient(db_client)
 
     return [
+        # Phase 1: Live market-data ingestion
+        BinanceWebSocketAgent(redis_client, db_client.db_url),
+        PolygonRestAgent(redis_client, db_client.db_url),
+        FeatureAgent(redis_client),
         # Phase 10: Internal Scout Network
         RegimeScout(redis_client, db_client),
         LiquidityScout(redis_client, db_client),
@@ -112,6 +125,11 @@ def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
         FeatureEvolutionEngine(redis_client, db_client),
         AgentPerformanceGovernor(redis_client, db_client),
         # Phase 16-26: External Intelligence & Coupling
+        RedditScout(redis_client, db_client),
+        DiscordScout(redis_client, db_client),
+        YouTubeScout(redis_client, db_client),
+        PodcastScout(redis_client, db_client),
+        CompetitionScout(redis_client, db_client),
         NewsIntelligenceEngine(redis_client, db_client),
         SourceReliabilityEngine(redis_client, db_client),
         HypothesisValidationEngine(redis_client, db_client),
@@ -152,6 +170,7 @@ async def _stop_agents(agents: list) -> None:
 
 
 async def main() -> None:
+    await asyncio.sleep(30)  # Wait for the database to start
     parser = argparse.ArgumentParser(description="Run the autonomous ATLAS cycle")
     parser.add_argument(
         "--duration-minutes",
@@ -159,11 +178,43 @@ async def main() -> None:
         default=60,
         help="How long to keep the supervisor running before shutting down",
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="logs/autonomous_cycle_{time:YYYY-MM-DD_HHmmss}.log",
+        help="Path to the log file (supports loguru rotation patterns)",
+    )
     args = parser.parse_args()
+
+    # Write logs to a file with rotation (10 MB per file, keep 5 backups)
+    log_path = Path(args.log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        str(log_path),
+        level="DEBUG",
+        rotation="10 MB",
+        retention=5,
+        enqueue=True,  # thread-safe for async agents
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level:<7} | {name}:{function}:{line} | {message}",
+    )
+    logger.info(f"Logging to file: {log_path.resolve()}")
 
     settings = get_settings()
     db_client = TimescaleClient(settings.database_url)
-    await db_client.connect()
+    try:
+        await db_client.connect()
+    except Exception as mig_error:
+        logger.warning(f"Migration attempt 1 failed: {mig_error} — retrying (may create remaining tables)")
+        await db_client.close()
+        db_client = TimescaleClient(settings.database_url)
+        await db_client.connect()
+        logger.info("Migration completed on retry")
+    try:
+        seeded = await db_client.sync_paper_trades_from_executions()
+        if seeded:
+            logger.info(f"Seeded paper_trades from execution history: {seeded} rows")
+    except Exception as e:
+        logger.warning(f"paper_trades bootstrap sync failed: {e}")
     redis_client = Redis.from_url(settings.redis_url)
 
     agents = _build_agents(redis_client, db_client)
@@ -178,9 +229,22 @@ async def main() -> None:
         monitor = None
 
     logger.info(
-        "Starting institutional cycle with Phases 13-18: "
-        "portfolio -> risk -> meta-learn -> scout -> execute -> govern -> monitor"
+        "Starting institutional cycle with L1 ingestion + Phases 13-18: "
+        "ingest -> portfolio -> risk -> meta-learn -> scout -> execute -> govern -> monitor"
     )
+    
+    # Pre-seed ingestion to ensure data is present for strategies
+    logger.info("Pre-seeding market data from L1 ingestion agents...")
+    for agent in agents:
+        if agent.name in ("BinanceWebSocketAgent", "PolygonRestAgent"):
+            try:
+                # Trigger a single explicit ingestion cycle before full async start
+                if hasattr(agent, "initialize"):
+                    await agent.initialize()
+                logger.info(f"Pre-seeded data for {agent.name}")
+            except Exception as e:
+                logger.warning(f"Failed to pre-seed {agent.name}: {e}")
+                
     tasks = await _start_agents(agents)
 
     runtime_seconds = max(1, args.duration_minutes) * 60

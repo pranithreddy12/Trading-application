@@ -411,14 +411,15 @@ class EconomicEfficiencyEngine(BaseAgent):
                         SELECT
                             checked_at,
                             drawdown_pct,
-                            LAG(drawdown_pct) OVER (ORDER BY checked_at) as prev_dd
+                            LAG(drawdown_pct) OVER (ORDER BY checked_at) as prev_dd,
+                            EXTRACT(EPOCH FROM checked_at - LAG(checked_at) OVER (ORDER BY checked_at)) / 3600 as hours_since_prev
                         FROM capital_preservation_state
                         WHERE checked_at > NOW() - INTERVAL '7 days'
                     )
                     SELECT
                         COALESCE(AVG(
                             CASE WHEN drawdown_pct < 0.05 AND prev_dd >= 0.10
-                            THEN EXTRACT(EPOCH FROM checked_at - LAG(checked_at) OVER (ORDER BY checked_at)) / 3600
+                            THEN hours_since_prev
                             ELSE NULL END
                         ), 0) as avg_recovery_hours
                     FROM dd_events
@@ -616,7 +617,7 @@ class EconomicEfficiencyEngine(BaseAgent):
                          :trend, :mutation_survival, :scout_attribution, :metadata)
                     """,
                     {
-                        "id": uuid.uuid4().hex[:16],
+                        "id": self.select_trace_id(),
                         "window_hours": int(window_hours.replace("h", "")),
                         "computed_at": now,
                         "n_strategies": data["n_strategies"],
@@ -727,17 +728,24 @@ class EconomicEfficiencyEngine(BaseAgent):
 
                 # Cascading failure risk: correlation between strategy failures
                 r5 = await conn.execute(text("""
-                    SELECT
-                        CASE WHEN COUNT(*) > 1
-                        THEN COALESCE(CORR(failure_count_1, failure_count_2), 0)
-                        ELSE 0 END as cascade_corr
-                    FROM (
+                    WITH hourly_failures AS (
                         SELECT
-                            SUM(CASE WHEN lifecycle_state IN ('failed', 'dead') THEN 1 ELSE 0 END) as failure_count_1,
-                            LAG(SUM(CASE WHEN lifecycle_state IN ('failed', 'dead') THEN 1 ELSE 0 END)) OVER (ORDER BY DATE_TRUNC('hour', created_at)) as failure_count_2
+                            DATE_TRUNC('hour', created_at) AS hour_bucket,
+                            SUM(CASE WHEN lifecycle_state IN ('failed', 'dead') THEN 1 ELSE 0 END) AS failure_count
                         FROM strategies
                         WHERE created_at > NOW() - INTERVAL '7 days'
                         GROUP BY DATE_TRUNC('hour', created_at)
+                    )
+                    SELECT
+                        CASE WHEN COUNT(*) > 1
+                        THEN COALESCE(CORR(failure_count, prev_failure_count), 0)
+                        ELSE 0 END AS cascade_corr
+                    FROM (
+                        SELECT
+                            hour_bucket,
+                            failure_count,
+                            LAG(failure_count) OVER (ORDER BY hour_bucket) AS prev_failure_count
+                        FROM hourly_failures
                     ) sub
                 """))
                 cascade_row = r5.fetchone()
@@ -1227,7 +1235,7 @@ class EconomicEfficiencyEngine(BaseAgent):
     async def _persist_composite_analysis(self, composite: dict) -> None:
         """Persist the full composite economic analysis to the database."""
         now = datetime.now(timezone.utc)
-        analysis_id = uuid.uuid4().hex[:16]
+        analysis_id = self.select_trace_id()
 
         try:
             # Extract key summary metrics for the composite row
@@ -1319,6 +1327,7 @@ class EconomicEfficiencyEngine(BaseAgent):
 
     async def _persist_regime_specialization(self, rs: dict, analysis_id: str, now: datetime) -> None:
         """Persist regime specialization details."""
+        analysis_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, analysis_id)
         for regime, data in rs.get("regime_specialists", {}).items():
             await self.db._execute_insert(
                 """
@@ -1330,7 +1339,7 @@ class EconomicEfficiencyEngine(BaseAgent):
                      :avg_sortino, :avg_win_rate, :avg_drawdown, :total_trades, :recorded_at)
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": str(uuid.uuid5(analysis_namespace, f"regime:{regime}")),
                     "analysis_id": analysis_id,
                     "regime": regime,
                     "n_obs": data["n_observations"],
@@ -1355,7 +1364,7 @@ class EconomicEfficiencyEngine(BaseAgent):
                  :vol_sensitive, :liq_sensitive, :metadata)
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": str(uuid.uuid5(analysis_namespace, "regime_specialization_summary")),
                 "analysis_id": analysis_id,
                 "computed_at": now,
                 "fragile": len(rs.get("fragile_organisms", [])),
@@ -1368,6 +1377,7 @@ class EconomicEfficiencyEngine(BaseAgent):
 
     async def _persist_scout_rankings(self, spv: dict, analysis_id: str, now: datetime) -> None:
         """Persist scout predictive value rankings."""
+        analysis_namespace = uuid.uuid5(uuid.NAMESPACE_DNS, analysis_id)
         for scout_name, data in spv.get("scout_rankings", {}).items():
             await self.db._execute_insert(
                 """
@@ -1383,7 +1393,7 @@ class EconomicEfficiencyEngine(BaseAgent):
                      :eco_score_penalized, :metadata)
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": str(uuid.uuid5(analysis_namespace, f"scout:{scout_name}")),
                     "analysis_id": analysis_id,
                     "source_scout": scout_name,
                     "computed_at": now,

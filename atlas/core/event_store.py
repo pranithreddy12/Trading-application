@@ -30,6 +30,8 @@ from typing import Any, Optional
 from loguru import logger
 from sqlalchemy.sql import text
 
+from atlas.core.persistence_integrity import canonical_uuid
+
 
 class EventVersion(str, Enum):
     V1 = "1.0"
@@ -91,7 +93,7 @@ class EventStore:
     ) -> str:
         """Append an immutable event. Returns event_id."""
         async with self._lock:
-            event_id = uuid.uuid4().hex[:16]
+            event_id = canonical_uuid(None, field_name="id", context="EventStore.append_event")
             now = datetime.now(timezone.utc)
 
             # Get previous hash for aggregate stream
@@ -280,7 +282,7 @@ class EventStore:
         version: int,
     ) -> str:
         """Create a point-in-time snapshot for fast replay."""
-        snapshot_id = uuid.uuid4().hex[:16]
+        snapshot_id = canonical_uuid(None, field_name="id", context="EventStore.create_snapshot")
         await self.db._execute_insert(
             """
             INSERT INTO event_snapshots

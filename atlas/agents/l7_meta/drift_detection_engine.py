@@ -18,7 +18,7 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -98,7 +98,7 @@ class DriftDetectionEngine(BaseAgent):
 
         report = {
             "id": str(uuid.uuid4()),
-            "detected_at": datetime.utcnow().isoformat(),
+            "detected_at": datetime.now(timezone.utc),
             "feature_drift": feature_drift,
             "strategy_drift": strategy_drift,
             "regime_drift": regime_drift,
@@ -377,6 +377,9 @@ class DriftDetectionEngine(BaseAgent):
         if not self.db:
             return
         try:
+            detected_at = report["detected_at"]
+            if isinstance(detected_at, str):
+                detected_at = datetime.fromisoformat(detected_at)
             await self.db._execute_insert(
                 """
                 INSERT INTO drift_detection
@@ -394,7 +397,7 @@ class DriftDetectionEngine(BaseAgent):
                 """,
                 {
                     "id": report["id"],
-                    "detected_at": report["detected_at"],
+                    "detected_at": detected_at,
                     "feature_drift_score": report["feature_drift"].get("drift_score", 0),
                     "strategy_drift_score": report["strategy_drift"].get("drift_score", 0),
                     "regime_drift_score": report["regime_drift"].get("drift_score", 0),

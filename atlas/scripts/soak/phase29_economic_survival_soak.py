@@ -370,7 +370,7 @@ async def _log_checkpoint(db: TimescaleClient, snapshot: dict) -> None:
                 (:id, :analyzed_at, CAST(:composite AS jsonb), CAST(:metadata AS jsonb), :expectancy)
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": canonical_uuid(None, field_name="id", context="economic_efficiency_analysis"),
                 "analyzed_at": datetime.now(timezone.utc),
                 "composite": json.dumps(snapshot, default=str),
                 "metadata": json.dumps({

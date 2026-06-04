@@ -91,7 +91,7 @@ class PositionReconciliationEngine(BaseAgent):
         total_exposure_delta = 0.0
         total_pnl_delta = 0.0
         repair_actions = []
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
 
         for symbol in all_symbols:
             lp = leader_positions.get(symbol, self._empty_position())
@@ -157,7 +157,7 @@ class PositionReconciliationEngine(BaseAgent):
                  :recon_score, CAST(:metadata AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "leader_id": leader_id,
                 "follower_id": follower_id,
@@ -244,7 +244,7 @@ class PositionReconciliationEngine(BaseAgent):
                  :sync_q, CAST(:metadata AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "leader_id": leader_id,
                 "follower_id": follower_id,

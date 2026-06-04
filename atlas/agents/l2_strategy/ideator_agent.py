@@ -130,9 +130,9 @@ DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
         # price_vs_vwap_pct > 0: ~55% | rvol > 0.9: ~55% → ~30%
         (["price_vs_vwap_pct > 0.0", "relative_volume > 0.9"],
          ["price_vs_vwap_pct < -0.0005"]),
-        # ema_12 > ema_26: ~50% | rsi_14 > 50: ~50% → ~25%
-        (["ema_12 > ema_26", "rsi_14 > 50"],
-         ["ema_12 < ema_26"]),
+        # ema_spread_pct > 0.0005: ~35% | rsi_14 > 52: ~45% → ~16%
+        (["ema_spread_pct > 0.0005", "rsi_14 > 52"],
+         ["ema_spread_pct < -0.0003"]),
     ],
     ("equity", "mean_reversion"): [
         # bb_pos < 0.3: ~13% | rvol > 0.8: ~68% → ~9%
@@ -157,9 +157,9 @@ DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
          ["bollinger_band_position < 0.55"]),
     ],
     ("equity", "trend_following"): [
-        # ema_12 > ema_26: ~50% → single strong trigger
-        (["ema_12 > ema_26"],
-         ["ema_12 < ema_26"]),
+        # ema_spread_pct > 0.0003: ~40% → normalized EMA signal
+        (["ema_spread_pct > 0.0003", "trend_strength > 0.0"],
+         ["ema_spread_pct < -0.0003"]),
         # trend_strength > 0.0: ~50% | ema_spread_pct > 0.0: ~48% → ~24%
         (["trend_strength > 0.0", "ema_spread_pct > 0.0"],
          ["trend_strength < -0.0005"]),
@@ -183,8 +183,8 @@ DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
          ["ema_spread_pct < -0.0005", "rsi_14 < 50"]),
         (["price_vs_vwap_pct > 0.0", "relative_volume > 1.0"],
          ["price_vs_vwap_pct < -0.0005"]),
-        (["ema_12 > ema_26", "trend_strength > 0.0"],
-         ["ema_12 < ema_26"]),
+        (["ema_spread_pct > 0.0008", "trend_strength > 0.0005"],
+         ["ema_spread_pct < -0.0003"]),
     ],
     ("crypto", "mean_reversion"): [
         (["rsi_14 < 42", "price_vs_vwap_pct < -0.001"],
@@ -203,7 +203,7 @@ DIVERSE_TEMPLATES: dict[tuple[str, str], list[tuple[list[str], list[str]]]] = {
          ["price_vs_vwap_pct < 0.0"]),
     ],
     ("crypto", "trend_following"): [
-        (["ema_12 > ema_26"], ["ema_12 < ema_26"]),
+        (["ema_spread_pct > 0.0005"], ["ema_spread_pct < -0.0005"]),
         (["trend_strength > 0.0", "ema_spread_pct > 0.0"], ["trend_strength < -0.0005"]),
         (["sma_20 > ema_12", "price_vs_vwap_pct > 0.0"], ["sma_20 < ema_12"]),
     ],
@@ -329,6 +329,7 @@ class IdeatorAgent(BaseAgent):
             "successful_patterns": [],
             "recent_names": [],
             "bars_available": {},
+            "feature_blacklist": [],
         }
 
         try:
@@ -462,6 +463,34 @@ class IdeatorAgent(BaseAgent):
         except Exception as e:
             logger.warning(f"{self.name}: Bars count fetch: {e}")
 
+        # ── Pattern intelligence: feature blacklist ──
+        try:
+            from sqlalchemy import text as _text
+
+            async with self.db_client.engine.connect() as conn:
+                r = await conn.execute(
+                    _text("""
+                        SELECT DISTINCT recommendation
+                        FROM pattern_memory
+                        WHERE pattern_type IN ('cost_trap', 'mutation_context')
+                           OR recommendation LIKE 'AVOID%%'
+                        ORDER BY detected_at DESC
+                        LIMIT 15
+                    """)
+                )
+                context["feature_blacklist"] = [
+                    row[0] for row in r.fetchall() if row[0]
+                ]
+
+            # Hard-coded empirical blacklist (501 strategies, 0% survival)
+            context["feature_blacklist"].extend([
+                "Pure EMA crossover (ema_12 > ema_26 as sole entry) → 0% survival rate across 500+ strategies",
+                "Use ema_spread_pct instead of raw ema_12/ema_26 comparisons",
+                "Breakout archetype is a cost trap — costs consume >30% of edge. Require relative_volume > 2.5 minimum.",
+            ])
+        except Exception as e:
+            logger.warning(f"{self.name}: Blacklist fetch error: {e}")
+
         return context
 
     # =========================================================
@@ -516,6 +545,13 @@ class IdeatorAgent(BaseAgent):
         )
 
         names_str = ", ".join(recent_names[:10]) if recent_names else "none yet"
+
+        # Format feature blacklist
+        blacklist = context.get("feature_blacklist", [])
+        if blacklist:
+            blacklist_str = "\n".join(f"  ❌ {b}" for b in blacklist[:8])
+        else:
+            blacklist_str = "  No known losers yet."
 
         system_prompt = """You are a senior quantitative researcher at a proprietary trading fund.
 You design algorithmic trading strategies that run on 1-minute OHLCV bar data.
@@ -588,6 +624,13 @@ Condition format rules:
   WRONG: "relative_volume > 5.0" (almost never happens)
 
 Avoid these recently used strategy names: {names_str}
+
+=== FEATURE BLACKLIST (these are PROVEN LOSERS — do NOT use) ===
+{blacklist_str}
+
+CRITICAL: Do NOT use "ema_12 > ema_26" or "ema_12 < ema_26" as primary entry/exit.
+This pattern has ZERO survival rate across 500+ backtested strategies.
+Instead, use ema_spread_pct which captures the same signal as a normalized ratio.
 
 === YOUR THINKING PROCESS ===
 Before outputting JSON, think through:

@@ -255,8 +255,8 @@ class HypothesisEngine(BaseAgent):
             obs_type = obs.get("type", "")
             source = obs.get("source", "")
             data = obs.get("data", {})
-            h_id = uuid.uuid4().hex[:16]
-            trace_id = uuid.uuid4().hex[:16]
+            h_id = self.select_trace_id()
+            trace_id = self.select_trace_id()
 
             if obs_type == "drift_escalation":
                 composite = data.get("composite", 0)
@@ -353,8 +353,8 @@ Output JSON array, each object:
             hypotheses = []
             for item in items[:3]:
                 hypotheses.append(Hypothesis(
-                    id=uuid.uuid4().hex[:16],
-                    trace_id=uuid.uuid4().hex[:16],
+                    id=self.select_trace_id(),
+                    trace_id=self.select_trace_id(),
                     statement=item.get("statement", ""),
                     observation_source=item.get("observation_source", "llm_generated"),
                     testable_prediction=item.get("testable_prediction", ""),

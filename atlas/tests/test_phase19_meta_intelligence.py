@@ -103,7 +103,7 @@ def test_grammar_template_resolution():
 
     # Numeric range template
     tmpl = ("rsi_14", "<", (28, 38))
-    result = agent._resolve_grammar_template(tmpl, "equity")
+    result = agent._resolve_grammar_template(tmpl, "equity", {})
     assert result is not None
     assert "rsi_14 <" in result
     val = float(result.split("< ")[1])
@@ -111,7 +111,7 @@ def test_grammar_template_resolution():
 
     # Cross-feature template
     tmpl2 = ("ema_12", ">", "ema_26")
-    result2 = agent._resolve_grammar_template(tmpl2, "equity")
+    result2 = agent._resolve_grammar_template(tmpl2, "equity", {})
     assert result2 == "ema_12 > ema_26"
 
 

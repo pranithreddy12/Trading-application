@@ -63,6 +63,18 @@ def compute_short_window_metrics(
 
     sub["cum_return"] = (1 + sub["strategy_return"]).cumprod()
 
+    # Per-bar Sharpe ratio (correct: uses per-bar strategy_return, not per-trade PnL)
+    strat_returns = sub["strategy_return"].values
+    std = float(np.std(strat_returns))
+    per_bar_sharpe = 0.0
+    if std > 0 and len(strat_returns) > 0:
+        mean_ret = float(np.mean(strat_returns))
+        bars_per_year = 525600  # 365 * 24 * 60 (minutes)
+        per_bar_sharpe = np.sqrt(bars_per_year) * (mean_ret / std)
+        if np.isnan(per_bar_sharpe) or np.isinf(per_bar_sharpe):
+            per_bar_sharpe = 0.0
+        per_bar_sharpe = max(min(per_bar_sharpe, 10.0), -10.0)
+
     total_return = float(sub["cum_return"].iloc[-1] - 1)
 
     trades_bars = sub[sub["position"].diff().fillna(0) != 0]
@@ -132,6 +144,7 @@ def compute_short_window_metrics(
         "profit_factor": profit_factor,
         "avg_return_per_trade": avg_return_per_trade,
         "max_drawdown": max_drawdown,
+        "sharpe_ratio": per_bar_sharpe,
         "evaluation_mode": "short_window",
     }
 
@@ -160,6 +173,9 @@ def compute_composite_short_window_score(metrics: dict) -> float:
     # 10% trade count — more is better, cap at 50
     t_score = max(0.0, min(1.0, trades / 50.0))
 
+    if trades == 0:
+        return 0.0
+
     score = (
         r_score * 0.30
         + pf_score * 0.25
@@ -181,5 +197,22 @@ def _zero_metrics() -> dict:
         "profit_factor": 1.0,
         "avg_return_per_trade": 0.0,
         "max_drawdown": 0.0,
+        "sharpe_ratio": 0.0,
         "evaluation_mode": "short_window",
     }
+
+
+def score_temporal_consistency(scores_by_window: list[float]) -> float:
+    """
+    Measures how consistent a strategy performs across time windows.
+    Returns 0-1. Higher = more temporally consistent.
+    """
+    if len(scores_by_window) < 2:
+        return 0.0
+    import numpy as np
+    arr = np.array(scores_by_window)
+    mean_val = np.mean(arr)
+    # Coefficient of variation (lower = more consistent)
+    cv = np.std(arr) / (abs(mean_val) + 1e-8)
+    # Convert to 0-1 score (cv=0 -> 1.0, cv>=1 -> 0.0)
+    return float(max(0.0, 1.0 - cv))

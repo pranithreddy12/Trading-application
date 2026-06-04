@@ -103,7 +103,7 @@ class LeaderGovernanceEngine(BaseAgent):
         else:
             leader_state = "trusted"
 
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
 
         await self.db._execute_insert(
             """
@@ -119,7 +119,7 @@ class LeaderGovernanceEngine(BaseAgent):
                  :vol_adj, :n_foll, CAST(:meta AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "leader_id": leader_id,
                 "health": round(health_score, 4),

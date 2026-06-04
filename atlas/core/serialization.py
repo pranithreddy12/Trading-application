@@ -117,6 +117,9 @@ def normalize_db_params(params: dict[str, Any] | None) -> dict[str, Any]:
       PostgreSQL ::timestamptz binding.
     - ISO-8601 timestamp *strings* are converted to datetime objects.
     - numpy scalars and other non-native types are converted to native Python.
+    - float values are rounded to 6 decimal places to avoid PostgreSQL
+      NUMERIC columns displaying binary floating-point artifacts
+      (e.g. 76.10999999999999943... instead of 76.11).
     """
     result: dict[str, Any] = {}
     for k, v in (params or {}).items():
@@ -141,7 +144,13 @@ def normalize_db_params(params: dict[str, Any] | None) -> dict[str, Any]:
             except Exception:
                 pass  # fall through to normal serialization
 
-        result[key] = normalize_json_value(v)
+        # Round all float values to 6 decimal places to prevent binary floating-point
+        # artifacts from polluting PostgreSQL NUMERIC columns (e.g. liquidity_score,
+        # slippage_risk, sharpe_ratio, etc.)
+        if isinstance(v, float):
+            result[key] = round(v, 6)
+        else:
+            result[key] = normalize_json_value(v)
 
     return result
 

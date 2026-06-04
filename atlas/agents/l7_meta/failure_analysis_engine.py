@@ -103,13 +103,13 @@ class FailureAnalysisEngine(BaseAgent):
             analysis = self._generate_deterministic_analysis(failure_data, systemic_patterns)
 
         # 4. Persist
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
         await self._persist_analysis(trace_id, analysis, failure_data)
 
         # 5. Update meta-memory
         self._prior_analyses.append({
             "trace_id": trace_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat() if datetime.now(timezone.utc) and hasattr(datetime.now(timezone.utc), "isoformat") else str(datetime.now(timezone.utc)) if datetime.now(timezone.utc) else None,
             "n_failures": failure_data.get("total_failures", 0),
             "top_pattern": systemic_patterns[0]["pattern"] if systemic_patterns else "none",
         })
@@ -148,7 +148,7 @@ class FailureAnalysisEngine(BaseAgent):
                     failed_strategies.append({
                         "id": str(row[0]), "name": row[1], "status": row[2],
                         "error": row[3] or "", "params": params,
-                        "created_at": str(row[5]),
+                        "created_at": row[5].isoformat() if row[5] and hasattr(row[5], "isoformat") else str(row[5]) if row[5] else None,
                     })
                 data["failed_strategies"] = failed_strategies
                 data["total_failures"] = len(failed_strategies)
@@ -442,7 +442,7 @@ Output JSON:
                      :n_failures, TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": self.select_trace_id(),
                     "trace_id": trace_id,
                     "analysis_type": "periodic_postmortem",
                     "confidence": analysis.get("confidence", 0.0),

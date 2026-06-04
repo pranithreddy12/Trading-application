@@ -103,6 +103,17 @@ class PolygonRestAgent(BaseAgent):
                 "(requires paid subscription). Bars + trades only."
             )
 
+        # Optional fallback to yfinance when Polygon is delayed/no-data
+        fallback_fetch = None
+        try:
+            if getattr(self.settings, "polygon_fallback_yfinance", False):
+                from atlas.data.ingestion.yfinance_client import fetch_1m_bars
+
+                fallback_fetch = fetch_1m_bars
+                logger.info("Polygon fallback to yfinance enabled")
+        except Exception as exc:
+            logger.warning(f"Could not enable yfinance fallback: {exc}")
+
         self.rest_client = PolygonRestClient(
             api_key=self.settings.polygon_api_key,
             symbols=self.symbols,
@@ -113,6 +124,7 @@ class PolygonRestAgent(BaseAgent):
             poll_trades=10.0,
             poll_snapshot=10.0,
             calls_per_minute=calls_per_minute,
+            fallback_fetch=fallback_fetch,
         )
         logger.info("PolygonRestClient built")
 
@@ -151,78 +163,82 @@ class PolygonRestAgent(BaseAgent):
     # ------------------------------------------------------------------ #
 
     async def _on_bar(self, data: Dict[str, Any], symbol: str) -> None:
+        o, h, l, c, v = _round_ohlcv(
+            data["open"],
+            data["high"],
+            data["low"],
+            data["close"],
+            data["volume"],
+            "equity",
+        )
+        bar = BarData(
+            time=datetime.fromtimestamp(data["time"] / 1000, tz=timezone.utc),
+            symbol=symbol,
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+            volume=v,
+            source="polygon",
+            interval="1m",
+            asset_class="equity",
+        )
         try:
-            o, h, l, c, v = _round_ohlcv(
-                data["open"],
-                data["high"],
-                data["low"],
-                data["close"],
-                data["volume"],
-                "equity",
-            )
-            bar = BarData(
-                time=datetime.fromtimestamp(data["time"] / 1000, tz=timezone.utc),
-                symbol=symbol,
-                open=o,
-                high=h,
-                low=l,
-                close=c,
-                volume=v,
-                source="polygon",
-                interval="1m",
-                asset_class="equity",
-            )
             await self.ts_client.write_bars(symbol, bar)
             self._bars_written += 1
             logger.debug(f"1m bar | {symbol} O={data['open']} C={data['close']}")
         except Exception as exc:
             self._errors += 1
             logger.error(f"Bar persist error ({symbol}): {exc}")
+            # Propagate to the poller so it doesn't advance the dedup watermark
+            raise
 
     async def _on_trade(self, data: Dict[str, Any], symbol: str) -> None:
+        price, size = _round_trade(data["price"], data["size"])
+        trade = TradeData(
+            time=datetime.fromtimestamp(
+                data["time_ns"] / 1_000_000_000, tz=timezone.utc
+            ),
+            symbol=symbol,
+            price=price,
+            size=size,
+            side="unknown",
+            exchange="polygon",
+            source="polygon",
+        )
         try:
-            price, size = _round_trade(data["price"], data["size"])
-            trade = TradeData(
-                time=datetime.fromtimestamp(
-                    data["time_ns"] / 1_000_000_000, tz=timezone.utc
-                ),
-                symbol=symbol,
-                price=price,
-                size=size,
-                side="unknown",
-                exchange="polygon",
-                source="polygon",
-            )
             await self.ts_client.write_trade(trade)
             self._trades_written += 1
         except Exception as exc:
             self._errors += 1
             logger.error(f"Trade persist error ({symbol}): {exc}")
+            raise
 
     async def _on_snapshot(self, data: Dict[str, Any], symbol: str) -> None:
+        bp, ap, bs, asz = _round_orderbook(
+            data["bid_price"],
+            data["ask_price"],
+            data["bid_size"],
+            data["ask_size"],
+        )
+        quote = QuoteData(
+            time=datetime.fromtimestamp(data["time_ms"] / 1000, tz=timezone.utc),
+            symbol=symbol,
+            bid=bp,
+            ask=ap,
+            bid_size=bs,
+            ask_size=asz,
+            bid_exchange="",
+            ask_exchange="",
+            source="polygon",
+        )
         try:
-            bp, ap, bs, asz = _round_orderbook(
-                data["bid_price"],
-                data["ask_price"],
-                data["bid_size"],
-                data["ask_size"],
-            )
-            quote = QuoteData(
-                time=datetime.fromtimestamp(data["time_ms"] / 1000, tz=timezone.utc),
-                symbol=symbol,
-                bid=bp,
-                ask=ap,
-                bid_size=bs,
-                ask_size=asz,
-                bid_exchange="",
-                ask_exchange="",
-                source="polygon",
-            )
             await self.ts_client.write_quote(quote)
             self._quotes_written += 1
         except Exception as exc:
             self._errors += 1
             logger.error(f"Quote persist error ({symbol}): {exc}")
+            raise
 
     # ------------------------------------------------------------------ #
     #  Utilities

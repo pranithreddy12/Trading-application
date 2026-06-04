@@ -192,7 +192,7 @@ class AntiPoisoningEngine(BaseAgent):
         self, source: str, source_sub: str, violation_type: str, 
         severity: float, symbols: list[str], action: str, reason: str
     ):
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
         
         # 1. Log the quarantine event
         await self.db._execute_insert(
@@ -205,7 +205,7 @@ class AntiPoisoningEngine(BaseAgent):
                  :severity, CAST(:symbols AS jsonb), :action, CAST(:metadata AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "source": source,
                 "sub": source_sub,
@@ -227,7 +227,7 @@ class AntiPoisoningEngine(BaseAgent):
             ON CONFLICT (id) DO NOTHING
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "source": source,
                 "sub": source_sub,
                 "trust": max(0.0, 0.9 - severity)  # Phase 26H fix: raised floor from 0.5 → 0.9 (gentler initial trust)

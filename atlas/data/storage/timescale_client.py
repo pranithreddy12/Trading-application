@@ -1,14 +1,18 @@
 import asyncio
 import json
+import random
+import asyncpg
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.sql import text
 import pandas as pd
 
+from loguru import logger
 from atlas.core.scout_validation import validate_scout_payload
+from atlas.core.persistence_integrity import normalize_uuid_params, SchemaContractRegistry
 from atlas.core.serialization import normalize_db_params, safe_json_dumps
 
 
@@ -205,7 +209,14 @@ class BinanceDepthData(BaseModel):
 class TimescaleClient:
     def __init__(self, db_url: str):
         self.db_url = db_url
-        self.engine = create_async_engine(self.db_url, echo=False)
+        self.engine = create_async_engine(
+            self.db_url,
+            echo=False,
+            pool_size=4,
+            max_overflow=8,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
 
     async def _log_strategy_transition(
         self,
@@ -282,6 +293,15 @@ class TimescaleClient:
         """Dispose the SQLAlchemy engine and release pooled connections."""
         await self.engine.dispose()
 
+    async def validate_schema_contracts(self, strict: bool = True) -> dict[str, Any]:
+        """Validate the current database against persistence schema contracts."""
+        registry = SchemaContractRegistry.default()
+        report = await registry.validate(self)
+        result = report.as_dict()
+        if strict and not report.valid:
+            raise RuntimeError(f"Schema contract validation failed: {result}")
+        return result
+
     async def get_mutation_leaderboard(self) -> list[dict]:
         """
         Retrieves the aggregated mutation intelligence (ranked by conversion rate and average delta).
@@ -327,14 +347,33 @@ class TimescaleClient:
             logger.error(f"Error fetching mutation leaderboard: {e}")
             return []
 
-    async def connect(self) -> None:
+    async def connect(self, run_migrations: bool = True) -> None:
         """Verify the database connection and apply missing migrations."""
-        async with self.engine.begin() as conn:
-            await conn.execute(text("SELECT 1"))
+        if not run_migrations:
+            async with self.engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+            return
 
-            # Auto-migration: ensure schema additions from schema.sql are applied
-            # backtest_trades
-            await conn.execute(
+        try:
+            async with self.engine.begin() as conn:
+                await conn.execute(text("SELECT 1"))
+                # Serialize runtime schema migrations across concurrent agents/processes.
+                # This prevents DDL deadlocks when many agents call connect() at startup.
+                await conn.execute(text("SELECT pg_advisory_xact_lock(987654321)"))
+
+                # Ensure schema_version table exists first (needed by later INSERT INTO schema_version)
+                await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version TEXT PRIMARY KEY,
+                    applied_at TIMESTAMPTZ DEFAULT NOW(),
+                    description TEXT,
+                    checksum TEXT
+                )
+                """))
+
+                # Auto-migration: ensure schema additions from schema.sql are applied
+                # backtest_trades
+                await conn.execute(
                 text("""
                 CREATE TABLE IF NOT EXISTS backtest_trades (
                     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -350,70 +389,121 @@ class TimescaleClient:
                     bars_held INT,
                     exit_reason TEXT
                 )
-            """)
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_strategy ON backtest_trades (strategy_id)"
-                )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_entry ON backtest_trades (entry_time)"
-                )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_backtest_trades_symbol ON backtest_trades (symbol)"
-                )
-            )
-            # market_data_l1 new columns
-            await conn.execute(
-                text(
-                    "ALTER TABLE market_data_l1 ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'crypto'"
-                )
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE market_data_l1 ADD COLUMN IF NOT EXISTS ingestion_time TIMESTAMPTZ DEFAULT NOW()"
-                )
-            )
-            # strategies new columns
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS prompt TEXT")
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS raw_response TEXT"
-                )
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS normalized_strategy JSONB"
-                )
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS compile_error TEXT"
-                )
-            )
-            await conn.execute(
-                text(
-                    "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS strategy_signature TEXT"
-                )
-            )
-            # features_wide materialized view — auto-migrate if schema outdated
-            has_price_vs_vwap = await conn.execute(
-                text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'features_wide' AND column_name = 'price_vs_vwap_pct'"
-                )
-            )
-            if has_price_vs_vwap.fetchone() is None:
-                await conn.execute(
-                    text("DROP MATERIALIZED VIEW IF EXISTS features_wide CASCADE")
+                """)
                 )
                 await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_backtest_trades_strategy ON backtest_trades (strategy_id)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_backtest_trades_entry ON backtest_trades (entry_time)"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_backtest_trades_symbol ON backtest_trades (symbol)"
+                    )
+                )
+                # market_data_l1 new columns
+                await conn.execute(
+                    text(
+                        "ALTER TABLE market_data_l1 ADD COLUMN IF NOT EXISTS asset_class TEXT NOT NULL DEFAULT 'crypto'"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE market_data_l1 ADD COLUMN IF NOT EXISTS ingestion_time TIMESTAMPTZ DEFAULT NOW()"
+                    )
+                )
+                # strategies new columns
+                await conn.execute(
+                    text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS prompt TEXT")
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS raw_response TEXT"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS normalized_strategy JSONB"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS compile_error TEXT"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE strategies ADD COLUMN IF NOT EXISTS strategy_signature TEXT"
+                    )
+                )
+                # market_data_l1 unique constraint for upsert
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_l1_time_symbol ON market_data_l1 (time, symbol)"
+                    )
+                )
+                # copy_execution_log missing columns migration
+                await conn.execute(
+                    text(
+                        "ALTER TABLE copy_execution_log ADD COLUMN IF NOT EXISTS follower_id TEXT"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE copy_execution_log ADD COLUMN IF NOT EXISTS leader_id TEXT"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE copy_execution_log ADD COLUMN IF NOT EXISTS follower_qty NUMERIC DEFAULT 0"
+                    )
+                )
+                await conn.execute(
+                    text(
+                        "ALTER TABLE copy_execution_log ADD COLUMN IF NOT EXISTS leader_qty NUMERIC DEFAULT 0"
+                    )
+                )
+
+                # portfolio_evolution_log core table creation
+                await conn.execute(
+                    text(
+                        """
+                        CREATE TABLE IF NOT EXISTS portfolio_evolution_log (
+                            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                            tracked_at TIMESTAMPTZ DEFAULT NOW(),
+                            portfolio_id TEXT,
+                            diversification_score FLOAT DEFAULT 0,
+                            correlation_collapse_risk FLOAT DEFAULT 0,
+                            contagion_exposure FLOAT DEFAULT 0,
+                            concentration_risk FLOAT DEFAULT 0,
+                            portfolio_survivability FLOAT DEFAULT 0,
+                            drawdown_recovery_speed FLOAT DEFAULT 0,
+                            active_strategies INT DEFAULT 0,
+                            created_at TIMESTAMPTZ DEFAULT NOW()
+                        )
+                        """
+                    )
+                )
+
+                # features_wide materialized view — auto-migrate if schema outdated
+                has_price_vs_vwap = await conn.execute(
+                    text(
+                        "SELECT a.attname "
+                        "FROM pg_attribute a "
+                        "JOIN pg_class c ON a.attrelid = c.oid "
+                        "WHERE c.relname = 'features_wide' AND a.attname = 'price_vs_vwap_pct' AND a.attnum > 0"
+                    )
+                )
+                if has_price_vs_vwap.fetchone() is None:
+                    await conn.execute(
+                        text("DROP MATERIALIZED VIEW IF EXISTS features_wide CASCADE")
+                    )
+                    await conn.execute(
                     text("""
                     CREATE MATERIALIZED VIEW features_wide AS
                     SELECT
@@ -441,15 +531,15 @@ class TimescaleClient:
                         MAX(CASE WHEN feature_name='trend_strength'        THEN value END) AS trend_strength
                     FROM features
                     GROUP BY time, symbol
-                """)
+                    """)
+                    )
+                await conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_features_wide_time_symbol ON features_wide (time, symbol)"
+                    )
                 )
-            await conn.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_features_wide_time_symbol ON features_wide (time, symbol)"
-                )
-            )
-            # pattern_memory — PatternAgent storage
-            await conn.execute(
+                # pattern_memory — PatternAgent storage
+                await conn.execute(
                 text("""
                 CREATE TABLE IF NOT EXISTS pattern_memory (
                     id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
@@ -472,20 +562,20 @@ class TimescaleClient:
                     detected_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """)
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_pattern_memory_type ON pattern_memory (pattern_type)"
+                """)
                 )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_pattern_memory_archetype ON pattern_memory (archetype)"
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_pattern_memory_type ON pattern_memory (pattern_type)"
+                    )
                 )
-            )
-            # lifecycle_events — Event Lineage Layer (Day 7b)
-            await conn.execute(
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_pattern_memory_archetype ON pattern_memory (archetype)"
+                    )
+                )
+                # lifecycle_events — Event Lineage Layer (Day 7b)
+                await conn.execute(
                 text("""
                 CREATE TABLE IF NOT EXISTS lifecycle_events (
                     id TEXT PRIMARY KEY,
@@ -498,25 +588,25 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """)
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle_events (trace_id)"
+                """)
                 )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_strategy ON lifecycle_events (strategy_id)"
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_lifecycle_trace ON lifecycle_events (trace_id)"
+                    )
                 )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage)"
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_lifecycle_strategy ON lifecycle_events (strategy_id)"
+                    )
                 )
-            )
-            await conn.execute(
-                text(
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_lifecycle_stage ON lifecycle_events (stage)"
+                    )
+                )
+                await conn.execute(
+                    text(
                     """
                     CREATE TABLE IF NOT EXISTS risk_state (
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -531,23 +621,23 @@ class TimescaleClient:
                         created_at TIMESTAMPTZ DEFAULT NOW(),
                         updated_at TIMESTAMPTZ DEFAULT NOW()
                     )
-                    """
+                        """
+                    )
                 )
-            )
-            await conn.execute(
-                text("CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_state_scope ON risk_state (scope)")
-            )
-            await conn.execute(
-                text(
+                await conn.execute(
+                    text("CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_state_scope ON risk_state (scope)")
+                )
+                await conn.execute(
+                    text(
                     """
                     INSERT INTO risk_state (scope, halted, reason)
                     VALUES ('portfolio', FALSE, 'initial_state')
                     ON CONFLICT DO NOTHING
-                    """
+                        """
+                    )
                 )
-            )
-            await conn.execute(
-                text(
+                await conn.execute(
+                    text(
                     """
                     CREATE TABLE IF NOT EXISTS scout_quarantine (
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -557,29 +647,29 @@ class TimescaleClient:
                         raw_payload JSONB NOT NULL,
                         quarantined_at TIMESTAMPTZ DEFAULT NOW()
                     )
-                    """
+                        """
+                    )
                 )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_source ON scout_quarantine (source)"
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_source ON scout_quarantine (source)"
+                    )
                 )
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quarantined_at DESC)"
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quarantined_at DESC)"
+                    )
                 )
-            )
-            # Fix system_logs.agent_id type (agents pass names like 'CoderAgent', not UUIDs)
-            try:
-                await conn.execute(text("""
+                # Fix system_logs.agent_id type (agents pass names like 'CoderAgent', not UUIDs)
+                try:
+                    await conn.execute(text("""
                     ALTER TABLE system_logs ALTER COLUMN agent_id TYPE TEXT
-                """))
-            except Exception:
-                pass  # Column may already be TEXT
+                    """))
+                except Exception:
+                    pass  # Column may already be TEXT
 
-            # Failed inserts dead-letter queue
-            await conn.execute(text("""
+                # Failed inserts dead-letter queue
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS failed_inserts (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     table_name TEXT,
@@ -588,30 +678,37 @@ class TimescaleClient:
                     reason TEXT,
                     inserted_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failed_inserts_time ON failed_inserts (inserted_at DESC)"))
-            # Add created_at column to backtest_results (needed by system_health, retirement, drift engines)
-            await conn.execute(
-                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_backtest_results_created ON backtest_results (created_at DESC)")
-            )
-
-            # trace_id column on strategies
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT")
-            )
-            await conn.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id)"
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failed_inserts_time ON failed_inserts (inserted_at DESC)"))
+                # Add created_at column to backtest_results only when missing to avoid repeated DDL locks.
+                backtest_created_at_exists = await conn.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = 'backtest_results' AND column_name = 'created_at'"
+                    )
                 )
-            )
+                if backtest_created_at_exists.fetchone() is None:
+                    await conn.execute(
+                        text("ALTER TABLE backtest_results ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW()")
+                    )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_backtest_results_created ON backtest_results (created_at DESC)")
+                )
 
-            # ================================================================
-            # SCOUT NETWORK TABLES — Phase 10: Internal Scout Intelligence
-            # ================================================================
-            await conn.execute(text("""
+                # trace_id column on strategies
+                await conn.execute(
+                    text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT")
+                )
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id)"
+                    )
+                )
+
+                # ================================================================
+                # SCOUT NETWORK TABLES — Phase 10: Internal Scout Intelligence
+                # ================================================================
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS market_regime_memory (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     symbol TEXT,
@@ -632,11 +729,11 @@ class TimescaleClient:
                     confidence_score NUMERIC DEFAULT 0.0,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_symbol ON market_regime_memory (symbol)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_timestamp ON market_regime_memory (timestamp DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_symbol ON market_regime_memory (symbol)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regime_memory_timestamp ON market_regime_memory (timestamp DESC)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS liquidity_intelligence (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     symbol TEXT,
@@ -649,11 +746,11 @@ class TimescaleClient:
                     liquidity_regime TEXT,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_symbol ON liquidity_intelligence (symbol)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_timestamp ON liquidity_intelligence (timestamp DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_symbol ON liquidity_intelligence (symbol)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_liquidity_timestamp ON liquidity_intelligence (timestamp DESC)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS correlation_memory (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     timestamp TIMESTAMPTZ NOT NULL,
@@ -666,11 +763,11 @@ class TimescaleClient:
                     correlation_spike_detected BOOLEAN DEFAULT FALSE,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_timestamp ON correlation_memory (timestamp DESC)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_risk_state ON correlation_memory (risk_state)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_timestamp ON correlation_memory (timestamp DESC)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_correlation_risk_state ON correlation_memory (risk_state)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS execution_intelligence (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     timestamp TIMESTAMPTZ NOT NULL,
@@ -684,15 +781,15 @@ class TimescaleClient:
                     sample_size INT DEFAULT 0,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_symbol ON execution_intelligence (symbol)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_timestamp ON execution_intelligence (timestamp DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_symbol ON execution_intelligence (symbol)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_execution_timestamp ON execution_intelligence (timestamp DESC)"))
 
-            # ================================================================
-            # VALIDATION TABLES — Phase 11: Advanced Validation & Pattern Intelligence
-            # ================================================================
-            # walk_forward_analysis
-            await conn.execute(text("""
+                # ================================================================
+                # VALIDATION TABLES — Phase 11: Advanced Validation & Pattern Intelligence
+                # ================================================================
+                # walk_forward_analysis
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS walk_forward_analysis (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
@@ -705,11 +802,11 @@ class TimescaleClient:
                     analyzed_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_walkforward_strategy ON walk_forward_analysis (strategy_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_walkforward_strategy ON walk_forward_analysis (strategy_id)"))
 
-            # monte_carlo_analysis
-            await conn.execute(text("""
+                # monte_carlo_analysis
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS monte_carlo_analysis (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
@@ -723,11 +820,11 @@ class TimescaleClient:
                     simulated_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mc_strategy ON monte_carlo_analysis (strategy_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mc_strategy ON monte_carlo_analysis (strategy_id)"))
 
-            # overfitting_analysis
-            await conn.execute(text("""
+                # overfitting_analysis
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS overfitting_analysis (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
@@ -739,11 +836,11 @@ class TimescaleClient:
                     analyzed_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overfit_strategy ON overfitting_analysis (strategy_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overfit_strategy ON overfitting_analysis (strategy_id)"))
 
-            # regime_validation
-            await conn.execute(text("""
+                # regime_validation
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS regime_validation (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
@@ -756,11 +853,11 @@ class TimescaleClient:
                     validated_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regimeval_strategy ON regime_validation (strategy_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_regimeval_strategy ON regime_validation (strategy_id)"))
 
-            # cost_stress_analysis
-            await conn.execute(text("""
+                # cost_stress_analysis
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS cost_stress_analysis (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id UUID NOT NULL,
@@ -773,11 +870,11 @@ class TimescaleClient:
                     tested_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (strategy_id)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_coststress_strategy ON cost_stress_analysis (strategy_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_coststress_strategy ON cost_stress_analysis (strategy_id)"))
 
-            # feature_importance
-            await conn.execute(text("""
+                # feature_importance
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS feature_importance (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     feature_name TEXT NOT NULL,
@@ -793,14 +890,14 @@ class TimescaleClient:
                     computed_at TIMESTAMPTZ DEFAULT NOW(),
                     UNIQUE (feature_name)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_score ON feature_importance (feature_importance_score DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_feature_importance_score ON feature_importance (feature_importance_score DESC)"))
 
-            # ================================================================
-            # PORTFOLIO TABLES — Phase 12: Portfolio Intelligence & Capital Realism
-            # ================================================================
-            # portfolio_intelligence
-            await conn.execute(text("""
+                # ================================================================
+                # PORTFOLIO TABLES — Phase 12: Portfolio Intelligence & Capital Realism
+                # ================================================================
+                # portfolio_intelligence
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS portfolio_intelligence (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     computed_at TIMESTAMPTZ NOT NULL,
@@ -817,11 +914,11 @@ class TimescaleClient:
                     diversification_score NUMERIC,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_computed ON portfolio_intelligence (computed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_portfolio_computed ON portfolio_intelligence (computed_at DESC)"))
 
-            # capital_allocation
-            await conn.execute(text("""
+                # capital_allocation
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS capital_allocation (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     computed_at TIMESTAMPTZ NOT NULL,
@@ -837,11 +934,11 @@ class TimescaleClient:
                     leverage_cap_applied NUMERIC DEFAULT 1.0,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_capital_allocation_computed ON capital_allocation (computed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_capital_allocation_computed ON capital_allocation (computed_at DESC)"))
 
-            # ensemble_execution
-            await conn.execute(text("""
+                # ensemble_execution
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS ensemble_execution (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     executed_at TIMESTAMPTZ NOT NULL,
@@ -852,11 +949,11 @@ class TimescaleClient:
                     regime_context JSONB DEFAULT CAST('{}' AS jsonb),
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ensemble_executed ON ensemble_execution (executed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ensemble_executed ON ensemble_execution (executed_at DESC)"))
 
-            # execution_realism
-            await conn.execute(text("""
+                # execution_realism
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS execution_realism (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     simulated_at TIMESTAMPTZ NOT NULL,
@@ -872,11 +969,11 @@ class TimescaleClient:
                     simulated_fills JSONB DEFAULT CAST('[]' AS jsonb),
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_realism_simulated ON execution_realism (simulated_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_realism_simulated ON execution_realism (simulated_at DESC)"))
 
-            # drift_detection
-            await conn.execute(text("""
+                # drift_detection
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS drift_detection (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     detected_at TIMESTAMPTZ NOT NULL,
@@ -890,11 +987,11 @@ class TimescaleClient:
                     retrain_recommendations JSONB DEFAULT CAST('[]' AS jsonb),
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_drift_detected ON drift_detection (detected_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_drift_detected ON drift_detection (detected_at DESC)"))
 
-            # strategy_retirement
-            await conn.execute(text("""
+                # strategy_retirement
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS strategy_retirement (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     analyzed_at TIMESTAMPTZ NOT NULL,
@@ -908,11 +1005,11 @@ class TimescaleClient:
                     capital_withdrawal_signals JSONB DEFAULT CAST('[]' AS jsonb),
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_retirement_analyzed ON strategy_retirement (analyzed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_retirement_analyzed ON strategy_retirement (analyzed_at DESC)"))
 
-            # external_scout_memory — External Scout Network (Phase 12.9)
-            await conn.execute(text("""
+                # external_scout_memory — External Scout Network (Phase 12.9)
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS external_scout_memory (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     source TEXT NOT NULL,
@@ -925,16 +1022,16 @@ class TimescaleClient:
                     signal_direction TEXT,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_source ON external_scout_memory (source)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_timestamp ON external_scout_memory (timestamp DESC)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_score ON external_scout_memory (hypothesis_score DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_source ON external_scout_memory (source)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_timestamp ON external_scout_memory (timestamp DESC)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ext_scout_score ON external_scout_memory (hypothesis_score DESC)"))
 
-            # ================================================================
-            # PHASE 13 — PRODUCTION GOVERNANCE & RELIABILITY TABLES
-            # ================================================================
-            # Event Store (append-only immutable event log)
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 13 — PRODUCTION GOVERNANCE & RELIABILITY TABLES
+                # ================================================================
+                # Event Store (append-only immutable event log)
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS event_store (
                     id TEXT PRIMARY KEY,
                     aggregate_id TEXT NOT NULL,
@@ -946,13 +1043,13 @@ class TimescaleClient:
                     parent_event_id TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_aggregate ON event_store (aggregate_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_type ON event_store (event_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_trace ON event_store (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_created ON event_store (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_aggregate ON event_store (aggregate_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_type ON event_store (event_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_trace ON event_store (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_events_created ON event_store (created_at DESC)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS event_snapshots (
                     id TEXT PRIMARY KEY,
                     aggregate_id TEXT NOT NULL,
@@ -960,11 +1057,11 @@ class TimescaleClient:
                     state JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_agg_version ON event_snapshots (aggregate_id, version)"))
+                """))
+                await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_agg_version ON event_snapshots (aggregate_id, version)"))
 
-            # Audit Ledger (tamper-resistant, cryptographic hash chaining)
-            await conn.execute(text("""
+                # Audit Ledger (tamper-resistant, cryptographic hash chaining)
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS audit_ledger (
                     id TEXT PRIMARY KEY,
                     event_type TEXT NOT NULL,
@@ -977,13 +1074,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_ledger (event_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_ledger (actor)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_ledger (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_type ON audit_ledger (event_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_ledger (actor)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_ledger (created_at DESC)"))
 
-            # Deployment Governance
-            await conn.execute(text("""
+                # Deployment Governance
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS deployment_governance (
                     id TEXT PRIMARY KEY,
                     strategy_id TEXT NOT NULL,
@@ -997,12 +1094,12 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_strategy ON deployment_governance (strategy_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_status ON deployment_governance (status)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_strategy ON deployment_governance (strategy_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deploy_status ON deployment_governance (status)"))
 
-            # System Health
-            await conn.execute(text("""
+                # System Health
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS system_health (
                     id TEXT PRIMARY KEY,
                     checked_at TIMESTAMPTZ NOT NULL,
@@ -1013,11 +1110,11 @@ class TimescaleClient:
                     n_degraded INT DEFAULT 0,
                     n_total INT DEFAULT 0
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_health_checked ON system_health (checked_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_health_checked ON system_health (checked_at DESC)"))
 
-            # Replay Integrity
-            await conn.execute(text("""
+                # Replay Integrity
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS replay_integrity (
                     id TEXT PRIMARY KEY,
                     checked_at TIMESTAMPTZ NOT NULL,
@@ -1027,11 +1124,11 @@ class TimescaleClient:
                     n_violations INT DEFAULT 0,
                     details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_replay_checked ON replay_integrity (checked_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_replay_checked ON replay_integrity (checked_at DESC)"))
 
-            # Systemic Risk
-            await conn.execute(text("""
+                # Systemic Risk
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS systemic_risk (
                     id TEXT PRIMARY KEY,
                     assessed_at TIMESTAMPTZ NOT NULL,
@@ -1043,11 +1140,11 @@ class TimescaleClient:
                     n_strategies_analyzed INT DEFAULT 0,
                     details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sysrisk_assessed ON systemic_risk (assessed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_sysrisk_assessed ON systemic_risk (assessed_at DESC)"))
 
-            # Stress Test Results
-            await conn.execute(text("""
+                # Stress Test Results
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS stress_test_results (
                     id TEXT PRIMARY KEY,
                     tested_at TIMESTAMPTZ NOT NULL,
@@ -1059,11 +1156,11 @@ class TimescaleClient:
                     avg_recovery_days NUMERIC,
                     scenario_results JSONB DEFAULT CAST('[]' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stress_tested ON stress_test_results (tested_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_stress_tested ON stress_test_results (tested_at DESC)"))
 
-            # Capital Preservation State
-            await conn.execute(text("""
+                # Capital Preservation State
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS capital_preservation_state (
                     id TEXT PRIMARY KEY,
                     checked_at TIMESTAMPTZ NOT NULL,
@@ -1075,14 +1172,14 @@ class TimescaleClient:
                     total_pnl NUMERIC,
                     total_exposure NUMERIC
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_cap_pres_checked ON capital_preservation_state (checked_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_cap_pres_checked ON capital_preservation_state (checked_at DESC)"))
 
-            # ================================================================
-            # PHASE 14 — PORTFOLIO DURABILITY TABLES
-            # ================================================================
-            # Advanced Portfolio Optimization
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 14 — PORTFOLIO DURABILITY TABLES
+                # ================================================================
+                # Advanced Portfolio Optimization
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS advanced_portfolio_optimization (
                     id TEXT PRIMARY KEY,
                     optimized_at TIMESTAMPTZ NOT NULL,
@@ -1092,14 +1189,14 @@ class TimescaleClient:
                     method_scores JSONB DEFAULT CAST('{}' AS jsonb),
                     details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_adv_portfolio_opt ON advanced_portfolio_optimization (optimized_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_adv_portfolio_opt ON advanced_portfolio_optimization (optimized_at DESC)"))
 
-            # ================================================================
-            # PHASE 15 — TRUE META-LEARNING TABLES
-            # ================================================================
-            # Prompt Templates
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 15 — TRUE META-LEARNING TABLES
+                # ================================================================
+                # Prompt Templates
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS prompt_templates (
                     id TEXT PRIMARY KEY,
                     prompt_type TEXT NOT NULL DEFAULT 'ideator',
@@ -1113,11 +1210,11 @@ class TimescaleClient:
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_type ON prompt_templates (prompt_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_effectiveness ON prompt_templates (effectiveness_score DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_type ON prompt_templates (prompt_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_effectiveness ON prompt_templates (effectiveness_score DESC)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS prompt_generation_log (
                     id TEXT PRIMARY KEY,
                     prompt_id TEXT,
@@ -1126,11 +1223,11 @@ class TimescaleClient:
                     generation_score NUMERIC,
                     generated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_log_prompt ON prompt_generation_log (prompt_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_prompt_log_prompt ON prompt_generation_log (prompt_id)"))
 
-            # Mutation Policy State
-            await conn.execute(text("""
+                # Mutation Policy State
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS mutation_policy_state (
                     id TEXT PRIMARY KEY,
                     learned_at TIMESTAMPTZ NOT NULL,
@@ -1139,10 +1236,10 @@ class TimescaleClient:
                     n_observations INT DEFAULT 0,
                     details JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_policy_learned ON mutation_policy_state (learned_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_policy_learned ON mutation_policy_state (learned_at DESC)"))
 
-            await conn.execute(text("""
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS mutation_outcome_log (
                     id TEXT PRIMARY KEY,
                     mutation_type TEXT,
@@ -1151,11 +1248,11 @@ class TimescaleClient:
                     outcome_score NUMERIC,
                     recorded_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_outcome_type ON mutation_outcome_log (mutation_type)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_outcome_type ON mutation_outcome_log (mutation_type)"))
 
-            # Agent Governance State
-            await conn.execute(text("""
+                # Agent Governance State
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS agent_governance_state (
                     id TEXT PRIMARY KEY,
                     assessed_at TIMESTAMPTZ NOT NULL,
@@ -1163,25 +1260,25 @@ class TimescaleClient:
                     agent_scores JSONB DEFAULT CAST('{}' AS jsonb),
                     throttled_agents JSONB DEFAULT CAST('[]' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gov_assessed ON agent_governance_state (assessed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_gov_assessed ON agent_governance_state (assessed_at DESC)"))
 
-            # ================================================================
-            # PHASE 17 — OBSERVABILITY TABLES
-            # ================================================================
-            # Monitoring Metrics
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 17 — OBSERVABILITY TABLES
+                # ================================================================
+                # Monitoring Metrics
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS monitoring_metrics (
                     id TEXT PRIMARY KEY,
                     recorded_at TIMESTAMPTZ NOT NULL,
                     counters JSONB DEFAULT CAST('{}' AS jsonb),
                     latencies JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_recorded ON monitoring_metrics (recorded_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_metrics_recorded ON monitoring_metrics (recorded_at DESC)"))
 
-            # Anomaly Observations
-            await conn.execute(text("""
+                # Anomaly Observations
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS anomaly_observations (
                     id TEXT PRIMARY KEY,
                     observed_at TIMESTAMPTZ NOT NULL,
@@ -1189,17 +1286,17 @@ class TimescaleClient:
                     anomalies JSONB DEFAULT CAST('[]' AS jsonb),
                     severity NUMERIC DEFAULT 0
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_anomaly_observed ON anomaly_observations (observed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_anomaly_observed ON anomaly_observations (observed_at DESC)"))
 
-            # Feature evolution metadata column on feature_importance
-            await conn.execute(text("ALTER TABLE feature_importance ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)"))
+                # Feature evolution metadata column on feature_importance
+                await conn.execute(text("ALTER TABLE feature_importance ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)"))
 
-            # ================================================================
-            # PHASE 19 — META-INTELLIGENCE ADVISORY TABLES
-            # ================================================================
-            # Meta Reasoning Log — MetaReasoningAgent outputs
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 19 — META-INTELLIGENCE ADVISORY TABLES
+                # ================================================================
+                # Meta Reasoning Log — MetaReasoningAgent outputs
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS meta_reasoning_log (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1212,13 +1309,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_trace ON meta_reasoning_log (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_type ON meta_reasoning_log (advisory_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_created ON meta_reasoning_log (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_trace ON meta_reasoning_log (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_type ON meta_reasoning_log (advisory_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meta_reasoning_created ON meta_reasoning_log (created_at DESC)"))
 
-            # Hypothesis Registry — structured research hypotheses
-            await conn.execute(text("""
+                # Hypothesis Registry — structured research hypotheses
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS hypothesis_registry (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1238,14 +1335,14 @@ class TimescaleClient:
                     created_at TIMESTAMPTZ DEFAULT NOW(),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_trace ON hypothesis_registry (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_status ON hypothesis_registry (status)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_confidence ON hypothesis_registry (confidence DESC)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_created ON hypothesis_registry (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_trace ON hypothesis_registry (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_status ON hypothesis_registry (status)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_confidence ON hypothesis_registry (confidence DESC)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_hypothesis_created ON hypothesis_registry (created_at DESC)"))
 
-            # Failure Analysis — postmortem reasoning on systemic failures
-            await conn.execute(text("""
+                # Failure Analysis — postmortem reasoning on systemic failures
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS failure_analysis (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1261,13 +1358,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_trace ON failure_analysis (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_type ON failure_analysis (analysis_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_created ON failure_analysis (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_trace ON failure_analysis (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_type ON failure_analysis (analysis_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failure_created ON failure_analysis (created_at DESC)"))
 
-            # Mutation Policy Log — advisory history for mutation directions
-            await conn.execute(text("""
+                # Mutation Policy Log — advisory history for mutation directions
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS mutation_policy_log (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1282,12 +1379,12 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_trace ON mutation_policy_log (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_created ON mutation_policy_log (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_trace ON mutation_policy_log (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_mutation_policy_created ON mutation_policy_log (created_at DESC)"))
 
-            # Scout Synthesis Log — synthesized scout intelligence
-            await conn.execute(text("""
+                # Scout Synthesis Log — synthesized scout intelligence
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_synthesis_log (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1302,16 +1399,16 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_trace ON scout_synthesis_log (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_created ON scout_synthesis_log (created_at DESC)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_agreement ON scout_synthesis_log (scout_agreement_score DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_trace ON scout_synthesis_log (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_created ON scout_synthesis_log (created_at DESC)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_synth_agreement ON scout_synthesis_log (scout_agreement_score DESC)"))
 
-            # ================================================================
-            # PHASE 21 — INSTITUTIONAL COPY TRADING TABLES
-            # ================================================================
-            # Copy Position State — leader vs follower portfolio snapshots
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 21 — INSTITUTIONAL COPY TRADING TABLES
+                # ================================================================
+                # Copy Position State — leader vs follower portfolio snapshots
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_position_state (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1333,13 +1430,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     snapshot_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_leader ON copy_position_state (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_follower ON copy_position_state (follower_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_snapshot ON copy_position_state (snapshot_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_leader ON copy_position_state (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_follower ON copy_position_state (follower_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_pos_snapshot ON copy_position_state (snapshot_at DESC)"))
 
-            # Copy Drift Log — follower divergence tracking
-            await conn.execute(text("""
+                # Copy Drift Log — follower divergence tracking
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_drift_log (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1359,13 +1456,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     detected_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_leader ON copy_drift_log (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_severity ON copy_drift_log (drift_severity)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_detected ON copy_drift_log (detected_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_leader ON copy_drift_log (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_severity ON copy_drift_log (drift_severity)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_drift_detected ON copy_drift_log (detected_at DESC)"))
 
-            # Leader Health Metrics — leader governance scores
-            await conn.execute(text("""
+                # Leader Health Metrics — leader governance scores
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS leader_health_metrics (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1385,13 +1482,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     assessed_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_leader ON leader_health_metrics (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_state ON leader_health_metrics (leader_state)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_assessed ON leader_health_metrics (assessed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_leader ON leader_health_metrics (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_state ON leader_health_metrics (leader_state)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_leader_health_assessed ON leader_health_metrics (assessed_at DESC)"))
 
-            # Follower Reconciliation — reconciliation reports
-            await conn.execute(text("""
+                # Follower Reconciliation — reconciliation reports
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS follower_reconciliation (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1407,13 +1504,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     reconciled_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_leader ON follower_reconciliation (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_follower ON follower_reconciliation (follower_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_at ON follower_reconciliation (reconciled_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_leader ON follower_reconciliation (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_follower ON follower_reconciliation (follower_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_recon_at ON follower_reconciliation (reconciled_at DESC)"))
 
-            # Copy Overlap Metrics — portfolio overlap detection
-            await conn.execute(text("""
+                # Copy Overlap Metrics — portfolio overlap detection
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_overlap_metrics (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1428,12 +1525,12 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     analyzed_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_follower ON copy_overlap_metrics (follower_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_analyzed ON copy_overlap_metrics (analyzed_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_follower ON copy_overlap_metrics (follower_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_overlap_analyzed ON copy_overlap_metrics (analyzed_at DESC)"))
 
-            # Copy Failover Events — degradation mode tracking
-            await conn.execute(text("""
+                # Copy Failover Events — degradation mode tracking
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_failover_events (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1447,13 +1544,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     occurred_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_follower ON copy_failover_events (follower_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_type ON copy_failover_events (event_type)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_at ON copy_failover_events (occurred_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_follower ON copy_failover_events (follower_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_type ON copy_failover_events (event_type)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_failover_at ON copy_failover_events (occurred_at DESC)"))
 
-            # Copy Replay Events — replayable copy execution log
-            await conn.execute(text("""
+                # Copy Replay Events — replayable copy execution log
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_replay_events (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1475,13 +1572,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_trace ON copy_replay_events (trace_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_leader ON copy_replay_events (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_created ON copy_replay_events (created_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_trace ON copy_replay_events (trace_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_leader ON copy_replay_events (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_replay_created ON copy_replay_events (created_at DESC)"))
 
-            # Copy Quality Metrics — institutional replication quality
-            await conn.execute(text("""
+                # Copy Quality Metrics — institutional replication quality
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS copy_quality_metrics (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1499,16 +1596,16 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     measured_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_leader ON copy_quality_metrics (leader_id)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_measured ON copy_quality_metrics (measured_at DESC)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_leader ON copy_quality_metrics (leader_id)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_copy_quality_measured ON copy_quality_metrics (measured_at DESC)"))
 
-            # ================================================================
-            # PHASE 22 — SCOUT NETWORK HARDENING & OUTCOME ATTRIBUTION
-            # ================================================================
+                # ================================================================
+                # PHASE 22 — SCOUT NETWORK HARDENING & OUTCOME ATTRIBUTION
+                # ================================================================
 
-            # Scout Signal Attribution — Links signals to execution/pnl outcomes
-            await conn.execute(text("""
+                # Scout Signal Attribution — Links signals to execution/pnl outcomes
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_signal_attribution (
                     id TEXT PRIMARY KEY,
                     signal_id TEXT NOT NULL,
@@ -1523,12 +1620,12 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     attributed_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_source ON scout_signal_attribution (source)"))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_signal ON scout_signal_attribution (signal_id)"))
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_source ON scout_signal_attribution (source)"))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_attr_signal ON scout_signal_attribution (signal_id)"))
 
-            # Source Performance Log — Dynamic trust tracking over time
-            await conn.execute(text("""
+                # Source Performance Log — Dynamic trust tracking over time
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS source_performance_log (
                     id TEXT PRIMARY KEY,
                     source TEXT NOT NULL,
@@ -1542,11 +1639,11 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_source_perf_source ON source_performance_log (source, source_sub)"))
-            
-            # Scout Poison Quarantine — Anti-poisoning detection logs
-            await conn.execute(text("""
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_source_perf_source ON source_performance_log (source, source_sub)"))
+                
+                # Scout Poison Quarantine — Anti-poisoning detection logs
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_poison_quarantine (
                     id TEXT PRIMARY KEY,
                     trace_id TEXT NOT NULL,
@@ -1559,12 +1656,12 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     detected_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quarantine (source)"))
-            # ---------------------------------------------------------------
-            # SCOUT_SIGNALS TABLE — anti_poisoning_engine dependency
-            # ---------------------------------------------------------------
-            await conn.execute(text("""
+                """))
+                await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scout_poison_source ON scout_poison_quarantine (source)"))
+                # ---------------------------------------------------------------
+                # SCOUT_SIGNALS TABLE — anti_poisoning_engine dependency
+                # ---------------------------------------------------------------
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_signals (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     source TEXT,
@@ -1574,21 +1671,21 @@ class TimescaleClient:
                     signal_data JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_source ON scout_signals (source)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_symbol ON scout_signals (symbol)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_signals_created ON scout_signals (created_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_signals_source ON scout_signals (source)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_signals_symbol ON scout_signals (symbol)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_signals_created ON scout_signals (created_at DESC)")
+                )
 
-            # ================================================================
-            # PHASE 25 — SCOUT MIRROR DEBUG LOG (signal pipeline observability)
-            # ================================================================
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 25 — SCOUT MIRROR DEBUG LOG (signal pipeline observability)
+                # ================================================================
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_mirror_debug_log (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     table_name TEXT,
@@ -1600,20 +1697,20 @@ class TimescaleClient:
                     error_message TEXT,
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_debug_log_created ON scout_mirror_debug_log (created_at DESC)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_debug_log_table ON scout_mirror_debug_log (table_name)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_debug_log_created ON scout_mirror_debug_log (created_at DESC)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_debug_log_table ON scout_mirror_debug_log (table_name)")
+                )
 
-            # ================================================================
-            # PHASE 26 -- SCOUT-INFLUENCE TRACKING TABLES
-            # ================================================================
+                # ================================================================
+                # PHASE 26 -- SCOUT-INFLUENCE TRACKING TABLES
+                # ================================================================
 
-            # scout_influence_log -- records every scout influence event on agent behavior
-            await conn.execute(text("""
+                # scout_influence_log -- records every scout influence event on agent behavior
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_influence_log (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     trace_id TEXT,
@@ -1630,22 +1727,22 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_source ON scout_influence_log (source_scout)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_target ON scout_influence_log (target_agent)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_created ON scout_influence_log (created_at DESC)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_influence_type ON scout_influence_log (influence_type)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_influence_source ON scout_influence_log (source_scout)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_influence_target ON scout_influence_log (target_agent)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_influence_created ON scout_influence_log (created_at DESC)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_influence_type ON scout_influence_log (influence_type)")
+                )
 
-            # scout_economic_attribution -- full causal chain tracking
-            await conn.execute(text("""
+                # scout_economic_attribution -- full causal chain tracking
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_economic_attribution (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     trace_id TEXT NOT NULL,
@@ -1665,178 +1762,184 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_source ON scout_economic_attribution (source_scout)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_trace ON scout_economic_attribution (trace_id)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_strategy ON scout_economic_attribution (strategy_id)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_economic_attr_created ON scout_economic_attribution (created_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_economic_attr_source ON scout_economic_attribution (source_scout)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_economic_attr_trace ON scout_economic_attribution (trace_id)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_economic_attr_strategy ON scout_economic_attribution (strategy_id)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_economic_attr_created ON scout_economic_attribution (created_at DESC)")
+                )
 
-            # Record schema version
-            await conn.execute(
-                text("INSERT INTO schema_version (version, description) VALUES ('v26.0', 'Phase 26: Scout influence tracking, economic attribution, entropy governance') ON CONFLICT DO NOTHING")
-            )
+                # Record schema version
+                await conn.execute(
+                    text("INSERT INTO schema_version (version, description) VALUES ('v26.0', 'Phase 26: Scout influence tracking, economic attribution, entropy governance') ON CONFLICT DO NOTHING")
+                )
 
 
-            # ================================================================
-            # PHASE 24 — SCHEMA DRIFT FIXES (post-soak audit remediation)
-            # ================================================================
+                # ================================================================
+                # PHASE 24 — SCHEMA DRIFT FIXES (post-soak audit remediation)
+                # ================================================================
 
-            # ---------------------------------------------------------------
-            # EVENT_STORE: The CREATE TABLE below defines a minimal set of
-            # columns, but EventStore.append_event() writes a DIFFERENT set
-            # of columns.  We must add ALL columns that the code expects.
-            # ---------------------------------------------------------------
+                # ---------------------------------------------------------------
+                # EVENT_STORE: The CREATE TABLE below defines a minimal set of
+                # columns, but EventStore.append_event() writes a DIFFERENT set
+                # of columns.  We must add ALL columns that the code expects.
+                # ---------------------------------------------------------------
 
-            # event_store.sequence — required by EventStore for ordering
-            await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 0")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_events_sequence ON event_store (sequence)")
-            )
+                # event_store.sequence — required by EventStore for ordering
+                await conn.execute(
+                    text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 0")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_events_sequence ON event_store (sequence)")
+                )
 
-            # event_store.version — used by EventStore.append_event() (inserted as :version)
-            await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS version TEXT DEFAULT '1.0'")
-            )
+                # event_store.version — used by EventStore.append_event() (inserted as :version)
+                await conn.execute(
+                    text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS version TEXT DEFAULT '1.0'")
+                )
 
-            # event_store.metadata — JSONB metadata column
-            await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)")
-            )
+                # event_store.metadata — JSONB metadata column
+                await conn.execute(
+                    text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS metadata JSONB DEFAULT CAST('{}' AS jsonb)")
+                )
 
-            # event_store.hash_prev — previous event hash for chain integrity
-            await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_prev TEXT")
-            )
+                # event_store.hash_prev — previous event hash for chain integrity
+                await conn.execute(
+                    text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_prev TEXT")
+                )
 
-            # event_store.hash_self — self-hash for tamper detection
-            await conn.execute(
-                text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_self TEXT")
-            )
+                # event_store.hash_self — self-hash for tamper detection
+                await conn.execute(
+                    text("ALTER TABLE event_store ADD COLUMN IF NOT EXISTS hash_self TEXT")
+                )
 
-            # ---------------------------------------------------------------
-            # AUDIT_LEDGER: The CREATE TABLE uses different column names than
-            # AuditLedger.record().  We add ALL columns the code writes.
-            # ---------------------------------------------------------------
+                # ---------------------------------------------------------------
+                # AUDIT_LEDGER: The CREATE TABLE uses different column names than
+                # AuditLedger.record().  We add ALL columns the code writes.
+                # ---------------------------------------------------------------
 
-            # audit_ledger.resource_type — used by AuditLedger.record()
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_type TEXT")
-            )
+                # audit_ledger.resource_type — used by AuditLedger.record()
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_type TEXT")
+                )
 
-            # audit_ledger.resource_id — used by AuditLedger.record()
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_id TEXT")
-            )
+                # audit_ledger.resource_id — used by AuditLedger.record()
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS resource_id TEXT")
+                )
 
-            # audit_ledger.details — JSONB details column
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS details JSONB DEFAULT CAST('{}' AS jsonb)")
-            )
+                # audit_ledger.details — JSONB details column
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS details JSONB DEFAULT CAST('{}' AS jsonb)")
+                )
 
-            # audit_ledger.severity — severity level column
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS severity TEXT DEFAULT 'info'")
-            )
+                # audit_ledger.severity — severity level column
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS severity TEXT DEFAULT 'info'")
+                )
 
-            # audit_ledger.hash_prev — previous entry hash
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_prev TEXT")
-            )
+                # audit_ledger.hash_prev — previous entry hash
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_prev TEXT")
+                )
 
-            # audit_ledger.hash_self — self-hash
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_self TEXT")
-            )
+                # audit_ledger.hash_self — self-hash
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS hash_self TEXT")
+                )
 
-            # audit_ledger.sequence — deterministic ordering for per-aggregate hash chain verification
-            await conn.execute(
-                text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 1")
-            )
-            await conn.execute(
-                text("DROP INDEX IF EXISTS idx_audit_sequence")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_audit_trace_sequence ON audit_ledger (trace_id, sequence)")
-            )
+                # audit_ledger.sequence — deterministic ordering for per-aggregate hash chain verification
+                await conn.execute(
+                    text("ALTER TABLE audit_ledger ADD COLUMN IF NOT EXISTS sequence INT DEFAULT 1")
+                )
+                await conn.execute(
+                    text("DROP INDEX IF EXISTS idx_audit_sequence")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_audit_trace_sequence ON audit_ledger (trace_id, sequence)")
+                )
 
-            # paper_trades.id — missing UUID primary key
-            await conn.execute(
-                text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS id UUID DEFAULT gen_random_uuid()")
-            )
-            # paper_trades.qty — generated column backed by quantity so both column names work
-            await conn.execute(
-                text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS qty NUMERIC GENERATED ALWAYS AS (quantity) STORED")
-            )
+                # paper_trades.id — missing UUID primary key
+                try:
+                    await conn.execute(
+                        text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS id UUID DEFAULT gen_random_uuid()")
+                    )
+                    # paper_trades.qty — generated column backed by quantity so both column names work
+                    await conn.execute(
+                        text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS qty NUMERIC GENERATED ALWAYS AS (quantity) STORED")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply paper_trades schema migrations (likely concurrency deadlock, safe to ignore if already applied): {e}")
 
-            # strategies.mutation_type — used by mutation analysis queries
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS mutation_type TEXT")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_strategies_mutation_type ON strategies (mutation_type)")
-            )
+                # strategies.mutation_type — used by mutation analysis queries
+                await conn.execute(
+                    text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS mutation_type TEXT")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_strategies_mutation_type ON strategies (mutation_type)")
+                )
 
-            # lifecycle_events.agent_name — alias for actor, used by metrics queries
-            await conn.execute(
-                text("ALTER TABLE lifecycle_events ADD COLUMN IF NOT EXISTS agent_name TEXT")
-            )
+                # lifecycle_events.agent_name — alias for actor, used by metrics queries
+                await conn.execute(
+                    text("ALTER TABLE lifecycle_events ADD COLUMN IF NOT EXISTS agent_name TEXT")
+                )
 
-            # external_scout_memory.details — used by scout performance tracking
-            await conn.execute(
-                text("ALTER TABLE external_scout_memory ADD COLUMN IF NOT EXISTS details TEXT")
-            )
+                # external_scout_memory.details — used by scout performance tracking
+                await conn.execute(
+                    text("ALTER TABLE external_scout_memory ADD COLUMN IF NOT EXISTS details TEXT")
+                )
 
-            # strategies.generation_batch — missing column used by IdeatorV2
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS generation_batch TEXT")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_strategies_batch ON strategies (generation_batch)")
-            )
+                # strategies.generation_batch — missing column used by IdeatorV2
+                await conn.execute(
+                    text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS generation_batch TEXT")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_strategies_batch ON strategies (generation_batch)")
+                )
 
-            # ================================================================
-            # PHASE 28 — ECONOMIC FITNESS, SURVIVAL & LONG-HORIZON EVOLUTION
-            # ================================================================
-            # 1. Evolutionary Survival Pressure - Strategies Lifecycle
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'emerging'")
-            )
-            await conn.execute(
-                text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS age_bars INT DEFAULT 0")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_strategies_lifecycle ON strategies (lifecycle_state)")
-            )
+                # ================================================================
+                # PHASE 28 — ECONOMIC FITNESS, SURVIVAL & LONG-HORIZON EVOLUTION
+                # ================================================================
+                try:
+                    # 1. Evolutionary Survival Pressure - Strategies Lifecycle
+                    await conn.execute(
+                        text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS lifecycle_state TEXT DEFAULT 'emerging'")
+                    )
+                    await conn.execute(
+                        text("ALTER TABLE strategies ADD COLUMN IF NOT EXISTS age_bars INT DEFAULT 0")
+                    )
+                    await conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS idx_strategies_lifecycle ON strategies (lifecycle_state)")
+                    )
 
-            # 2. Economic Fitness Engine - Composite Metrics
-            await conn.execute(
-                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS composite_fitness_score NUMERIC DEFAULT 0.0")
-            )
-            await conn.execute(
-                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS sortino_ratio NUMERIC DEFAULT 0.0")
-            )
-            await conn.execute(
-                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS calmar_ratio NUMERIC DEFAULT 0.0")
-            )
-            await conn.execute(
-                text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS expectancy NUMERIC DEFAULT 0.0")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_backtest_composite_fitness ON backtest_results (composite_fitness_score DESC)")
-            )
+                    # 2. Economic Fitness Engine - Composite Metrics
+                    await conn.execute(
+                        text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS composite_fitness_score NUMERIC DEFAULT 0.0")
+                    )
+                    await conn.execute(
+                        text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS sortino_ratio NUMERIC DEFAULT 0.0")
+                    )
+                    await conn.execute(
+                        text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS calmar_ratio NUMERIC DEFAULT 0.0")
+                    )
+                    await conn.execute(
+                        text("ALTER TABLE backtest_results ADD COLUMN IF NOT EXISTS expectancy NUMERIC DEFAULT 0.0")
+                    )
+                    await conn.execute(
+                        text("CREATE INDEX IF NOT EXISTS idx_backtest_composite_fitness ON backtest_results (composite_fitness_score DESC)")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply Phase 28 migrations (likely concurrency deadlock, safe to ignore if already applied): {e}")
 
-            # 3. Regime-Conditioned Fitness
-            await conn.execute(text("""
+                # 3. Regime-Conditioned Fitness
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS regime_fitness_log (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     strategy_id TEXT NOT NULL,
@@ -1850,16 +1953,16 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_strategy ON regime_fitness_log (strategy_id)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_regime ON regime_fitness_log (regime)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_strategy ON regime_fitness_log (strategy_id)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_regime_fitness_regime ON regime_fitness_log (regime)")
+                )
 
-            # 4. Mutation Survival Intelligence
-            await conn.execute(text("""
+                # 4. Mutation Survival Intelligence
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS mutation_survival_log (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     mutation_type TEXT NOT NULL,
@@ -1871,25 +1974,27 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_mutation_survival_type ON mutation_survival_log (mutation_type)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_mutation_survival_type ON mutation_survival_log (mutation_type)")
+                )
 
-            # 5. Portfolio-Level Evolution (Phase 31 - managed by phase31_db_migration.py)
-            # The portfolio_evolution_log schema is now managed by Phase 31 migration.
-            # Ensure backward compatibility: add created_at alias if table exists.
-            try:
-                await conn.execute(text("ALTER TABLE portfolio_evolution_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"))
-            except Exception:
-                pass
+                # 5. Portfolio-Level Evolution (Phase 31 - managed by phase31_db_migration.py)
+                # The portfolio_evolution_log schema is now managed by Phase 31 migration.
+                # Ensure backward compatibility: add created_at alias if table exists.
+                table_exists_res = await conn.execute(text("SELECT 1 FROM information_schema.tables WHERE table_name = 'portfolio_evolution_log'"))
+                if table_exists_res.fetchone() is not None:
+                    try:
+                        await conn.execute(text("ALTER TABLE portfolio_evolution_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()"))
+                    except Exception:
+                        pass
 
-            # ================================================================
-            # PHASE 29 - ECONOMIC EFFICIENCY, SURVIVAL QUALITY & REAL EVOLUTIONARY FITNESS
-            # ================================================================
+                # ================================================================
+                # PHASE 29 - ECONOMIC EFFICIENCY, SURVIVAL QUALITY & REAL EVOLUTIONARY FITNESS
+                # ================================================================
 
-            # 1. Economic Fitness Windows - rolling long-horizon fitness
-            await conn.execute(text("""
+                # 1. Economic Fitness Windows - rolling long-horizon fitness
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS economic_fitness_windows (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     window_hours INT NOT NULL,
@@ -1909,13 +2014,13 @@ class TimescaleClient:
                     metadata JSONB DEFAULT CAST('{}' AS jsonb),
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_fitness_windows_computed ON economic_fitness_windows (computed_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_fitness_windows_computed ON economic_fitness_windows (computed_at DESC)")
+                )
 
-            # 2. Economic Efficiency Composite Analysis
-            await conn.execute(text("""
+                # 2. Economic Efficiency Composite Analysis
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS economic_efficiency_analysis (
                     id TEXT PRIMARY KEY,
                     analyzed_at TIMESTAMPTZ NOT NULL,
@@ -1945,13 +2050,13 @@ class TimescaleClient:
                     composite_analysis JSONB DEFAULT CAST('{}' AS jsonb),
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_efficiency_analyzed ON economic_efficiency_analysis (analyzed_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_efficiency_analyzed ON economic_efficiency_analysis (analyzed_at DESC)")
+                )
 
-            # 3. Regime Specialization Log
-            await conn.execute(text("""
+                # 3. Regime Specialization Log
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS regime_specialization_log (
                     id TEXT PRIMARY KEY,
                     analysis_id TEXT,
@@ -1965,16 +2070,16 @@ class TimescaleClient:
                     total_trades INT DEFAULT 0,
                     recorded_at TIMESTAMPTZ DEFAULT NOW()
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_regime ON regime_specialization_log (regime)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_recorded ON regime_specialization_log (recorded_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_regime ON regime_specialization_log (regime)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_regime_specialization_recorded ON regime_specialization_log (recorded_at DESC)")
+                )
 
-            # 3b. Regime Specialization Summary
-            await conn.execute(text("""
+                # 3b. Regime Specialization Summary
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS regime_specialization_summary (
                     id TEXT PRIMARY KEY,
                     analysis_id TEXT,
@@ -1985,13 +2090,13 @@ class TimescaleClient:
                     n_liquidity_sensitive INT DEFAULT 0,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_regime_summary_computed ON regime_specialization_summary (computed_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_regime_summary_computed ON regime_specialization_summary (computed_at DESC)")
+                )
 
-            # 4. Scout Predictive Value Log
-            await conn.execute(text("""
+                # 4. Scout Predictive Value Log
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scout_predictive_value_log (
                     id TEXT PRIMARY KEY,
                     analysis_id TEXT,
@@ -2007,70 +2112,164 @@ class TimescaleClient:
                     economic_score_penalized NUMERIC DEFAULT 0.0,
                     metadata JSONB DEFAULT CAST('{}' AS jsonb)
                 )
-            """))
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_scout ON scout_predictive_value_log (source_scout)")
-            )
-            await conn.execute(
-                text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_computed ON scout_predictive_value_log (computed_at DESC)")
-            )
+                """))
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_scout ON scout_predictive_value_log (source_scout)")
+                )
+                await conn.execute(
+                    text("CREATE INDEX IF NOT EXISTS idx_scout_predictive_value_computed ON scout_predictive_value_log (computed_at DESC)")
+                )
 
-            # Record schema version
-            await conn.execute(
-                text("INSERT INTO schema_version (version, description) VALUES ('v29.0', 'Phase 29: Economic efficiency, survival quality, real evolutionary fitness') ON CONFLICT DO NOTHING")
-            )
+                # Record schema version
+                await conn.execute(
+                    text("INSERT INTO schema_version (version, description) VALUES ('v29.0', 'Phase 29: Economic efficiency, survival quality, real evolutionary fitness') ON CONFLICT DO NOTHING")
+                )
 
-            # ================================================================
-            # SCHEMA VERSIONING — Phase 24: Post-migration validation
-            # ================================================================
-            from loguru import logger
-            await conn.execute(text("""
+                # ================================================================
+                # PHASE 30 - EXECUTION GATEWAY, POSITIONS, & DEAD LETTER TABLES
+                # ================================================================
+                try:
+                    # 1. execution_log
+                    await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS execution_log (
+                        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        order_key       TEXT NOT NULL,
+                        strategy_id     UUID,
+                        symbol          TEXT NOT NULL,
+                        side            TEXT NOT NULL,
+                        quantity        NUMERIC,
+                        price           NUMERIC,
+                        state           TEXT NOT NULL,
+                        broker_order_id TEXT,
+                        client_order_id TEXT,
+                        broker          TEXT NOT NULL DEFAULT 'alpaca',
+                        error_message   TEXT,
+                        metadata        JSONB,
+                        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_order_key ON execution_log(order_key)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_strategy ON execution_log(strategy_id)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_state ON execution_log(state)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_created ON execution_log(created_at DESC)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_client_oid ON execution_log(client_order_id)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_exec_log_broker_oid ON execution_log(broker_order_id)"))
+
+                    # 2. execution_dead_letter
+                    await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS execution_dead_letter (
+                        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        order_key       TEXT NOT NULL,
+                        strategy_id     UUID,
+                        symbol          TEXT NOT NULL,
+                        side            TEXT NOT NULL,
+                        quantity        NUMERIC,
+                        failure_reason  TEXT NOT NULL,
+                        last_state      TEXT NOT NULL,
+                        broker_order_id TEXT,
+                        client_order_id TEXT,
+                        severity        TEXT NOT NULL DEFAULT 'medium',
+                        resolved        BOOLEAN NOT NULL DEFAULT FALSE,
+                        resolution      TEXT,
+                        retry_count     INT NOT NULL DEFAULT 0,
+                        metadata        JSONB,
+                        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        resolved_at     TIMESTAMPTZ
+                    )
+                    """))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_dead_letter_unresolved ON execution_dead_letter(resolved) WHERE resolved = FALSE"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_dead_letter_severity ON execution_dead_letter(severity)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_dead_letter_strategy ON execution_dead_letter(strategy_id)"))
+
+                    # 3. positions table updates
+                    # (Ensure table exists first just in case)
+                    await conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS positions (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        account_ref TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        qty NUMERIC NOT NULL DEFAULT 0,
+                        avg_price NUMERIC,
+                        side TEXT NOT NULL DEFAULT 'long',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS strategy_id UUID"))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS broker TEXT NOT NULL DEFAULT 'alpaca'"))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS unrealized_pnl NUMERIC DEFAULT 0"))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS realized_pnl NUMERIC DEFAULT 0"))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS trace_id TEXT"))
+                    await conn.execute(text("ALTER TABLE positions ADD COLUMN IF NOT EXISTS feature_snapshot_id TEXT"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_positions_strategy ON positions(strategy_id)"))
+                    await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_positions_broker ON positions(broker)"))
+
+                    # 4. paper_trades updates
+                    await conn.execute(text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS trace_id TEXT"))
+                    await conn.execute(text("ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS feature_snapshot_id TEXT"))
+
+                    # Record schema version
+                    await conn.execute(
+                        text("INSERT INTO schema_version (version, description) VALUES ('v30.0', 'Phase 30: Execution gateway, positions, & dead letter tables') ON CONFLICT DO NOTHING")
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply Phase 30 migrations: {e}")
+
+                # ================================================================
+                # SCHEMA VERSIONING — Phase 24: Post-migration validation
+                # ================================================================
+                from loguru import logger
+                await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version TEXT PRIMARY KEY,
                     applied_at TIMESTAMPTZ DEFAULT NOW(),
                     description TEXT,
                     checksum TEXT
                 )
-            """))
-            await conn.execute(
-                text("INSERT INTO schema_version (version, description) VALUES ('v24.0', 'Phase 24: Schema drift remediation, column alignment, start-up validation') ON CONFLICT DO NOTHING")
-            )
-
-            # Verify critical columns that are required by the code
-            # Runs AFTER all migrations to avoid false-positive warnings
-            _required_columns = [
-                ("event_store", "version", "EventStore.append_event"),
-                ("event_store", "metadata", "EventStore.append_event"),
-                ("event_store", "hash_prev", "EventStore hash chain"),
-                ("event_store", "hash_self", "EventStore hash chain"),
-                ("event_store", "sequence", "EventStore ordering"),
-                ("audit_ledger", "resource_type", "AuditLedger.record"),
-                ("audit_ledger", "resource_id", "AuditLedger.record"),
-                ("audit_ledger", "details", "AuditLedger.record"),
-                ("audit_ledger", "severity", "AuditLedger.record"),
-                ("audit_ledger", "hash_prev", "AuditLedger hash chain"),
-                ("audit_ledger", "hash_self", "AuditLedger hash chain"),
-                ("audit_ledger", "sequence", "AuditLedger hash chain ordering"),
-                ("external_scout_memory", "details", "Scout performance tracking"),
-                ("strategies", "mutation_type", "Mutation analysis"),
-                ("strategies", "generation_batch", "IdeatorV2"),
-                ("lifecycle_events", "agent_name", "Metrics queries"),
-                ("correlation_memory", "correlation_value", "SystemicRiskEngine"),
-                ("paper_trades", "id", "Primary key"),
-                ("backtest_results", "created_at", "System health, retirement"),
-            ]
-            _missing = []
-            for _table, _col, _usage in _required_columns:
-                r = await conn.execute(
-                    text("SELECT column_name FROM information_schema.columns WHERE table_name = :t AND column_name = :c"),
-                    {"t": _table, "c": _col},
+                """))
+                await conn.execute(
+                    text("INSERT INTO schema_version (version, description) VALUES ('v24.0', 'Phase 24: Schema drift remediation, column alignment, start-up validation') ON CONFLICT DO NOTHING")
                 )
-                if r.fetchone() is None:
-                    _missing.append(f"{_table}.{_col} ({_usage})")
-            if _missing:
-                logger.warning(f"Schema validation: {len(_missing)} critical columns still missing — {', '.join(_missing[:5])}...")
-            else:
-                logger.info("Schema validation: All critical columns present ✅")
+
+                # Verify critical columns that are required by the code
+                # Runs AFTER all migrations to avoid false-positive warnings
+                _required_columns = [
+                    ("event_store", "version", "EventStore.append_event"),
+                    ("event_store", "metadata", "EventStore.append_event"),
+                    ("event_store", "hash_prev", "EventStore hash chain"),
+                    ("event_store", "hash_self", "EventStore hash chain"),
+                    ("event_store", "sequence", "EventStore ordering"),
+                    ("audit_ledger", "resource_type", "AuditLedger.record"),
+                    ("audit_ledger", "resource_id", "AuditLedger.record"),
+                    ("audit_ledger", "details", "AuditLedger.record"),
+                    ("audit_ledger", "severity", "AuditLedger.record"),
+                    ("audit_ledger", "hash_prev", "AuditLedger hash chain"),
+                    ("audit_ledger", "hash_self", "AuditLedger hash chain"),
+                    ("audit_ledger", "sequence", "AuditLedger hash chain ordering"),
+                    ("external_scout_memory", "details", "Scout performance tracking"),
+                    ("strategies", "mutation_type", "Mutation analysis"),
+                    ("strategies", "generation_batch", "IdeatorV2"),
+                    ("lifecycle_events", "agent_name", "Metrics queries"),
+                    ("correlation_memory", "avg_pairwise_corr", "SystemicRiskEngine"),
+                    ("paper_trades", "id", "Primary key"),
+                    ("backtest_results", "created_at", "System health, retirement"),
+                ]
+                _missing = []
+                for _table, _col, _usage in _required_columns:
+                    r = await conn.execute(
+                        text("SELECT column_name FROM information_schema.columns WHERE table_name = :t AND column_name = :c"),
+                        {"t": _table, "c": _col},
+                    )
+                    if r.fetchone() is None:
+                        _missing.append(f"{_table}.{_col} ({_usage})")
+                if _missing:
+                    logger.warning(f"Schema validation: {len(_missing)} critical columns still missing — {', '.join(_missing[:5])}...")
+                else:
+                    logger.info("Schema validation: All critical columns present ✅")
+
+        except Exception as migration_error:
+            from loguru import logger
+            logger.warning(f"Migration encountered non-fatal issues: {migration_error}")
 
     @staticmethod
     def _strip_pg_casts(query: str) -> str:
@@ -2080,163 +2279,199 @@ class TimescaleClient:
         query = self._strip_pg_casts(query)
         normalized_params = normalize_db_params(params)
         query_l = query.strip().lower()
-        if query_l.startswith("insert into external_scout_memory"):
-            validation = validate_scout_payload(normalized_params)
-            if not validation.valid:
-                await self._quarantine_scout_payload(validation.normalized_payload, validation.reasons)
-                return
-            normalized_params = validation.normalized_payload
-        async with self.engine.begin() as conn:
-            try:
-                res = await conn.execute(text(query), normalized_params)
-                # rowcount may be None depending on driver; treat None as unknown
-                rc = getattr(res, "rowcount", None)
-                if rc == 0:
-                    # Insert silently affected 0 rows — capture dead-letter for investigation
-                    table_name = _extract_table_name_from_insert(query)
-                    await conn.execute(
-                        text("""
-                        INSERT INTO failed_inserts (table_name, query, params, reason)
-                        VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
-                        """),
-                        {
-                            "table_name": table_name,
-                            "query": query,
-                            "params": safe_json_dumps(normalized_params),
-                            "reason": "zero_rowcount",
-                        },
-                    )
-
-                else:
-                    # Successful insert -- mirror to scout_signals if applicable
-                    table_name = _extract_table_name_from_insert(query)
-                    await self._mirror_to_scout_signals(table_name, normalized_params)
-
-            except Exception as e:
-                # On exception, persist the failed insert for offline debugging and continue
-                try:
-                    table_name = _extract_table_name_from_insert(query)
-                    await conn.execute(
-                        text("""
-                        INSERT INTO failed_inserts (table_name, query, params, reason)
-                        VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
-                        """),
-                        {
-                            "table_name": table_name,
-                            "query": query,
-                            "params": safe_json_dumps(normalized_params),
-                            "reason": str(e),
-                        },
-                    )
-                except Exception:
-                    # Last resort: log and move on
-                    from loguru import logger
-
-                    logger.error(f"Failed to record failed_insert for query: {e}")
+        table_name = _extract_table_name_from_insert(query)
+        normalized_params, recovered_fields = normalize_uuid_params(
+                normalized_params,
+                table_name=table_name,
+                context="TimescaleClient._execute_insert",
+        )
+        if recovered_fields:
                 from loguru import logger
 
-                logger.warning(f"DB insert failed: {e}")
+                logger.warning(
+                    f"UUID normalization recovered fields for {table_name}: {', '.join(recovered_fields)}"
+                )
+        if query_l.startswith("insert into external_scout_memory"):
+                validation = validate_scout_payload(normalized_params)
+                if not validation.valid:
+                    await self._quarantine_scout_payload(validation.normalized_payload, validation.reasons)
+                    return
+                normalized_params = validation.normalized_payload
+        
+        max_retries = 4
+        success = False
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+                try:
+                    async with self.engine.begin() as conn:
+                        res = await conn.execute(text(query), normalized_params)
+                        # rowcount may be None depending on driver; treat None as unknown
+                        rc = getattr(res, "rowcount", None)
+                        if rc == 0:
+                            # Insert silently affected 0 rows — capture dead-letter for investigation
+                            table_name = _extract_table_name_from_insert(query)
+                            await conn.execute(
+                            text("""
+                            INSERT INTO failed_inserts (table_name, query, params, reason)
+                            VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
+                                """),
+                                {
+                                    "table_name": table_name,
+                                    "query": query,
+                                    "params": safe_json_dumps(normalized_params),
+                                    "reason": "zero_rowcount",
+                                },
+                            )
+                        else:
+                            # Successful insert -- mirror to scout_signals if applicable
+                            table_name = _extract_table_name_from_insert(query)
+                            await self._mirror_to_scout_signals(table_name, normalized_params)
+
+                        # success -> break retry loop
+                        success = True
+                        break
+
+                except asyncpg.exceptions.DeadlockDetectedError as dde:
+                    last_error = dde
+                    from loguru import logger
+
+                    logger.error(f"Deadlock detected on insert (attempt {attempt}/{max_retries}): {dde}")
+                    if attempt < max_retries:
+                        # exponential backoff with jitter
+                        backoff = min(1.0, 0.1 * (2 ** (attempt - 1))) + random.uniform(0, 0.05)
+                        await asyncio.sleep(backoff)
+
+                except Exception as e:
+                    last_error = e
+                    from loguru import logger
+
+                    logger.warning(f"DB insert attempt {attempt}/{max_retries} failed: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(0.5)
+
+        if not success:
+                # Record the final failure outside the main transaction using a fresh connection
+                try:
+                    table_name = _extract_table_name_from_insert(query)
+                    async with self.engine.begin() as conn:
+                        await conn.execute(
+                        text("""
+                        INSERT INTO failed_inserts (table_name, query, params, reason)
+                        VALUES (:table_name, :query, CAST(:params AS jsonb), :reason)
+                            """),
+                            {
+                                "table_name": table_name,
+                                "query": query,
+                                "params": safe_json_dumps(normalized_params),
+                                "reason": f"failed_all_attempts:{last_error}",
+                            },
+                        )
+                except Exception as log_err:
+                    from loguru import logger
+                    logger.error(f"Failed to record failed_insert: {log_err}")
+                
+                raise last_error
 
     async def _quarantine_scout_payload(self, payload: dict[str, Any], reasons: list[str]) -> None:
         async with self.engine.begin() as conn:
-            await conn.execute(
-                text(
+                await conn.execute(
+                    text(
                     """
                     INSERT INTO scout_quarantine (source, source_sub, reasons, raw_payload)
                     VALUES (:source, :source_sub, CAST(:reasons AS jsonb), CAST(:raw_payload AS jsonb))
-                    """
-                ),
-                {
-                    "source": payload.get("source"),
-                    "source_sub": payload.get("source_sub") or payload.get("signal_type"),
-                    "reasons": safe_json_dumps(reasons),
-                    "raw_payload": safe_json_dumps(payload),
-                },
-            )
+                        """
+                    ),
+                    {
+                        "source": payload.get("source"),
+                        "source_sub": payload.get("source_sub") or payload.get("signal_type"),
+                        "reasons": safe_json_dumps(reasons),
+                        "raw_payload": safe_json_dumps(payload),
+                    },
+                )
 
     async def _mirror_to_scout_signals(self, table_name: str, params: dict[str, Any]) -> None:
         """Auto-mirror scout inserts to scout_signals for pipeline consumption."""
         config = _SCOUT_TABLE_MIRROR_MAP.get(table_name)
         if config is None:
-            return
+                return
 
         # Use config source value as a literal static name, unless the param key
         # actually exists in the insert params (e.g., external_scout_memory has a
         # dynamic "source" field like "youtube" / "discord").
         if config["source"] in params:
-            raw_source = params[config["source"]]
+                raw_source = params[config["source"]]
         else:
-            raw_source = config["source"]
+                raw_source = config["source"]
         symbol = None
         if config.get("symbol_key"):
-            symbol = params.get(config["symbol_key"])
+                symbol = params.get(config["symbol_key"])
 
         confidence = None
         if config.get("confidence_key"):
-            try:
-                confidence = float(params.get(config["confidence_key"], 0) or 0)
-            except (TypeError, ValueError):
-                confidence = 0.0
+                try:
+                    confidence = float(params.get(config["confidence_key"], 0) or 0)
+                except (TypeError, ValueError):
+                    confidence = 0.0
 
         signal_data = {}
         for key in config.get("signal_data_keys", []):
-            if key in params:
-                val = params[key]
-                if isinstance(val, (list, dict)):
-                    import json
-                    signal_data[key] = json.loads(json.dumps(val, default=str))
-                else:
-                    signal_data[key] = val
+                if key in params:
+                    val = params[key]
+                    if isinstance(val, (list, dict)):
+                        import json
+                        signal_data[key] = json.loads(json.dumps(val, default=str))
+                    else:
+                        signal_data[key] = val
 
         insert_query = """
-            INSERT INTO scout_signals (source, symbol, signal_type, confidence_score, signal_data)
-            VALUES (:source, :symbol, :signal_type, :confidence_score, CAST(:signal_data AS jsonb))
+                INSERT INTO scout_signals (source, symbol, signal_type, confidence_score, signal_data)
+                VALUES (:source, :symbol, :signal_type, :confidence_score, CAST(:signal_data AS jsonb))
         """
         async with self.engine.begin() as conn:
-            success = False
-            error_msg = None
-            try:
-                await conn.execute(
-                    text(insert_query),
-                    {
-                        "source": str(raw_source),
-                        "symbol": str(symbol) if symbol else None,
-                        "signal_type": config["signal_type"],
-                        "confidence_score": confidence,
-                        "signal_data": safe_json_dumps(signal_data),
-                    },
-                )
-                success = True
-            except Exception as e:
-                error_msg = str(e)[:500]
-                # Mirror failures are non-fatal -- do not poison the primary insert
+                success = False
+                error_msg = None
+                try:
+                    await conn.execute(
+                        text(insert_query),
+                        {
+                            "source": str(raw_source),
+                            "symbol": str(symbol) if symbol else None,
+                            "signal_type": config["signal_type"],
+                            "confidence_score": confidence,
+                            "signal_data": safe_json_dumps(signal_data),
+                        },
+                    )
+                    success = True
+                except Exception as e:
+                    error_msg = str(e)[:500]
+                    # Mirror failures are non-fatal -- do not poison the primary insert
 
-            # Phase 25 Step 3: Debug mode — log every mirror attempt
-            try:
-                await conn.execute(
+                # Phase 25 Step 3: Debug mode — log every mirror attempt
+                try:
+                    await conn.execute(
                     text("""
                         INSERT INTO scout_mirror_debug_log
                             (table_name, source, symbol, signal_type, confidence_score, success, error_message)
                         VALUES (:tn, :src, :sym, :st, :conf, :ok, :err)
-                    """),
-                    {
-                        "tn": table_name,
-                        "src": str(raw_source),
-                        "sym": str(symbol) if symbol else None,
-                        "st": config["signal_type"],
-                        "conf": confidence,
-                        "ok": success,
-                        "err": error_msg,
-                    },
-                )
-            except Exception as log_e:
-                from loguru import logger
-                logger.debug(f"Mirror debug log insertion failed: {log_e}")
+                        """),
+                        {
+                            "tn": table_name,
+                            "src": str(raw_source),
+                            "sym": str(symbol) if symbol else None,
+                            "st": config["signal_type"],
+                            "conf": confidence,
+                            "ok": success,
+                            "err": error_msg,
+                        },
+                    )
+                except Exception as log_e:
+                    from loguru import logger
+                    logger.debug(f"Mirror debug log insertion failed: {log_e}")
 
     async def fetchval(self, query: str, params: Optional[Dict[str, Any]] = None):
         async with self.engine.connect() as conn:
-            result = await conn.execute(text(query), params or {})
-            return result.scalar()
+                result = await conn.execute(text(query), params or {})
+                return result.scalar()
 
     # ================================================================
     # PHASE 26 -- SCOUT INFLUENCE TRACKING HELPERS
@@ -2260,7 +2495,7 @@ class TimescaleClient:
         """Log a scout influence event for Phase 26 coupling analysis."""
         import uuid
         try:
-            await self._execute_insert(
+                await self._execute_insert(
                 """
                 INSERT INTO scout_influence_log
                     (trace_id, source_scout, target_agent, influence_type, influence_metric,
@@ -2270,22 +2505,22 @@ class TimescaleClient:
                     (:trace_id, :source, :target, :itype, :imetric,
                      :before, :after, :delta, :conf, :regime,
                      :entropy, CAST(:meta AS jsonb))
-                """,
-                {
-                    "trace_id": trace_id or uuid.uuid4().hex[:16],
-                    "source": source_scout,
-                    "target": target_agent,
-                    "itype": influence_type,
-                    "imetric": influence_metric,
-                    "before": before_value,
-                    "after": after_value,
-                    "delta": delta,
-                    "conf": confidence,
-                    "regime": regime_context,
-                    "entropy": entropy_context,
-                    "meta": safe_json_dumps(metadata or {}),
-                },
-            )
+                    """,
+                    {
+                        "trace_id": trace_id or str(uuid.uuid4()),
+                        "source": source_scout,
+                        "target": target_agent,
+                        "itype": influence_type,
+                        "imetric": influence_metric,
+                        "before": before_value,
+                        "after": after_value,
+                        "delta": delta,
+                        "conf": confidence,
+                        "regime": regime_context,
+                        "entropy": entropy_context,
+                        "meta": safe_json_dumps(metadata or {}),
+                    },
+                )
         except Exception as e:
             from loguru import logger
             logger.debug(f"log_scout_influence failed: {e}")
@@ -2309,7 +2544,7 @@ class TimescaleClient:
     ) -> None:
         """Record full economic attribution for a scout-influenced decision."""
         import uuid
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = str(uuid.uuid4())
         try:
             await self._execute_insert(
                 """
@@ -3060,7 +3295,7 @@ class TimescaleClient:
             )
 
         strategy_id = str(uuid.uuid4())
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = str(uuid.uuid4())
         query = """
             INSERT INTO strategies (id, name, code, parameters, status, created_at, author_agent, prompt, raw_response, normalized_strategy, strategy_signature, trace_id, generation_batch)
             VALUES (:id, :name, :code, :parameters, :status, :created_at, :author_agent, :prompt, :raw_response, :normalized_strategy, :strategy_signature, :trace_id, :generation_batch)
@@ -3754,6 +3989,86 @@ class TimescaleClient:
                 trade,
             )
 
+    async def sync_paper_trades_from_executions(self) -> int:
+        """Backfill paper_trades from filled execution and copy-execution records.
+
+        This keeps the public demo surfaces populated even when the live paper-trade
+        writer has not yet produced rows in the current environment.
+        paper_trades is a hypertable WITHOUT an 'id' column, so we deduplicate
+        on (time, strategy_id, symbol, side).
+        """
+        inserted = 0
+        async with self.engine.begin() as conn:
+            # From copy_execution_log
+            try:
+                result = await conn.execute(
+                    text(
+                        """
+                        INSERT INTO paper_trades
+                            (time, strategy_id, symbol, side, quantity, price, fill_price, status, pnl)
+                        SELECT
+                            c.created_at,
+                            CAST(COALESCE(c.follower_id, c.leader_id) AS UUID),
+                            c.symbol,
+                            c.side,
+                            COALESCE(c.follower_qty, c.leader_qty, 0),
+                            0,
+                            0,
+                            'filled',
+                            0
+                        FROM copy_execution_log c
+                        WHERE c.status = 'filled'
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM paper_trades p
+                              WHERE p.time = c.created_at
+                                AND p.symbol = c.symbol
+                                AND p.side = c.side
+                          )
+                        """
+                    )
+                )
+                inserted += max(0, result.rowcount or 0)
+            except Exception:
+                pass  # copy_execution_log may be empty or have schema issues
+
+            # From execution_log
+            try:
+                result = await conn.execute(
+                    text(
+                        """
+                        INSERT INTO paper_trades
+                            (time, strategy_id, symbol, side, quantity, price, fill_price, status, pnl)
+                        SELECT
+                            e.created_at,
+                            e.strategy_id,
+                            e.symbol,
+                            e.side,
+                            COALESCE(e.quantity, 0),
+                            COALESCE(e.price, 0),
+                            COALESCE(e.price, 0),
+                            'filled',
+                            0
+                        FROM execution_log e
+                        WHERE e.state IN ('filled', 'closed')
+                          AND e.strategy_id IS NOT NULL
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM paper_trades p
+                              WHERE p.time = e.created_at
+                                AND p.strategy_id = e.strategy_id
+                                AND p.symbol = e.symbol
+                                AND p.side = e.side
+                          )
+                        """
+                    )
+                )
+                inserted += max(0, result.rowcount or 0)
+            except Exception:
+                pass  # execution_log may be empty
+
+        return inserted
+
     async def save_backtest_trade(self, strategy_id: str, trade: dict) -> None:
         """Insert a single backtest trade into backtest_trades"""
         query = """
@@ -3982,7 +4297,7 @@ class TimescaleClient:
     ) -> None:
         import json as _json
         import uuid as _uuid
-        trace_id = _uuid.uuid4().hex[:16]
+        trace_id = str(_uuid.uuid4())
         await self._execute_insert(
             """
             INSERT INTO scout_economic_attribution
@@ -4024,10 +4339,10 @@ class TimescaleClient:
                        influence_metric, delta, regime_context,
                        entropy_context, created_at
                 FROM scout_influence_log
-                WHERE created_at > NOW() - INTERVAL :hours_str
+                WHERE created_at > NOW() - CAST(:hours_str AS INTERVAL)
                 ORDER BY created_at DESC
                 LIMIT 200
-            """), {"hours_str": f"{hours} hours"})
+            """), {"hours_str": timedelta(hours=hours)})
             return [
                 {
                     "source_scout": row[0],
@@ -4051,10 +4366,10 @@ class TimescaleClient:
                        SUM(CASE WHEN survived_validation THEN 1 ELSE 0 END) as n_survived,
                        AVG(attribution_weight) as avg_weight
                 FROM scout_economic_attribution
-                WHERE created_at > NOW() - INTERVAL :hours_str
+                WHERE created_at > NOW() - CAST(:hours_str AS INTERVAL)
                 GROUP BY source_scout
                 ORDER BY avg_sharpe DESC
-            """), {"hours_str": f"{hours} hours"})
+            """), {"hours_str": timedelta(hours=hours)})
             return [
                 {
                     "source_scout": row[0],

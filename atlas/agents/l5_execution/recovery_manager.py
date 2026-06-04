@@ -59,7 +59,7 @@ class RecoveryManager:
         - Recovers orphaned orders from dead instances
         - Dead-letter reconciliation for orders with stale ownership
         """
-        logger.critical("RECOVERY: Starting startup reconciliation")
+        logger.info("RECOVERY: Starting startup reconciliation")
         self.execution_locked = True
         
         # 1. Set recovery lock (blocks all execution locally, and via redis globally)
@@ -107,6 +107,10 @@ class RecoveryManager:
                 
             if unresolved_count > 0:
                 logger.warning(f"RECOVERY: {unresolved_count} unresolved dead-letter orders require attention.")
+                reconcile_result = await self.dead_letter.reconcile_unresolved(self, limit=50)
+                logger.warning(
+                    f"RECOVERY: dead-letter reconciliation summary: {reconcile_result}"
+                )
             
             logger.info("RECOVERY: Startup reconciliation complete — trading enabled")
             self.execution_locked = False

@@ -139,7 +139,7 @@ class CopyDriftEngine(BaseAgent):
         sync_quality = max(0.0, 1.0 - drift_score)
 
         # Persist
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = str(uuid.uuid4())
         await self.db._execute_insert(
             """
             INSERT INTO copy_drift_log
@@ -160,7 +160,7 @@ class CopyDriftEngine(BaseAgent):
                  CAST(:metadata AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": str(uuid.uuid4()),
                 "trace_id": trace_id,
                 "leader_id": leader_id,
                 "follower_id": follower_id,

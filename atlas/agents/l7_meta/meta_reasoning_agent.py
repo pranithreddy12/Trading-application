@@ -119,13 +119,13 @@ class MetaReasoningAgent(BaseAgent):
             return
 
         # 3. Persist advisory with trace lineage
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
         await self._persist_advisory(trace_id, advisory, state)
 
         # 4. Update meta-memory (keep last 10 analyses for temporal comparison)
         self._prior_analyses.append({
             "trace_id": trace_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat() if datetime.now(timezone.utc) and hasattr(datetime.now(timezone.utc), "isoformat") else str(datetime.now(timezone.utc)) if datetime.now(timezone.utc) else None,
             "summary": advisory.get("summary", ""),
             "confidence": advisory.get("confidence", 0.0),
         })
@@ -429,7 +429,7 @@ Focus on the MOST IMPORTANT systemic observation. Prioritize:
                      CAST(:snapshot AS jsonb), CAST(:recommendations AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": self.select_trace_id(),
                     "trace_id": trace_id,
                     "advisory_type": advisory.get("advisory_type", "strategic_advisory"),
                     "confidence": advisory.get("confidence", 0.0),

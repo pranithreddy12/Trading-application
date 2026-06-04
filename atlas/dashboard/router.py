@@ -12,6 +12,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,18 +20,35 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from loguru import logger
+from sqlalchemy import text
 
 from atlas.config.settings import settings
 
 router = APIRouter(tags=["Dashboard"])
 
+_db_client = None
+_db_client_lock = asyncio.Lock()
+
 
 async def _get_db():
+    import os
     from atlas.data.storage.timescale_client import TimescaleClient
 
-    db = TimescaleClient(settings.database_url)
-    await db.connect()
-    return db
+    global _db_client
+
+    if _db_client is not None:
+        return _db_client
+
+    db_url = getattr(settings, "database_url", None) or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise ValueError("DATABASE_URL environment variable is not set.")
+
+    async with _db_client_lock:
+        if _db_client is None:
+            db = TimescaleClient(db_url)
+            await db.connect()
+            _db_client = db
+    return _db_client
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
@@ -116,7 +134,7 @@ async def dashboard_overview():
             ensemble_count = r.scalar() or 0
 
             r = await conn.execute(
-                text("SELECT COUNT(*) FROM external_scout_memory")
+                text("SELECT COUNT(*) FROM scout_signals")
             )
             scout_signals = r.scalar() or 0
 
@@ -190,7 +208,7 @@ async def dashboard_overview():
                 "execution_realism": realism_count,
             },
             "scouts": {
-                "external_signals": scout_signals,
+                "internal_signals": scout_signals,
             },
         }
     except Exception as exc:
@@ -246,9 +264,7 @@ async def dashboard_pipeline():
                     "name": row[1],
                     "status": row[2],
                     "author": row[3],
-                    "created_at": row[4].isoformat()
-                    if hasattr(row[4], "isoformat")
-                    else str(row[4]),
+                    "created_at": row[4].isoformat() if row[4] and hasattr(row[4], "isoformat") else str(row[4]) if row[4] else None,
                 }
                 for row in r.fetchall()
             ]
@@ -296,9 +312,7 @@ async def dashboard_traces(limit: int = Query(20, ge=1, le=100)):
                         "actor": str(row[3]),
                         "strategy_id": str(row[4]) if row[4] else None,
                         "metadata": meta,
-                        "created_at": row[6].isoformat()
-                        if hasattr(row[6], "isoformat")
-                        else str(row[6]),
+                        "created_at": row[6].isoformat() if row[6] and hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
                     }
                 )
 
@@ -319,6 +333,90 @@ async def dashboard_traces(limit: int = Query(20, ge=1, le=100)):
         }
     except Exception as exc:
         logger.error(f"Dashboard traces error: {exc}")
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/validations/list")
+async def dashboard_validations_list(limit: int = Query(200, ge=1, le=500)):
+    """Phase 30: Detailed validation logs for the dashboard."""
+    try:
+        db = await _get_db()
+        from sqlalchemy.sql import text
+        async with db.engine.connect() as conn:
+            # Fetch strategies that are in validation-related states
+            r = await conn.execute(
+                text("""
+                SELECT s.id, s.name, s.status, s.author_agent, s.created_at,
+                       s.validation_metrics, s.compile_error, s.parameters->>'validation_notes' as notes
+                FROM strategies s
+                WHERE s.status IN ('validated', 'failed_validation', 'backtest_failed', 'code_failed', 'no_signal_strategy')
+                ORDER BY s.created_at DESC
+                LIMIT :limit
+                """),
+                {"limit": limit}
+            )
+
+            validations = []
+            for row in r.fetchall():
+                v = dict(row._mapping)
+                v["id"] = str(v["id"])
+                if hasattr(v["created_at"], "isoformat"):
+                    v["created_at"] = v["created_at"].isoformat()
+
+                # Heuristic for "why rejected"
+                reason = "Unknown"
+                status = v["status"]
+                notes = v.get("notes")
+                val_metrics = v.get("validation_metrics") or {}
+
+                if status == "validated":
+                    reason = "Passed all checks"
+                elif status == "failed_validation":
+                    if notes:
+                        if notes.startswith("{"):  # It's a JSON string of metrics
+                            try:
+                                nm = json.loads(notes)
+                                # Try to extract a human reason
+                                if nm.get("tier") == "failed_validation":
+                                    reasons = []
+                                    if nm.get("test_sharpe", 0) < 0:
+                                        reasons.append("Negative Sharpe")
+                                    if nm.get("regime_score", 0) < 0.3:
+                                        reasons.append("Low Regime Score")
+                                    if nm.get("composite_score", 0) < 40:
+                                        reasons.append(
+                                            f"Low Composite ({nm.get('composite_score', 0)})"
+                                        )
+                                    reason = (
+                                        ", ".join(reasons)
+                                        if reasons
+                                        else "Criteria not met"
+                                    )
+                                else:
+                                    reason = "Validation criteria not met"
+                            except Exception:
+                                reason = "Failed validation metrics"
+                        elif "|" in notes:
+                            reason = notes.split("|")[-1].strip()
+                        else:
+                            reason = notes
+                    else:
+                        reason = "Validation criteria not met"
+                elif status == "backtest_failed":
+                    reason = "Backtest execution error"
+                elif status == "code_failed":
+                    reason = (
+                        v.get("compile_error") or "Syntax/Logic error in generated code"
+                    )
+                elif status == "no_signal_strategy":
+                    reason = "No trade signals generated"
+
+                v["reason"] = reason
+                validations.append(v)
+
+        return {"validations": validations}
+    except Exception as exc:
+        logger.error(f"Dashboard validations list error: {exc}")
         return {"error": str(exc)}
 
 
@@ -358,9 +456,7 @@ async def dashboard_patterns():
                         "composite_score": float(row[3]) if row[3] else 0.0,
                         "confidence": float(row[4]) if row[4] else 0.0,
                         "recommendation": str(row[5]) if row[5] else "",
-                        "detected_at": row[6].isoformat()
-                        if hasattr(row[6], "isoformat")
-                        else str(row[6]),
+                        "detected_at": row[6].isoformat() if row[6] and hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
                     }
                 )
 
@@ -634,11 +730,41 @@ async def dashboard_execution_realism():
 
 @router.get("/dashboard/api/scouts")
 async def dashboard_scouts():
-    """Phase 12 External Scout Network data."""
+    """Phase 12 Scout Network data — internal scout_signals + external_scout_memory."""
     try:
         db = await _get_db()
         from sqlalchemy.sql import text
         async with db.engine.connect() as conn:
+            # ── Internal scout signals (regime, liquidity, correlation, execution scouts) ──
+            r = await conn.execute(
+                text("""
+                SELECT COALESCE(source, 'unknown') as source, COUNT(*) as cnt
+                FROM scout_signals
+                GROUP BY source ORDER BY cnt DESC
+                """)
+            )
+            internal_by_source = {str(row[0]): row[1] for row in r.fetchall()}
+
+            r = await conn.execute(
+                text("""
+                SELECT source, symbol, signal_type, confidence_score,
+                       signal_data, created_at
+                FROM scout_signals
+                ORDER BY created_at DESC LIMIT 20
+                """)
+            )
+            internal_signals = []
+            for row in r.fetchall():
+                internal_signals.append({
+                    "source": str(row[0]) if row[0] else "unknown",
+                    "symbol": str(row[1]) if row[1] else "",
+                    "signal_type": str(row[2]) if row[2] else "",
+                    "confidence": float(row[3]) if row[3] else 0,
+                    "data": str(row[4])[:200] if row[4] else "",
+                    "created_at": row[5].isoformat() if hasattr(row[5], "isoformat") else str(row[5]),
+                })
+
+            # ── External scout signals (Reddit, Discord, YouTube, Podcast) ──
             r = await conn.execute(
                 text("""
                 SELECT source, COUNT(*) as cnt
@@ -646,7 +772,7 @@ async def dashboard_scouts():
                 GROUP BY source ORDER BY cnt DESC
                 """)
             )
-            by_source = {str(row[0]): row[1] for row in r.fetchall()}
+            external_by_source = {str(row[0]): row[1] for row in r.fetchall()}
 
             r = await conn.execute(
                 text("""
@@ -656,16 +782,29 @@ async def dashboard_scouts():
                 ORDER BY timestamp DESC LIMIT 20
                 """)
             )
-            signals = []
+            external_signals = []
             for row in r.fetchall():
-                signals.append({
+                external_signals.append({
                     "source": str(row[0]),
                     "timestamp": row[1].isoformat() if hasattr(row[1], "isoformat") else str(row[1]),
                     "sentiment": float(row[2]) if row[2] else 0,
                     "score": float(row[3]) if row[3] else 0,
                     "direction": str(row[4]) if row[4] else "neutral",
+                    "mentioned_tickers": row[5] if row[5] else [],
                 })
-        return {"by_source": by_source, "signals": signals}
+
+        return {
+            "internal": {
+                "total_signals": sum(internal_by_source.values()),
+                "by_source": internal_by_source,
+                "recent": internal_signals,
+            },
+            "external": {
+                "total_signals": sum(external_by_source.values()),
+                "by_source": external_by_source,
+                "recent": external_signals,
+            },
+        }
     except Exception as exc:
         logger.error(f"Dashboard scouts error: {exc}")
         return {"error": str(exc)}
@@ -943,7 +1082,9 @@ async def dashboard_deployments(limit: int = 20):
                     "approved_by": row[4],
                     "activated_at": row[5].isoformat() if row[5] and hasattr(row[5], "isoformat") else str(row[5]) if row[5] else None,
                 })
-        return {"deployments": deploys}
+            r = await conn.execute(text("SELECT COUNT(*) FROM deployment_governance"))
+            total = r.scalar() or 0
+        return {"total_deployments": total, "deployments": deploys}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -1125,27 +1266,6 @@ async def dashboard_mutation_policy():
         return {"error": str(exc)}
 
 
-@router.get("/dashboard/api/meta/agent-governance")
-async def dashboard_agent_governance():
-    """Phase 15: Agent performance governor state."""
-    try:
-        db = await _get_db()
-        async with db.engine.connect() as conn:
-            r = await conn.execute(text("""
-                SELECT assessed_at, n_agents_assessed
-                FROM agent_governance_state
-                ORDER BY assessed_at DESC LIMIT 1
-            """))
-            row = r.fetchone()
-            if row:
-                return {
-                    "assessed_at": row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0]),
-                    "n_agents_assessed": row[1] or 0,
-                }
-            return {"message": "No agent governance data"}
-    except Exception as exc:
-        return {"error": str(exc)}
-
 
 # ================================================================
 # PHASE 17 — OBSERVABILITY ENDPOINTS
@@ -1229,6 +1349,348 @@ async def dashboard_institutional_overview():
         return metrics
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ================================================================
+# TRADES — Real paper trades with strategy linkage
+# ================================================================
+
+@router.get("/dashboard/api/trades")
+async def dashboard_trades(limit: int = Query(default=50, ge=1, le=200)):
+    """Recent paper trades with strategy name linkage."""
+    try:
+        db = await _get_db()
+        from sqlalchemy.sql import text
+        async with db.engine.connect() as conn:
+            r = await conn.execute(
+                text("""
+                SELECT
+                    pt.id, pt.time, pt.strategy_id, pt.symbol,
+                    pt.side, pt.quantity, pt.price, pt.fill_price,
+                    pt.status, pt.pnl, s.name AS strategy_name
+                FROM paper_trades pt
+                LEFT JOIN strategies s ON s.id::text = pt.strategy_id::text
+                ORDER BY pt.time DESC
+                LIMIT :limit
+                """),
+                {"limit": limit},
+            )
+            trades = []
+            for row in r.fetchall():
+                t = dict(row._mapping)
+                t["id"] = str(t["id"]) if t.get("id") else None
+                t["strategy_id"] = str(t["strategy_id"]) if t.get("strategy_id") else None
+                if hasattr(t.get("time"), "isoformat"):
+                    t["time"] = t["time"].isoformat()
+                trades.append(t)
+
+            r = await conn.execute(text("SELECT COUNT(*) FROM paper_trades"))
+            total = r.scalar() or 0
+
+            r = await conn.execute(
+                text("SELECT COALESCE(SUM(pnl), 0) FROM paper_trades WHERE status = 'filled'")
+            )
+            total_pnl = float(r.scalar() or 0.0)
+
+            r = await conn.execute(
+                text("SELECT COUNT(DISTINCT strategy_id) FROM paper_trades WHERE strategy_id IS NOT NULL")
+            )
+            strategies_with_trades = r.scalar() or 0
+
+        return {
+            "total_trades": total,
+            "total_pnl": total_pnl,
+            "strategies_with_trades": strategies_with_trades,
+            "trades": trades,
+        }
+    except Exception as exc:
+        logger.error(f"Dashboard trades error: {exc}")
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/trades/by-strategy/{strategy_id}")
+async def dashboard_trades_by_strategy(strategy_id: str):
+    """Paper trades for a specific strategy."""
+    try:
+        db = await _get_db()
+        from sqlalchemy.sql import text
+        async with db.engine.connect() as conn:
+            r = await conn.execute(
+                text("""
+                SELECT
+                    pt.id, pt.time, pt.symbol,
+                    pt.side, pt.quantity, pt.price, pt.fill_price,
+                    pt.status, pt.pnl, s.name AS strategy_name
+                FROM paper_trades pt
+                LEFT JOIN strategies s ON s.id::text = pt.strategy_id::text
+                WHERE pt.strategy_id::text = :sid
+                ORDER BY pt.time DESC
+                """),
+                {"sid": strategy_id},
+            )
+            trades = []
+            for row in r.fetchall():
+                t = dict(row._mapping)
+                t["id"] = str(t["id"]) if t.get("id") else None
+                t["time"] = t["time"].isoformat() if hasattr(t["time"], "isoformat") else str(t["time"])
+                trades.append(t)
+
+        return {
+            "strategy_id": strategy_id,
+            "count": len(trades),
+            "trades": trades,
+        }
+    except Exception as exc:
+        logger.error(f"Dashboard trades by strategy error: {exc}")
+        return {"error": str(exc)}
+
+
+# ================================================================
+# STRATEGY DETAIL — Full strategy with validation reasons + trades
+# ================================================================
+
+@router.get("/dashboard/api/strategies/{strategy_id}")
+async def dashboard_strategy_detail(strategy_id: str):
+    """Full strategy detail: metadata, backtest results, all validation scores, and trades."""
+    try:
+        db = await _get_db()
+        from sqlalchemy.sql import text
+        async with db.engine.connect() as conn:
+            # 1. Strategy metadata
+            r = await conn.execute(
+                text("""
+                SELECT id, name, status, author_agent, strategy_signature,
+                       mutation_type, lifecycle_state, age_bars,
+                       compile_error, trace_id, generation_batch,
+                       created_at
+                FROM strategies
+                WHERE id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            if not row:
+                return {"error": f"Strategy {strategy_id} not found"}
+
+            strategy = {
+                "id": str(row[0]),
+                "name": row[1],
+                "status": row[2],
+                "author": row[3],
+                "signature": row[4],
+                "mutation_type": row[5],
+                "lifecycle_state": row[6],
+                "age_bars": row[7],
+                "compile_error": row[8],
+                "trace_id": row[9],
+                "generation_batch": row[10],
+                "created_at": str(row[11]) if row[11] else "",
+            }
+
+            # 2. Backtest results
+            r = await conn.execute(
+                text("""
+                SELECT sharpe, win_rate, total_trades, composite_fitness_score,
+                       sortino_ratio, calmar_ratio, expectancy, created_at
+                FROM backtest_results
+                WHERE strategy_id = :sid
+                ORDER BY created_at DESC LIMIT 1
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            backtest = None
+            if row:
+                backtest = {
+                    "sharpe": float(row[0]) if row[0] else None,
+                    "win_rate": float(row[1]) if row[1] else None,
+                    "total_trades": row[2],
+                    "composite_fitness": float(row[3]) if row[3] else None,
+                    "sortino": float(row[4]) if row[4] else None,
+                    "calmar": float(row[5]) if row[5] else None,
+                    "expectancy": float(row[6]) if row[6] else None,
+                    "created_at": str(row[7]) if row[7] else "",
+                }
+
+            # 3. Walk-forward validation
+            r = await conn.execute(
+                text("""
+                SELECT walk_forward_score, temporal_consistency, regime_survival_score,
+                       n_windows_survived, n_windows_total, analyzed_at
+                FROM walk_forward_analysis
+                WHERE strategy_id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            walk_forward = None
+            if row:
+                walk_forward = {
+                    "walk_forward_score": float(row[0]) if row[0] else None,
+                    "temporal_consistency": float(row[1]) if row[1] else None,
+                    "regime_survival_score": float(row[2]) if row[2] else None,
+                    "n_windows_survived": row[3],
+                    "n_windows_total": row[4],
+                    "analyzed_at": str(row[5]) if row[5] else "",
+                }
+
+            # 4. Monte Carlo validation
+            r = await conn.execute(
+                text("""
+                SELECT monte_carlo_survival_score, expected_tail_drawdown,
+                       probabilistic_sharpe, n_simulations, simulated_at
+                FROM monte_carlo_analysis
+                WHERE strategy_id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            monte_carlo = None
+            if row:
+                monte_carlo = {
+                    "survival_score": float(row[0]) if row[0] else None,
+                    "tail_drawdown": float(row[1]) if row[1] else None,
+                    "prob_sharpe": float(row[2]) if row[2] else None,
+                    "n_simulations": row[3],
+                    "simulated_at": str(row[4]) if row[4] else "",
+                }
+
+            # 5. Overfitting analysis
+            r = await conn.execute(
+                text("""
+                SELECT overfit_probability, robustness_score,
+                       parameter_stability_score, analyzed_at
+                FROM overfitting_analysis
+                WHERE strategy_id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            overfitting = None
+            if row:
+                overfitting = {
+                    "overfit_probability": float(row[0]) if row[0] else None,
+                    "robustness_score": float(row[1]) if row[1] else None,
+                    "stability_score": float(row[2]) if row[2] else None,
+                    "analyzed_at": str(row[3]) if row[3] else "",
+                }
+
+            # 6. Regime validation
+            r = await conn.execute(
+                text("""
+                SELECT regime_survival_score, regime_dependency_score,
+                       n_regimes_survived, over_specialized, validated_at
+                FROM regime_validation
+                WHERE strategy_id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            regime_val = None
+            if row:
+                regime_val = {
+                    "survival_score": float(row[0]) if row[0] else None,
+                    "dependency_score": float(row[1]) if row[1] else None,
+                    "n_regimes": row[2],
+                    "over_specialized": bool(row[3]) if row[3] else False,
+                    "validated_at": str(row[4]) if row[4] else "",
+                }
+
+            # 7. Cost stress test
+            r = await conn.execute(
+                text("""
+                SELECT cost_survival_score, max_survivable_multiplier,
+                       passes_min_survival, fragile_scalper_detected, tested_at
+                FROM cost_stress_analysis
+                WHERE strategy_id = :sid
+                """),
+                {"sid": strategy_id},
+            )
+            row = r.fetchone()
+            cost_stress = None
+            if row:
+                cost_stress = {
+                    "survival_score": float(row[0]) if row[0] else None,
+                    "max_multiplier": float(row[1]) if row[1] else None,
+                    "passes_min_survival": bool(row[2]) if row[2] else False,
+                    "fragile_scalper": bool(row[3]) if row[3] else False,
+                    "tested_at": str(row[4]) if row[4] else "",
+                }
+
+            # 8. Lifecycle events (traces) for this strategy
+            r = await conn.execute(
+                text("""
+                SELECT trace_id, stage, status, actor, created_at
+                FROM lifecycle_events
+                WHERE strategy_id = :sid
+                ORDER BY created_at DESC LIMIT 20
+                """),
+                {"sid": strategy_id},
+            )
+            lifecycle_traces = []
+            for row in r.fetchall():
+                lifecycle_traces.append({
+                    "trace_id": str(row[0]),
+                    "stage": row[1],
+                    "status": row[2],
+                    "actor": row[3],
+                    "created_at": str(row[4]) if row[4] else "",
+                })
+
+        # Compile validation pass/fail reasons
+        validation_reasons = []
+        if walk_forward:
+            wf_score = walk_forward.get("walk_forward_score")
+            if wf_score is not None and wf_score >= 60:
+                validation_reasons.append({"check": "walk_forward", "passed": True, "detail": f"Score {wf_score:.1f}/100"})
+            elif wf_score is not None:
+                validation_reasons.append({"check": "walk_forward", "passed": False, "detail": f"Score {wf_score:.1f}/100 — below 60 threshold"})
+
+        if monte_carlo:
+            mc_score = monte_carlo.get("survival_score")
+            if mc_score is not None and mc_score >= 50:
+                validation_reasons.append({"check": "monte_carlo", "passed": True, "detail": f"Survival {mc_score:.1f}%, Sharpe {monte_carlo.get('prob_sharpe', 'N/A')}"})
+            elif mc_score is not None:
+                validation_reasons.append({"check": "monte_carlo", "passed": False, "detail": f"Survival {mc_score:.1f}% — below 50% threshold"})
+
+        if overfitting:
+            of_prob = overfitting.get("overfit_probability")
+            if of_prob is not None and of_prob < 50:
+                validation_reasons.append({"check": "overfitting", "passed": True, "detail": f"Overfit probability {of_prob:.1f}% — low risk"})
+            elif of_prob is not None:
+                validation_reasons.append({"check": "overfitting", "passed": False, "detail": f"Overfit probability {of_prob:.1f}% — high risk"})
+
+        if regime_val:
+            rs = regime_val.get("survival_score")
+            if rs is not None and rs >= 50:
+                validation_reasons.append({"check": "regime_resilience", "passed": True, "detail": f"Survived {regime_val.get('n_regimes', 0)} regimes, score {rs:.1f}"})
+            elif rs is not None:
+                validation_reasons.append({"check": "regime_resilience", "passed": False, "detail": f"Regime score {rs:.1f}, over-specialized={regime_val.get('over_specialized', False)}"})
+
+        if cost_stress:
+            cs_score = cost_stress.get("survival_score")
+            if cs_score is not None and cost_stress.get("passes_min_survival", False):
+                validation_reasons.append({"check": "cost_stress", "passed": True, "detail": f"Survival score {cs_score:.1f}, max multiplier {cost_stress.get('max_multiplier', 'N/A')}x"})
+            elif cs_score is not None:
+                validation_reasons.append({"check": "cost_stress", "passed": False, "detail": f"Score {cs_score:.1f}, fragile_scalper={cost_stress.get('fragile_scalper', False)}"})
+
+        return {
+            "strategy": strategy,
+            "backtest": backtest,
+            "validation": {
+                "walk_forward": walk_forward,
+                "monte_carlo": monte_carlo,
+                "overfitting": overfitting,
+                "regime": regime_val,
+                "cost_stress": cost_stress,
+            },
+            "validation_reasons": validation_reasons,
+            "lifecycle_traces": lifecycle_traces,
+        }
+    except Exception as exc:
+        logger.error(f"Dashboard strategy detail error: {exc}")
+        return {"error": str(exc)}
+
 
 # ================================================================
 # PHASE 19 — META-INTELLIGENCE DASHBOARD ENDPOINTS
@@ -1532,6 +1994,267 @@ async def dashboard_copy_overlap(limit: int = Query(default=20, le=100)):
                         "duplicated_exposure": json.loads(row[4]) if isinstance(row[4], str) else (row[4] or []),
                         "n_leaders_analyzed": row[5] or 0,
                         "analyzed_at": str(row[6]),
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ================================================================
+# PHASE 32/33 — ADAPTIVE INTELLIGENCE & BENCHMARK ENDPOINTS
+# ================================================================
+
+@router.get("/dashboard/api/meta/agent-governance")
+async def dashboard_agent_governance():
+    """Phase 15: Agent reliability and performance governance."""
+    try:
+        db = await _get_db()
+        from sqlalchemy.sql import text
+        async with db.engine.connect() as conn:
+            r = await conn.execute(
+                text("""
+                SELECT assessed_at, n_agents_assessed, agent_scores, throttled_agents
+                FROM agent_governance_state
+                ORDER BY assessed_at DESC
+                LIMIT 1
+            """)
+            )
+            row = r.fetchone()
+            if row:
+                return {
+                    "assessed_at": str(row[0]),
+                    "n_agents_assessed": row[1],
+                    "agent_scores": row[2],
+                    "throttled_agents": row[3],
+                }
+            return {
+                "n_agents_assessed": 0,
+                "agent_scores": {},
+                "throttled_agents": [],
+            }
+    except Exception as exc:
+        logger.error(f"Dashboard agent governance error: {exc}")
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/mutation-families")
+async def dashboard_mutation_families(limit: int = Query(default=20, le=100)):
+    """Phase 32: Mutation family performance rankings."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT family_id, family_name, n_members,
+                       avg_fitness, best_fitness, survival_rate,
+                       dominant_archetype, lineage_depth, last_active
+                FROM mutation_families
+                ORDER BY avg_fitness DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            return {
+                "count": len(rows),
+                "families": [
+                    {
+                        "family_id": str(row[0]),
+                        "family_name": row[1],
+                        "n_members": row[2] or 0,
+                        "avg_fitness": float(row[3]) if row[3] else 0,
+                        "best_fitness": float(row[4]) if row[4] else 0,
+                        "survival_rate": float(row[5]) if row[5] else 0,
+                        "dominant_archetype": row[6] or "mixed",
+                        "lineage_depth": row[7] or 0,
+                        "last_active": str(row[8]) if row[8] else "",
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/dominant-organisms")
+async def dashboard_dominant_organisms(limit: int = Query(default=20, le=100)):
+    """Phase 32: Dominant organism emergence tracking."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT strategy_id, strategy_name, archetype,
+                       fitness_score, dominance_duration_hours,
+                       n_generations_dominant, specialization_regime,
+                       last_detected_at
+                FROM dominant_organisms
+                ORDER BY fitness_score DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            if rows:
+                return {
+                    "count": len(rows),
+                    "organisms": [
+                        {
+                            "strategy_id": str(row[0]),
+                            "strategy_name": row[1],
+                            "archetype": row[2] or "unknown",
+                            "fitness_score": float(row[3]) if row[3] else 0,
+                            "dominance_hours": float(row[4]) if row[4] else 0,
+                            "generations": row[5] or 0,
+                            "regime": row[6] or "all",
+                            "last_detected": str(row[7]) if row[7] else "",
+                        }
+                        for row in rows
+                    ],
+                }
+            return {"count": 0, "organisms": [], "message": "No dominant organisms yet (requires longer runtime)"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/regime-specialization")
+async def dashboard_regime_specialization(limit: int = Query(default=20, le=100)):
+    """Phase 32: Regime specialization profiles."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT strategy_id, profiled_at, bull, bear,
+                       ranging, high_vol, low_vol, archetype
+                FROM regime_specialization
+                ORDER BY profiled_at DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            return {
+                "count": len(rows),
+                "profiles": [
+                    {
+                        "strategy_id": str(row[0]),
+                        "profiled_at": str(row[1]),
+                        "bull": float(row[2]) if row[2] else 0,
+                        "bear": float(row[3]) if row[3] else 0,
+                        "ranging": float(row[4]) if row[4] else 0,
+                        "high_vol": float(row[5]) if row[5] else 0,
+                        "low_vol": float(row[6]) if row[6] else 0,
+                        "archetype": row[7] or "generalist",
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/scout-rankings")
+async def dashboard_scout_rankings(limit: int = Query(default=20, le=100)):
+    """Phase 32: Scout predictive rankings."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT source_scout, prediction_accuracy,
+                       signal_quality_score, divergence_score,
+                       n_predictions, trust_score, ranked_at
+                FROM scout_predictive_rankings
+                ORDER BY prediction_accuracy DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            return {
+                "count": len(rows),
+                "rankings": [
+                    {
+                        "scout_name": row[0],
+                        "prediction_accuracy": float(row[1]) if row[1] else 0,
+                        "signal_quality": float(row[2]) if row[2] else 0,
+                        "divergence_score": float(row[3]) if row[3] else 0,
+                        "n_predictions": row[4] or 0,
+                        "trust_score": float(row[5]) if row[5] else 0,
+                        "ranked_at": str(row[6]) if row[6] else "",
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/portfolio-evolution")
+async def dashboard_portfolio_evolution(limit: int = Query(default=20, le=100)):
+    """Phase 32: Portfolio evolution and capital migration tracking."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT tracked_at, diversification_score,
+                       correlation_collapse_risk, contagion_exposure,
+                       concentration_risk, portfolio_survivability,
+                       capital_migrated, weak_penalized, dominant_boosted
+                FROM portfolio_evolution_log
+                ORDER BY tracked_at DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            return {
+                "count": len(rows),
+                "evolution": [
+                    {
+                        "tracked_at": str(row[0]),
+                        "diversification_score": float(row[1]) if row[1] else 0,
+                        "collapse_risk": float(row[2]) if row[2] else 0,
+                        "contagion_exposure": float(row[3]) if row[3] else 0,
+                        "concentration_risk": float(row[4]) if row[4] else 0,
+                        "survivability": float(row[5]) if row[5] else 0,
+                        "capital_migrated": float(row[6]) if row[6] else 0,
+                        "weak_penalized": row[7] or 0,
+                        "dominant_boosted": row[8] or 0,
+                    }
+                    for row in rows
+                ],
+            }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/meta/adaptive-intelligence")
+async def dashboard_adaptive_intelligence(limit: int = Query(default=50, le=200)):
+    """Phase 33: Adaptive intelligence benchmark metrics."""
+    try:
+        db = await _get_db()
+        async with db.engine.connect() as conn:
+            from sqlalchemy.sql import text
+            r = await conn.execute(text("""
+                SELECT recorded_at, runtime_minutes,
+                       adaptive_quality_score, specialization_quality_score,
+                       allocation_quality_score, evolutionary_selection_score,
+                       long_horizon_survivability_score,
+                       recovery_quality, drawdown_resilience, diversification_quality,
+                       replay_integrity, execution_degradation,
+                       dominant_organisms, active_organisms
+                FROM phase33_performance_metrics
+                ORDER BY recorded_at DESC LIMIT :limit
+            """), {"limit": limit})
+            rows = r.fetchall()
+            return {
+                "count": len(rows),
+                "metrics": [
+                    {
+                        "recorded_at": str(row[0]),
+                        "runtime_minutes": row[1] or 0,
+                        "adaptive_quality": float(row[2]) if row[2] else 0,
+                        "specialization_quality": float(row[3]) if row[3] else 0,
+                        "allocation_quality": float(row[4]) if row[4] else 0,
+                        "evolutionary_selection": float(row[5]) if row[5] else 0,
+                        "long_horizon_survivability": float(row[6]) if row[6] else 0,
+                        "recovery_quality": float(row[7]) if row[7] else 0,
+                        "drawdown_resilience": float(row[8]) if row[8] else 0,
+                        "diversification_quality": float(row[9]) if row[9] else 0,
+                        "replay_integrity": float(row[10]) if row[10] else 0,
+                        "execution_degradation": float(row[11]) if row[11] else 0,
+                        "dominant_organisms": row[12] or 0,
+                        "active_organisms": row[13] or 0,
                     }
                     for row in rows
                 ],

@@ -43,6 +43,9 @@ class CapitalAllocator(BaseAgent):
     KELLY_FRACTION = 0.15              # Phase 30: Reduced from 0.25 — more scarcity pressure
     VOL_TARGET = 0.12                  # Phase 30: Reduced from 0.15 — lower vol target
     RISK_FREE_RATE = 0.05              # 5% risk-free rate
+    # Evolution selection adjustments (applied when percentile thresholds are available)
+    WEAK_PENALTY_MULTIPLIER = 0.7      # reduce weight to 70% for weak organisms
+    DOMINANT_BOOST_MULTIPLIER = 1.5    # boost weight by 50% for dominant organisms
 
     def __init__(self, redis_client=None, db_client=None, run_interval: int = 1800):
         super().__init__(
@@ -151,6 +154,37 @@ class CapitalAllocator(BaseAgent):
             logger.warning(f"{self.name}: fetch strategies failed: {e}")
             return []
 
+    async def _get_selection_thresholds(self) -> tuple[float, float]:
+        """Compute percentile-based weak/dominant thresholds from backtest_results.
+
+        Returns (weak_threshold, dominant_threshold). Falls back to sensible defaults on error.
+        """
+        # Defaults chosen to be permissive if DB percentile can't be computed
+        default_weak = 30.0
+        default_dominant = 40.0
+        if not self.db:
+            return default_weak, default_dominant
+        try:
+            async with self.db.engine.connect() as conn:
+                from sqlalchemy.sql import text
+                r = await conn.execute(
+                    text('''
+                        SELECT
+                            PERCENTILE_CONT(0.2) WITHIN GROUP (ORDER BY short_window_score) as p20,
+                            PERCENTILE_CONT(0.8) WITHIN GROUP (ORDER BY short_window_score) as p80
+                        FROM backtest_results
+                        WHERE short_window_score IS NOT NULL
+                    '''),
+                )
+                row = r.fetchone()
+                if row:
+                    p20 = float(row[0]) if row[0] is not None else default_weak
+                    p80 = float(row[1]) if row[1] is not None else default_dominant
+                    return p20, p80
+        except Exception as e:
+            logger.debug(f"{self.name}: percentile thresholds query failed: {e}")
+        return default_weak, default_dominant
+
     async def _compute_scout_regime(self) -> dict:
         """Fetch current market regime from scout intelligence."""
         try:
@@ -175,6 +209,8 @@ class CapitalAllocator(BaseAgent):
 
         portfolio = await self._fetch_portfolio_intelligence()
         regime = await self._compute_scout_regime()
+        # Determine selection thresholds from DB (percentiles)
+        weak_threshold, dominant_threshold = await self._get_selection_thresholds()
 
         # Step 1: Kelly fraction per strategy
         kelly_weights = self._compute_kelly_fractions(strategies)
@@ -189,6 +225,27 @@ class CapitalAllocator(BaseAgent):
         combined_weights = self._combine_weighting_methods(
             strategies, kelly_weights, vol_weights, parity_weights, portfolio, regime
         )
+
+        # Apply percentile-based weak/dominant adjustments to combined weights
+        try:
+            by_id = {s["id"]: s for s in strategies}
+            for cw in combined_weights:
+                sid = cw.get("strategy_id")
+                strat = by_id.get(sid)
+                if not strat:
+                    continue
+                score = float(strat.get("score", 0))
+                if score <= weak_threshold:
+                    cw["combined_weight"] = round(float(cw.get("combined_weight", 0)) * self.WEAK_PENALTY_MULTIPLIER, 6)
+                    cw.setdefault("components", {})
+                    cw["components"]["selection_adjustment"] = "weak_penalty"
+                elif score >= dominant_threshold:
+                    cw["combined_weight"] = round(float(cw.get("combined_weight", 0)) * self.DOMINANT_BOOST_MULTIPLIER, 6)
+                    cw.setdefault("components", {})
+                    cw["components"]["selection_adjustment"] = "dominant_boost"
+        except Exception:
+            # best-effort; don't fail allocation cycle on thresholding issues
+            pass
 
         # Step 5: Apply constraints
         final_weights = self._apply_constraints(strategies, combined_weights, portfolio)

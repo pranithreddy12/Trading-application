@@ -88,7 +88,7 @@ class CopyAnalyticsEngine(BaseAgent):
         replay_integrity = max(0.0, 1.0 - exec_divergence)
         follower_survivability = max(0.0, 1.0 - drift_acc - (pnl_div * 0.5))
 
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
 
         await self.db._execute_insert(
             """
@@ -105,7 +105,7 @@ class CopyAnalyticsEngine(BaseAgent):
                  CAST(:meta AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "lid": leader_id,
                 "fid": follower_id,

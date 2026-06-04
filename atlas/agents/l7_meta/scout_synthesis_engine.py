@@ -38,6 +38,8 @@ from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.serialization import safe_json_dumps
+from atlas.core.persistence_integrity import strict_identity_contracts_enabled, IdentityContractViolation
+from atlas.governance.context import GovernanceExecutionContext
 
 
 class ScoutSynthesisEngine(BaseAgent):
@@ -118,7 +120,7 @@ class ScoutSynthesisEngine(BaseAgent):
             synthesis = self._generate_deterministic_synthesis(signals, metrics)
 
         # 4. Persist
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = await self._select_trace_id()
         await self._persist_synthesis(trace_id, synthesis, signals, metrics)
 
         logger.info(
@@ -470,7 +472,7 @@ Output JSON:
                      CAST(:signals AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": self.select_trace_id(),
                     "trace_id": trace_id,
                     "confidence": synthesis.get("confidence", 0.0),
                     "summary": synthesis.get("contextual_summary", ""),
@@ -496,3 +498,7 @@ Output JSON:
             )
         except Exception as e:
             logger.warning(f"{self.name}: persist synthesis failed: {e}")
+
+    async def _select_trace_id(self) -> str:
+        # Delegate to BaseAgent.select_trace_id for centralized behavior
+        return self.select_trace_id()

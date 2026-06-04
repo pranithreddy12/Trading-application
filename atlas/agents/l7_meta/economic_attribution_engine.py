@@ -139,7 +139,7 @@ class EconomicAttributionEngine(BaseAgent):
                     "max_drawdown": float(row[10] or 0),
                     "total_return": float(row[11] or 0),
                     "win_rate": float(row[12] or 0),
-                    "composite_fitness_score": float(row[14] if len(row) > 14 and row[14] is not None else row[9] or 0),
+                    "composite_fitness_score": float(row[9] or 0),
                     "status": str(row[13] or ""),
                 }
                 for row in r.fetchall()

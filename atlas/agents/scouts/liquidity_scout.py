@@ -19,7 +19,6 @@ Integrations:
 
 import asyncio
 import json
-import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -65,7 +64,9 @@ class LiquidityScout(BaseAgent):
     SPREAD_THIN = 20.0
 
     # Depth imbalance thresholds
-    IMBALANCE_THRESHOLD = 0.3  # |1 - ratio| > this = dangerous imbalance
+    IMBALANCE_THRESHOLD = (
+        0.3  # |depth_imbalance| > this = dangerous imbalance on [-1, +1]
+    )
 
     def __init__(
         self,
@@ -83,11 +84,17 @@ class LiquidityScout(BaseAgent):
         self.messaging = MessagingClient(redis_client)
 
         self.symbols = symbols or [
-            "BTCUSDT", "ETHUSDT", "SOLUSDT",
-            "SPY", "QQQ", "AAPL", "MSFT", "NVDA",
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "SPY",
+            "QQQ",
+            "AAPL",
+            "MSFT",
+            "NVDA",
         ]
 
-        self._latest_payload: Optional[LiquidityPayload] = None
+        self._latest_payloads: dict[str, LiquidityPayload] = {}
 
     async def run(self):
         logger.info(f"{self.name} started — monitoring {len(self.symbols)} symbols")
@@ -132,8 +139,12 @@ class LiquidityScout(BaseAgent):
                 if row:
                     return {
                         "time": row[0],
-                        "bids": json.loads(row[1]) if isinstance(row[1], str) else row[1],
-                        "asks": json.loads(row[2]) if isinstance(row[2], str) else row[2],
+                        "bids": json.loads(row[1])
+                        if isinstance(row[1], str)
+                        else row[1],
+                        "asks": json.loads(row[2])
+                        if isinstance(row[2], str)
+                        else row[2],
                         "spread": float(row[3]),
                         "mid_price": float(row[4]),
                     }
@@ -143,7 +154,11 @@ class LiquidityScout(BaseAgent):
 
     async def _analyze_with_l2(self, symbol: str, l2: dict) -> LiquidityPayload:
         """Analyze liquidity using orderbook data."""
-        spread_bps = l2["spread"] / max(l2["mid_price"], 1e-10) * 10000 if l2["mid_price"] > 0 else 0
+        spread_bps = (
+            l2["spread"] / max(l2["mid_price"], 1e-10) * 10000
+            if l2["mid_price"] > 0
+            else 0
+        )
 
         # Depth imbalance
         bids = l2.get("bids", {})
@@ -151,20 +166,20 @@ class LiquidityScout(BaseAgent):
 
         bid_volume = sum(float(v) for v in bids.values())
         ask_volume = sum(float(v) for v in asks.values())
-        depth_imbalance = bid_volume / max(ask_volume, 1)
+        depth_imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume + 1e-10)
 
         # Slippage risk: wider spreads + imbalance = higher risk
         spread_risk = min(1.0, spread_bps / 100)
-        imbalance_risk = min(1.0, abs(1.0 - depth_imbalance)) if depth_imbalance > 0 else 0.5
+        imbalance_risk = min(1.0, abs(depth_imbalance))
         slippage_risk = round((spread_risk * 0.6 + imbalance_risk * 0.4), 4)
 
         # Market impact estimate: slippage_risk * mid_price * 0.01
         impact_estimate = slippage_risk * l2["mid_price"] * 0.01
 
         # Liquidity score (0-100)
-        liq_score = max(0, min(100,
-            100 - (spread_bps * 3) - (abs(1 - depth_imbalance) * 20)
-        ))
+        liq_score = max(
+            0, min(100, 100 - (spread_bps * 3) - (abs(depth_imbalance) * 20))
+        )
 
         # Classification
         if liq_score >= self.LIQ_EXCELLENT:
@@ -189,7 +204,7 @@ class LiquidityScout(BaseAgent):
 
         await self._persist(payload)
         await self._publish(payload)
-        self._latest_payload = payload
+        self._latest_payloads[symbol] = payload
 
         logger.info(
             f"{self.name}: {symbol} → liq={regime}, score={liq_score:.0f}, "
@@ -244,7 +259,7 @@ class LiquidityScout(BaseAgent):
 
         await self._persist(payload)
         await self._publish(payload)
-        self._latest_payload = payload
+        self._latest_payloads[symbol] = payload
 
         logger.info(
             f"{self.name}: {symbol} → liq={regime} (volume heuristic), score={liq_score:.0f}"
@@ -286,10 +301,14 @@ class LiquidityScout(BaseAgent):
 
     async def _publish_summary(self):
         """Publish a compressed summary for Ideator consumption."""
-        if self._latest_payload is None:
+        if not self._latest_payloads:
             return
-        summary = scout_summary_for_ideator(liquidity=self._latest_payload)
+        worst = min(
+            self._latest_payloads.values(),
+            key=lambda p: p.liquidity_score,
+        )
+        summary = scout_summary_for_ideator(liquidity=worst)
         await self._redis.set("scout:liquidity_summary", summary, ex=300)
 
-    def get_latest(self) -> Optional[LiquidityPayload]:
-        return self._latest_payload
+    def get_latest_payloads(self) -> dict[str, LiquidityPayload]:
+        return dict(self._latest_payloads)

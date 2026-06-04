@@ -89,7 +89,7 @@ class AdvancedPortfolioOptimizer(BaseAgent):
                  CAST(:allocations AS jsonb), CAST(:scores AS jsonb), CAST(:details AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "method": best_method,
                 "n_strategies": len(strategies),
                 "allocations": json.dumps(best_allocation),

@@ -173,7 +173,7 @@ class NewsIntelligenceEngine(BaseAgent):
                  :score, :direction, :tickers, CAST(:details AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "source": signal["source"],
                 "source_sub": signal.get("source_sub", ""),
                 "sentiment": signal["sentiment"],

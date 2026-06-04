@@ -84,7 +84,7 @@ class AgentPerformanceGovernor(BaseAgent):
                  CAST(:scores AS jsonb), CAST(:throttled AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "n_agents": len(agents),
                 "scores": json.dumps(scores),
                 "throttled": json.dumps(list(self._throttled_agents.keys())),

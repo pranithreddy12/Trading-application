@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import defaultdict
+from atlas.core.persistence_integrity import canonical_uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -64,7 +65,7 @@ class AnomalyMonitor:
                     (:id, NOW(), :n_anomalies, CAST(:anomalies AS jsonb), :severity)
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
+                    "id": canonical_uuid(None, field_name="id", context="anomaly_observations"),
                     "n_anomalies": len(anomalies),
                     "anomalies": json.dumps(anomalies),
                     "severity": max(a.get("severity", 0) for a in anomalies),

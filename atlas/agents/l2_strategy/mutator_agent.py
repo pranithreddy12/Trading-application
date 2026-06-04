@@ -32,6 +32,8 @@ from atlas.agents.l2_strategy.viability_score import (
     classify_viability,
 )
 
+from atlas.core.selection import tournament_select
+
 from atlas.core.execution_cost_intelligence import (
     cost_efficiency_delta,
     cost_efficiency_score,
@@ -506,12 +508,26 @@ class MutatorAgent(BaseAgent):
         """Full mutation pipeline: fetch candidates -> filter -> mutate -> save."""
         logger.info("Starting mutation cycle...")
         try:
-            candidates = await self.db_client.get_repair_candidates(limit=10)
-            if not candidates:
+            # Phase 37B: Fetch more candidates and apply tournament selection
+            # to determine which ones get mutated (exploration vs exploitation)
+            all_candidates = await self.db_client.get_repair_candidates(limit=30)
+            if not all_candidates:
                 logger.info("No repair candidates found. Skipping cycle.")
                 return
 
-            logger.info(f"Found {len(candidates)} repair candidates")
+            # Tournament select which candidates to mutate (top 5 from tournaments of 7)
+            selected = tournament_select(
+                all_candidates,
+                tournament_size=7,
+                key=lambda s: float(s.get("sharpe", 0) or 0),
+                n_select=5,
+            )
+            candidates = selected
+
+            logger.info(
+                f"Found {len(all_candidates)} repair candidates, "
+                f"tournament selected {len(candidates)} for mutation"
+            )
 
             # Fetch existing mutant specs for anti-clone check
             # (get recently-created mutated strategies)

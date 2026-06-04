@@ -24,17 +24,21 @@ Features Included:
 import asyncio
 import math
 from datetime import datetime, timezone
+import uuid
+from typing import Optional
 
 import asyncpg
 import pandas as pd
 import numpy as np
 from loguru import logger
+from redis.asyncio import Redis
 
+from atlas.core.agent_base import BaseAgent, AgentLayer
 from atlas.config.settings import get_settings
 
 
-class FeatureAgent:
-    def __init__(self):
+class FeatureAgent(BaseAgent):
+    def __init__(self, redis_client: Optional[Redis] = None):
         self.settings = get_settings()
         self.db_pool = None
         self._stop_event = asyncio.Event()
@@ -45,6 +49,22 @@ class FeatureAgent:
 
         if not self.symbols:
             self.symbols = ["BTCUSDT", "ETHUSDT", "NVDA", "AAPL", "SPY"]
+
+        if redis_client is not None:
+            super().__init__(
+                name="FeatureAgent",
+                agent_type="feature_computation",
+                layer=AgentLayer.L1,
+                redis_client=redis_client,
+            )
+        else:
+            # Standalone mode: initialize minimal attributes for compatibility
+            self.agent_id = str(uuid.uuid4())
+            self.name = "FeatureAgent"
+            self.agent_type = "feature_computation"
+            self.layer = "L1"
+            self.status = "stopped"
+            self._redis = None
 
     # ============================================================
     # DB
@@ -65,6 +85,8 @@ class FeatureAgent:
         if self.db_pool is not None:
             await self.db_pool.close()
             self.db_pool = None
+        if hasattr(super(), "stop"):
+            await super().stop()
 
     # ============================================================
     # Data Fetch
@@ -249,8 +271,7 @@ class FeatureAgent:
         """
 
         async with self.db_pool.acquire() as conn:
-            for rec in records:
-                await conn.execute(query, *rec)
+            await conn.executemany(query, records)
 
     # ============================================================
     # Symbol Processing
@@ -305,6 +326,20 @@ class FeatureAgent:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
                 logger.info("=== Feature cycle complete ===")
+
+                # Refresh features_wide materialized view concurrently
+                try:
+                    async with self.db_pool.acquire() as conn:
+                        await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY features_wide")
+                    logger.info("✓ Materialized view features_wide refreshed concurrently")
+                except Exception as mv_exc:
+                    logger.warning(f"Concurrent refresh failed: {mv_exc} — trying non-concurrent refresh")
+                    try:
+                        async with self.db_pool.acquire() as conn:
+                            await conn.execute("REFRESH MATERIALIZED VIEW features_wide")
+                        logger.info("✓ Materialized view features_wide refreshed")
+                    except Exception as mv_exc_2:
+                        logger.error(f"Failed to refresh materialized view features_wide: {mv_exc_2}")
 
                 # Align roughly to 60s bars, but remain responsive to stop()
                 elapsed = (datetime.now(timezone.utc) - cycle_start).total_seconds()

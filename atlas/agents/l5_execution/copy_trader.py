@@ -17,6 +17,7 @@ Design notes:
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from datetime import datetime
@@ -35,14 +36,28 @@ from atlas.agents.l6_portfolio.copy_capital_allocator import CopyCapitalAllocato
 class BrokerAdapter:
     """Abstract broker adapter. Implement `place_order` in subclasses."""
 
-    async def place_order(self, account_ref: str, symbol: str, side: str, qty: float, price: float | None = None) -> Dict[str, Any]:
+    async def place_order(
+        self,
+        account_ref: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float | None = None,
+    ) -> Dict[str, Any]:
         raise NotImplementedError()
 
 
 class LocalSimulatorAdapter(BrokerAdapter):
     """Simulates order placement locally (for Day-4 demos/tests)."""
 
-    async def place_order(self, account_ref: str, symbol: str, side: str, qty: float, price: float | None = None) -> Dict[str, Any]:
+    async def place_order(
+        self,
+        account_ref: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float | None = None,
+    ) -> Dict[str, Any]:
         # Simulate network latency and return a fake order id and timestamp
         start = time.time()
         await asyncio.sleep(0.05 + min(0.5, max(0.0, 0.01 * (len(symbol)))))
@@ -57,14 +72,26 @@ class LocalSimulatorAdapter(BrokerAdapter):
 
 
 class CopyTraderAgent(BaseAgent):
-    def __init__(self, redis_client: Redis, db_client: TimescaleClient, broker: BrokerAdapter | None = None):
-        super().__init__(name="CopyTraderV1", agent_type="copy_trader", layer="L5", redis_client=redis_client)
+    def __init__(
+        self,
+        redis_client: Redis,
+        db_client: TimescaleClient,
+        broker: BrokerAdapter | None = None,
+    ):
+        super().__init__(
+            name="CopyTraderV1",
+            agent_type="copy_trader",
+            layer="L5",
+            redis_client=redis_client,
+        )
         self.redis = redis_client
         self.db = db_client
         self.messaging = MessagingClient(redis_client)
         self.broker = broker or LocalSimulatorAdapter()
         self.allocator = CopyCapitalAllocator(redis_client, db_client)
+        self._followers: Dict[str, List[Dict[str, Any]]] = {}
         self._processed_set_key = "copy:processed_leader_orders"
+        self._last_poll_key = "copy:last_polled_order_id"
         self._poll_interval = 1.0
         self._background_tasks: set[asyncio.Task] = set()
         self._allocator_started = False
@@ -104,21 +131,25 @@ class CopyTraderAgent(BaseAgent):
         logger.info("CopyTraderV1 starting")
         try:
             # Load follower mappings into memory (refreshed periodically)
-            followers = await self._load_followers()
+            self._followers = await self._load_followers()
 
             # Subscribe to execution fills for leader signals
             async def _callback(msg: dict):
-                await self._handle_leader_fill(msg, followers)
+                await self._handle_leader_fill(msg, self._followers)
 
             # Start Capital Allocator
             await self.allocator.start()
             self._allocator_started = True
 
             # Start a background refresher for followers
-            self._track_background_task(asyncio.create_task(self._refresh_followers_loop()))
+            self._track_background_task(
+                asyncio.create_task(self._refresh_followers_loop())
+            )
 
             # Start polling loop as background task (in addition to subscribe)
-            self._track_background_task(asyncio.create_task(self._polling_loop(followers)))
+            self._track_background_task(
+                asyncio.create_task(self._polling_loop(self._followers))
+            )
 
             # Subscribe to Redis pubsub; if fails, polling will still work
             try:
@@ -157,11 +188,19 @@ class CopyTraderAgent(BaseAgent):
         """Return mapping leader_account_ref -> list of follower dicts."""
         out: Dict[str, List[Dict[str, Any]]] = {}
         async with self.db.engine.connect() as conn:
-            res = await conn.execute(text("SELECT follower_id, leader_id, broker, account_ref, allocation_ratio, max_position_pct, is_active FROM copy_follower_accounts WHERE is_active = TRUE"))
+            res = await conn.execute(
+                text(
+                    "SELECT follower_id, leader_id, broker, account_ref, allocation_ratio, max_position_pct, is_active FROM copy_follower_accounts WHERE is_active = TRUE"
+                )
+            )
             rows = res.fetchall()
             # Map leader_id to account_ref via copy_leader_accounts
             leader_map = {}
-            res2 = await conn.execute(text("SELECT leader_id, account_ref FROM copy_leader_accounts WHERE is_active = TRUE"))
+            res2 = await conn.execute(
+                text(
+                    "SELECT leader_id, account_ref FROM copy_leader_accounts WHERE is_active = TRUE"
+                )
+            )
             for r in res2.fetchall():
                 leader_map[str(r[0])] = r[1]
 
@@ -181,7 +220,9 @@ class CopyTraderAgent(BaseAgent):
         logger.info(f"Loaded follower map for {len(out)} leaders")
         return out
 
-    async def _handle_leader_fill(self, msg: dict, followers_map: Dict[str, List[Dict[str, Any]]]):
+    async def _handle_leader_fill(
+        self, msg: dict, followers_map: Dict[str, List[Dict[str, Any]]]
+    ):
         """Process a leader fill message. Expected keys: order_id, account_ref, symbol, side, qty, price, leader_id (optional)."""
         try:
             leader_order_id = msg.get("order_id") or msg.get("id")
@@ -214,22 +255,25 @@ class CopyTraderAgent(BaseAgent):
             # Fetch market state for realism
             market_state = await self._get_market_state(symbol)
             if market_state.get("is_dangerous", False):
-                logger.warning(f"Dangerous market detected for {symbol}. Rejecting copy flow.")
+                logger.warning(
+                    f"Dangerous market detected for {symbol}. Rejecting copy flow."
+                )
                 return
 
-            # For each follower, compute qty and attempt order with retries
-            for f in followers:
-                # Execution degradation check
+            # Process followers in parallel for reduced latency
+            async def _exec_follower(f):
                 degraded_mode = await self._get_follower_degraded_mode(f["follower_id"])
                 if degraded_mode in ("frozen_follow", "observation_only"):
-                    logger.info(f"Follower {f['follower_id']} is in {degraded_mode}. Skipping order.")
-                    continue
+                    logger.info(
+                        f"Follower {f['follower_id']} is in {degraded_mode}. Skipping order."
+                    )
+                    return
 
-                # Get current exposure
-                current_exposure = await self._get_follower_exposure(f["account_ref"], symbol)
+                current_exposure = await self._get_follower_exposure(
+                    f["account_ref"], symbol
+                )
                 leader_total_exposure = await self._get_leader_exposure(account_ref)
 
-                # Use Phase 21C Capital Intelligence Layer
                 allocation = self.allocator.compute_allocation(
                     follower_id=f["follower_id"],
                     symbol=symbol,
@@ -239,41 +283,68 @@ class CopyTraderAgent(BaseAgent):
                     current_follower_exposure=current_exposure,
                     symbol_volatility=market_state.get("volatility", 0.02),
                     liquidity_score=market_state.get("liquidity_score", 1.0),
-                    overlap_penalty=await self._get_overlap_penalty(f["follower_id"], symbol)
+                    overlap_penalty=await self._get_overlap_penalty(
+                        f["follower_id"], symbol
+                    ),
                 )
 
                 if allocation.allocated_qty == 0:
-                    logger.info(f"Allocation rejected for {f['follower_id']}: {allocation.rejection_reason}")
-                    await self._log_copy_execution(
-                        leader_order_id, None, account_ref, f, symbol, side, qty, 0,
-                        status="skipped", failure_reason=allocation.rejection_reason
+                    logger.info(
+                        f"Allocation rejected for {f['follower_id']}: {allocation.rejection_reason}"
                     )
-                    continue
+                    await self._log_copy_execution(
+                        leader_order_id,
+                        None,
+                        account_ref,
+                        f,
+                        symbol,
+                        side,
+                        qty,
+                        0,
+                        status="skipped",
+                        failure_reason=allocation.rejection_reason,
+                    )
+                    return
 
                 follower_qty = allocation.allocated_qty
-                # Basic follower risk check: ensure not exceeding max_position_pct (best-effort)
                 allowed = True
                 try:
                     allowed = await self._check_follower_risk(f, symbol, follower_qty)
                 except Exception as e:
-                    logger.warning(f"Risk check failed for follower {f['follower_id']}: {e}")
+                    logger.warning(
+                        f"Risk check failed for follower {f['follower_id']}: {e}"
+                    )
 
                 if not allowed:
-                    await self._log_copy_execution(leader_order_id, None, account_ref, f, symbol, side, qty, 0, status="skipped", failure_reason="risk_rejected")
-                    continue
+                    await self._log_copy_execution(
+                        leader_order_id,
+                        None,
+                        account_ref,
+                        f,
+                        symbol,
+                        side,
+                        qty,
+                        0,
+                        status="skipped",
+                        failure_reason="risk_rejected",
+                    )
+                    return
 
-                # Place order with retries
                 attempt = 0
                 placed = None
                 start_ts = time.time()
                 while attempt < 3:
                     try:
-                        resp = await self.broker.place_order(f["account_ref"], symbol, side, follower_qty, price)
+                        resp = await self.broker.place_order(
+                            f["account_ref"], symbol, side, follower_qty, price
+                        )
                         placed = resp
                         break
                     except Exception as e:
                         attempt += 1
-                        logger.warning(f"Failed placing order for follower {f['follower_id']} attempt {attempt}: {e}")
+                        logger.warning(
+                            f"Failed placing order for follower {f['follower_id']} attempt {attempt}: {e}"
+                        )
                         await asyncio.sleep(0.5 * attempt)
 
                 latency_ms = int((time.time() - start_ts) * 1000)
@@ -281,38 +352,108 @@ class CopyTraderAgent(BaseAgent):
                 if placed:
                     follower_order_id = placed.get("order_id")
                     await self._log_copy_execution(
-                        leader_order_id, follower_order_id, account_ref, f, symbol, side, qty, follower_qty,
-                        status=placed.get("status"), failure_reason=None, latency_ms=placed.get("latency_ms", latency_ms),
-                        leader_price=float(price or 0), follower_price=float(price or 0) # Simulated
+                        leader_order_id,
+                        follower_order_id,
+                        account_ref,
+                        f,
+                        symbol,
+                        side,
+                        qty,
+                        follower_qty,
+                        status=placed.get("status"),
+                        failure_reason=None,
+                        latency_ms=placed.get("latency_ms", latency_ms),
+                        leader_price=float(price or 0),
+                        follower_price=float(price or 0),
                     )
                 else:
                     await self._log_copy_execution(
-                        leader_order_id, None, account_ref, f, symbol, side, qty, follower_qty,
-                        status="failed", failure_reason="order_failed", latency_ms=latency_ms,
-                        leader_price=float(price or 0), follower_price=0.0
+                        leader_order_id,
+                        None,
+                        account_ref,
+                        f,
+                        symbol,
+                        side,
+                        qty,
+                        follower_qty,
+                        status="failed",
+                        failure_reason="order_failed",
+                        latency_ms=latency_ms,
+                        leader_price=float(price or 0),
+                        follower_price=0.0,
                     )
+
+            await asyncio.gather(
+                *[_exec_follower(f) for f in followers], return_exceptions=True
+            )
 
         except Exception as e:
             logger.exception(f"Error handling leader fill: {e}")
             # best-effort: do not re-raise
 
     async def _poll_leader_orders(self, followers_map: Dict[str, List[Dict[str, Any]]]):
-        """Poll leader_orders table for new fills (if available). This is a fallback mechanism."""
+        """Poll leader_orders table for new fills, tracking last seen ID to avoid reprocessing."""
+        last_id_raw = await self.redis.get(self._last_poll_key)
+        last_id = int(last_id_raw) if last_id_raw else 0
+
         async with self.db.engine.connect() as conn:
-            # Assumes leader_orders has id, account_ref, symbol, side, qty, created_at
-            res = await conn.execute(text("SELECT id, account_ref, symbol, side, qty, price FROM leader_orders WHERE created_at > NOW() - INTERVAL '1 minute' ORDER BY created_at ASC"))
+            res = await conn.execute(
+                text(
+                    "SELECT id, account_ref, symbol, side, qty, price FROM leader_orders WHERE id > :last_id ORDER BY id ASC"
+                ),
+                {"last_id": last_id},
+            )
             rows = res.fetchall()
+            max_id = last_id
             for r in rows:
-                msg = {"order_id": str(r[0]), "account_ref": r[1], "symbol": r[2], "side": r[3], "qty": float(r[4]), "price": r[5]}
+                row_id = int(r[0])
+                if row_id > max_id:
+                    max_id = row_id
+                msg = {
+                    "order_id": str(r[0]),
+                    "account_ref": r[1],
+                    "symbol": r[2],
+                    "side": r[3],
+                    "qty": float(r[4]),
+                    "price": r[5],
+                }
                 await self._handle_leader_fill(msg, followers_map)
 
+            if max_id > last_id:
+                await self.redis.set(self._last_poll_key, str(max_id))
+
     async def _get_market_state(self, symbol: str) -> dict:
-        """Simulate fetching market state for realism."""
-        return {
-            "volatility": 0.015,
-            "liquidity_score": 0.9,
-            "is_dangerous": False
+        """Fetch real market state from scout intelligence in Redis."""
+        state = {
+            "volatility": 0.02,
+            "liquidity_score": 0.7,
+            "is_dangerous": False,
         }
+        liq_raw = await self.redis.get("scout:liquidity_summary")
+        reg_raw = await self.redis.get("scout:regime_summary")
+
+        if liq_raw:
+            liq_str = liq_raw.decode("utf-8")
+            score_m = re.search(r"score=(\d+)", liq_str)
+            if score_m:
+                state["liquidity_score"] = int(score_m.group(1)) / 100.0
+            regime_m = re.search(r"regime=(\w+)", liq_str)
+            if regime_m and regime_m.group(1) in ("dangerous", "thin"):
+                state["is_dangerous"] = True
+
+        if reg_raw:
+            reg_str = reg_raw.decode("utf-8")
+            vol_m = re.search(r"vol=(\w+)", reg_str)
+            if vol_m:
+                v = vol_m.group(1)
+                if v == "high":
+                    state["volatility"] = 0.05
+                elif v == "low":
+                    state["volatility"] = 0.008
+                else:
+                    state["volatility"] = 0.02
+
+        return state
 
     async def _get_follower_degraded_mode(self, follower_id: str) -> str:
         """Get follower failover mode from Redis if set."""
@@ -326,7 +467,12 @@ class CopyTraderAgent(BaseAgent):
     async def _get_follower_exposure(self, account_ref: str, symbol: str) -> float:
         try:
             async with self.db.engine.connect() as conn:
-                res = await conn.execute(text("SELECT COALESCE(SUM(qty * COALESCE(current_price, avg_entry_price)), 0) FROM positions WHERE account_ref = :acc AND symbol = :sym"), {"acc": account_ref, "sym": symbol})
+                res = await conn.execute(
+                    text(
+                        "SELECT COALESCE(SUM(qty * COALESCE(current_price, avg_entry_price)), 0) FROM positions WHERE account_ref = :acc AND symbol = :sym"
+                    ),
+                    {"acc": account_ref, "sym": symbol},
+                )
                 row = res.fetchone()
                 return float(row[0]) if row and row[0] is not None else 0.0
         except Exception:
@@ -335,26 +481,68 @@ class CopyTraderAgent(BaseAgent):
     async def _get_leader_exposure(self, account_ref: str) -> float:
         try:
             async with self.db.engine.connect() as conn:
-                res = await conn.execute(text("SELECT COALESCE(SUM(qty * COALESCE(current_price, avg_entry_price)), 0) FROM positions WHERE account_ref = :acc"), {"acc": account_ref})
+                res = await conn.execute(
+                    text(
+                        "SELECT COALESCE(SUM(qty * COALESCE(current_price, avg_entry_price)), 0) FROM positions WHERE account_ref = :acc"
+                    ),
+                    {"acc": account_ref},
+                )
                 row = res.fetchone()
                 return float(row[0]) if row and row[0] is not None else 0.0
         except Exception:
-            return 10000.0  # Fallback to avoid div by zero
+            return 10000.0
 
-    async def _check_follower_risk(self, follower: Dict[str, Any], symbol: str, qty: float) -> bool:
-        # Replaced by Capital Intelligence Layer
+    async def _check_follower_risk(
+        self, follower: Dict[str, Any], symbol: str, qty: float
+    ) -> bool:
+        max_pct = follower.get("max_position_pct", 0.1)
+        current_exposure = await self._get_follower_exposure(
+            follower["account_ref"], symbol
+        )
+        equity = await self._get_follower_equity(follower["account_ref"])
+        if equity <= 0:
+            logger.warning(f"Risk: {follower['follower_id']} equity <= 0 — rejecting")
+            return False
+        notional_add = qty * 100.0
+        total_notional = current_exposure + notional_add
+        if total_notional / equity > max_pct:
+            logger.warning(
+                f"Risk: {follower['follower_id']} position {total_notional / equity:.1%} "
+                f"exceeds max {max_pct:.1%} of equity ({equity:.0f})"
+            )
+            return False
         return True
 
+    async def _get_follower_equity(self, account_ref: str) -> float:
+        equity_raw = await self.redis.get(f"copy:equity:{account_ref}")
+        if equity_raw:
+            try:
+                return float(equity_raw.decode("utf-8"))
+            except (ValueError, TypeError):
+                pass
+        return 100000.0
+
     async def _log_copy_execution(
-        self, leader_order_id, follower_order_id, leader_account_ref, follower: Dict[str, Any],
-        symbol, side, leader_qty, follower_qty, status, failure_reason=None, latency_ms: int | None = None,
-        leader_price: float = 0.0, follower_price: float = 0.0
+        self,
+        leader_order_id,
+        follower_order_id,
+        leader_account_ref,
+        follower: Dict[str, Any],
+        symbol,
+        side,
+        leader_qty,
+        follower_qty,
+        status,
+        failure_reason=None,
+        latency_ms: int | None = None,
+        leader_price: float = 0.0,
+        follower_price: float = 0.0,
     ):
-        """Idempotent insert into copy_execution_log and Phase 21H copy_replay_events."""
-        trace_id = uuid.uuid4().hex[:16]
+        """Idempotent insert into copy_execution_log and copy_replay_events."""
+        trace_id = str(uuid.uuid4())
         follower_id = follower.get("follower_id")
-        leader_id = leader_account_ref  # In a real system, resolve account_ref -> leader_id
-        
+        leader_id = leader_account_ref
+
         async with self.db.engine.begin() as conn:
             query = text(
                 """
@@ -380,8 +568,7 @@ class CopyTraderAgent(BaseAgent):
                 "failure_reason": failure_reason,
             }
             res = await conn.execute(query, params)
-            
-            # If a row was inserted, also emit to copy_replay_events for Phase 21H
+
             if res.rowcount > 0:
                 replay_query = text(
                     """
@@ -398,26 +585,38 @@ class CopyTraderAgent(BaseAgent):
                     )
                     """
                 )
-                await conn.execute(replay_query, {
-                    "id": str(uuid.uuid4()),
-                    "trace_id": trace_id,
-                    "leader_id": leader_id,
-                    "follower_id": follower_id,
-                    "leader_order_id": leader_order_id,
-                    "follower_order_id": follower_order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "leader_qty": leader_qty,
-                    "follower_qty": follower_qty,
-                    "leader_price": leader_price,
-                    "follower_price": follower_price,
-                    "latency_ms": latency_ms or 0,
-                    "event_data": json.dumps({"status": status, "failure_reason": failure_reason})
-                })
+                await conn.execute(
+                    replay_query,
+                    {
+                        "id": str(uuid.uuid4()),
+                        "trace_id": trace_id,
+                        "leader_id": leader_id,
+                        "follower_id": follower_id,
+                        "leader_order_id": leader_order_id,
+                        "follower_order_id": follower_order_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "leader_qty": leader_qty,
+                        "follower_qty": follower_qty,
+                        "leader_price": leader_price,
+                        "follower_price": follower_price,
+                        "latency_ms": latency_ms or 0,
+                        "event_data": json.dumps(
+                            {"status": status, "failure_reason": failure_reason}
+                        ),
+                    },
+                )
 
-        # Publish a small event for observability
         try:
-            await self.messaging.publish(Channel.SYSTEM_EVENTS, {"event": "copy_execution", "leader_order_id": leader_order_id, "follower_id": follower_id, "status": status})
+            await self.messaging.publish(
+                Channel.SYSTEM_EVENTS,
+                {
+                    "event": "copy_execution",
+                    "leader_order_id": leader_order_id,
+                    "follower_id": follower_id,
+                    "status": status,
+                },
+            )
         except Exception as e:
             logger.warning(f"Failed to publish copy execution event: {e}")
 

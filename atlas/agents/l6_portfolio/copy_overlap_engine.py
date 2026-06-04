@@ -110,7 +110,7 @@ class CopyOverlapEngine(BaseAgent):
         diversification_penalty = min(0.5, concentration_risk * 0.5)
 
         # 4. Save overlap metrics
-        trace_id = uuid.uuid4().hex[:16]
+        trace_id = self.select_trace_id()
         await self.db._execute_insert(
             """
             INSERT INTO copy_overlap_metrics
@@ -123,7 +123,7 @@ class CopyOverlapEngine(BaseAgent):
                  CAST(:hidden_conc AS jsonb), :n_leaders, CAST(:meta AS jsonb), NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "trace_id": trace_id,
                 "fid": follower_id,
                 "overlap": round(overlap_score, 4),

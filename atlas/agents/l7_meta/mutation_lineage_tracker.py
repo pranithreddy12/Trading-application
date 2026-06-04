@@ -29,6 +29,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
+from atlas.core.persistence_integrity import canonical_uuid
 
 
 class MutationLineageTracker(BaseAgent):
@@ -93,7 +94,7 @@ class MutationLineageTracker(BaseAgent):
         )
 
         tracking = {
-            "id": str(uuid.uuid4()),
+            "id": canonical_uuid(None, field_name="id", context="MutationLineageTracker._lineage_cycle"),
             "tracked_at": datetime.now(timezone.utc),
             "n_mutations_analyzed": len(mutations),
             "n_lineages_identified": len(lineages),
@@ -262,7 +263,7 @@ class MutationLineageTracker(BaseAgent):
             if tree["n_members"] < self.MIN_MEMBERS_FOR_FAMILY:
                 continue
 
-            lineage_id = str(uuid.uuid4())[:12]
+            lineage_id = canonical_uuid(None, field_name="lineage_id", context="MutationLineageTracker._assign_lineage_ids")
             # Extract mutation types in this lineage
             mutation_types = set()
             for m in tree["members"]:

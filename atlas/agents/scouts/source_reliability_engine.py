@@ -156,7 +156,7 @@ class SourceReliabilityEngine(BaseAgent):
                             updated_at = NOW()
                     """,
                     {
-                        "id": uuid.uuid4().hex[:16],
+                        "id": self.select_trace_id(),
                         "source": source_key,
                         "trust": round(new_trust, 4),
                         "acc": round(0.5 + economic_bonus, 4),
@@ -279,7 +279,7 @@ class SourceReliabilityEngine(BaseAgent):
             ON CONFLICT (id) DO NOTHING
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "source": source,
                 "sub": sub,
                 "trust": round(trust, 4),

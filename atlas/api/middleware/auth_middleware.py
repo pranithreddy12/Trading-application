@@ -25,8 +25,8 @@ Usage:
         ...
 """
 
+import asyncio
 from typing import Optional, Dict, Any
-from functools import lru_cache
 import time
 import hashlib
 
@@ -228,22 +228,37 @@ class RateLimitMiddleware:
       2. AuthMiddleware.log_request() is called by response middleware
       3. Redis stores token buckets per API key
     
-    Implementation note: This is a skeleton for Phase A.
-    Full implementation in Phase A-2 when Redis is integrated.
+    Implementation note: this uses an in-memory token bucket fallback so the
+    middleware is functional even when Redis is not wired into the app yet.
     """
     
     def __init__(self, auth_service: AuthService):
         self.auth = auth_service
-        # TODO: Initialize Redis client
-        # self.redis = ...
+        self._lock = asyncio.Lock()
+        self._buckets: Dict[str, list[float]] = {}
+        self._bucket_window_seconds = 60.0
     
     async def check_rate_limit(self, api_key: APIKey) -> bool:
         """Check if API key is within rate limit"""
-        # TODO: Implement token bucket using Redis
-        # For now, always allow
-        return True
+        now = time.time()
+        bucket_key = str(api_key.id)
+        rate_limit = max(1, int(getattr(api_key, "rate_limit_per_min", 30) or 30))
+
+        async with self._lock:
+            bucket = self._buckets.setdefault(bucket_key, [])
+            bucket[:] = [timestamp for timestamp in bucket if now - timestamp < self._bucket_window_seconds]
+            if len(bucket) >= rate_limit:
+                return False
+            bucket.append(now)
+            return True
     
     async def get_remaining(self, api_key: APIKey) -> int:
         """Get remaining requests for this period"""
-        # TODO: Query Redis
-        return api_key.rate_limit_per_min
+        now = time.time()
+        bucket_key = str(api_key.id)
+        rate_limit = max(1, int(getattr(api_key, "rate_limit_per_min", 30) or 30))
+
+        async with self._lock:
+            bucket = self._buckets.get(bucket_key, [])
+            active = [timestamp for timestamp in bucket if now - timestamp < self._bucket_window_seconds]
+            return max(0, rate_limit - len(active))

@@ -297,7 +297,9 @@ class {class_name}:
             if not in_position:
                 if entry_clean.iloc[i]:
                     # Regime gate — skip entry if current regime not in valid set
-                    if self.VALID_REGIMES and df['_regime'].iloc[i] not in self.VALID_REGIMES:
+                    # Allow 'unknown' (NaN/degraded features) to pass through;
+                    # the entry conditions themselves will naturally filter NaN.
+                    if self.VALID_REGIMES and df['_regime'].iloc[i] not in self.VALID_REGIMES and df['_regime'].iloc[i] != 'unknown':
                         continue
                     signals.iloc[i] = 1
                     in_position = True

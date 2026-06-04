@@ -1,0 +1,33 @@
+{
+  "governance_coverage_percent": 0.0,
+  "bypass_rate_percent": 0.0,
+  "repair_dependency_percent": 0.0,
+  "violation_signatures": [
+    {
+      "violation_type": "None",
+      "operation_type": "",
+      "component": "",
+      "table": "",
+      "field": "",
+      "count": 6864
+    }
+  ],
+  "repair_hotspots": {
+    "fields": [],
+    "components": [],
+    "tables": [],
+    "operations": []
+  },
+  "lineage_metrics": {
+    "lineage_integrity_score": 100.0,
+    "orphan_lineage_count": 0,
+    "lineage_repair_frequency": 0,
+    "lineage_continuity_failures": 0
+  },
+  "trace_metrics": {
+    "trace_continuity_score": 100.0,
+    "trace_break_count": 0,
+    "invalid_trace_frequency": 0.0,
+    "trace_repair_dependency": 0
+  }
+}

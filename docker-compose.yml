@@ -11,6 +11,7 @@ services:
       POSTGRES_DB: atlas
     ports:
       - "5433:5432"
+    command: ["postgres", "-c", "max_connections=200", "-c", "superuser_reserved_connections=5"]
     volumes:
       - atlas_pgdata:/var/lib/postgresql/data
       - ./atlas/data/storage/init_timescale.sql:/docker-entrypoint-initdb.d/01_init_timescale.sql

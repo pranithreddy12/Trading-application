@@ -12,12 +12,14 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Any, Optional
 
 from loguru import logger
 from sqlalchemy.sql import text
+
+from atlas.core.persistence_integrity import canonical_uuid
 
 
 class AuditEventType(str, Enum):
@@ -58,7 +60,7 @@ class AuditLedger:
         trace_id: Optional[str] = None,
     ) -> str:
         """Record an immutable audit entry. Returns entry_id."""
-        entry_id = uuid.uuid4().hex[:16]
+        entry_id = canonical_uuid(None, field_name="id", context="AuditLedger.record")
         now = datetime.now(timezone.utc)
 
         # Compute next sequence for this trace_id (per-trace_id incrementing)
@@ -238,9 +240,9 @@ class AuditLedger:
                         COUNT(CASE WHEN severity = 'critical' THEN 1 END) as critical_events,
                         COUNT(CASE WHEN severity = 'warning' THEN 1 END) as warnings
                     FROM audit_ledger
-                    WHERE created_at > NOW() - INTERVAL :delta
+                    WHERE created_at > NOW() - CAST(:delta AS INTERVAL)
                 """),
-                {"delta": f"{hours} hours"},
+                {"delta": timedelta(hours=hours)},
             )
             row = r.fetchone()
             if not row:
@@ -250,10 +252,10 @@ class AuditLedger:
                 text("""
                     SELECT event_type, COUNT(*) as cnt
                     FROM audit_ledger
-                    WHERE created_at > NOW() - INTERVAL :delta
+                    WHERE created_at > NOW() - :delta::INTERVAL
                     GROUP BY event_type ORDER BY cnt DESC
                 """),
-                {"delta": f"{hours} hours"},
+                {"delta": timedelta(hours=hours)},
             )
             by_type = {str(r[0]): r[1] for r in r2.fetchall()}
 

@@ -19,6 +19,7 @@ from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.event_store import EventStore
+from atlas.core.persistence_integrity import canonical_uuid
 
 
 class ReplayEngine(BaseAgent):
@@ -91,7 +92,7 @@ class ReplayEngine(BaseAgent):
                  :integrity_score, :violations, CAST(:details AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "n_aggregates": len(results),
                 "n_events": total_events,
                 "integrity_score": integrity_score,

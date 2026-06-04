@@ -260,9 +260,24 @@ class SelfImprovementAgent(BaseAgent):
         best_asset_class = self._best_group(grouped["asset_class"])
         best_regime = self._best_group(grouped["regime"])
 
+        # Phase 38: Add detailed logging for observability
+        await self._safe_log(
+            level="INFO",
+            message="Derived self-improvement insights",
+            metadata={
+                "type": "insight_derivation_summary",
+                "n_winning_patterns": len(winning_patterns),
+                "n_losing_patterns": len(losing_patterns),
+                "n_cost_traps": len(cost_traps),
+                "best_timeframe": best_timeframe,
+                "best_asset_class": best_asset_class,
+                "best_regime": best_regime,
+            }
+        )
+
         return {
             "analysis_window_days": 7,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat() if datetime.now(timezone.utc) and hasattr(datetime.now(timezone.utc), "isoformat") else str(datetime.now(timezone.utc)) if datetime.now(timezone.utc) else None,
             "winning_patterns": sorted(
                 winning_patterns,
                 key=lambda x: x["avg_score"],

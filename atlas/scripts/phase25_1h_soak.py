@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.normpath(os.path.join(_THIS_DIR, ".."))
@@ -107,8 +107,8 @@ async def sample_db(tc: TimescaleClient, label: str) -> dict:
         ]:
             try:
                 r = await conn.execute(
-                    text(f"SELECT COUNT(*) FROM {table} WHERE {interval_col} > NOW() - INTERVAL :iv"),
-                    {"iv": interval_val},
+                    text(f"SELECT COUNT(*) FROM {table} WHERE {interval_col} > NOW() - CAST(:iv AS INTERVAL)"),
+                    {"iv": timedelta(minutes=5)},
                 )
                 results[f"{table}_5min"] = r.scalar() or 0
             except Exception:

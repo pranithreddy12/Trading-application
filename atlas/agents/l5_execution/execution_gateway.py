@@ -7,6 +7,7 @@ Strategy → OrderTracker → Risk → KillSwitch → BrokerAdapter → Position
 """
 
 import asyncio
+import random
 from typing import Optional
 
 from loguru import logger
@@ -17,12 +18,14 @@ from atlas.core.event_lineage import EventLineageClient
 from atlas.agents.l4_risk.risk_controller import RiskController
 from atlas.agents.l4_risk.kill_switch import KillSwitch
 from atlas.data.storage.timescale_client import TimescaleClient
+from atlas.config.settings import get_settings
 
 from .broker_adapter import BrokerAdapter
 from .order_tracker import OrderTracker, OrderState
 from .position_manager import PositionManager
 from .recovery_manager import RecoveryManager
 from .dead_letter import DeadLetterManager
+from atlas.agents.l3_backtest.regime_selector import RegimeSelector
 
 
 class ExecutionGateway(BaseAgent):
@@ -174,6 +177,9 @@ class ExecutionGateway(BaseAgent):
         except Exception as e:
             logger.warning(f"Lost order recovery failed: {e}")
 
+        # 1d. Start Position Lifecycle Engine (Mark-to-Market)
+        await self.positions.start_monitoring()
+
         # 2. Poll for validated strategies (in a real system this might be pub/sub driven)
         # We will subscribe to pubsub for signals
         pubsub = self._redis.pubsub()
@@ -209,6 +215,7 @@ class ExecutionGateway(BaseAgent):
 
                 await asyncio.sleep(0.1)
         finally:
+            await self.positions.stop_monitoring()
             await pubsub.unsubscribe()
             await self._shutdown_background_tasks()
 
@@ -216,7 +223,14 @@ class ExecutionGateway(BaseAgent):
         from sqlalchemy.sql import text
         async with self.db.engine.connect() as conn:
             result = await conn.execute(
-                text("SELECT id, name, parameters, status FROM strategies WHERE id = :id"),
+                text("""
+                    SELECT s.id, s.name, s.parameters, s.status, b.short_window_score
+                    FROM strategies s
+                    LEFT JOIN backtest_results b ON b.strategy_id = s.id
+                    WHERE s.id::text = :id
+                    ORDER BY b.start_date DESC NULLS LAST
+                    LIMIT 1
+                """),
                 {"id": strategy_id}
             )
             row = result.fetchone()
@@ -235,7 +249,16 @@ class ExecutionGateway(BaseAgent):
                 params = {}
 
         asset_class = params.get("asset_class", "equity").lower()
-        default_symbol = "BTC/USD" if asset_class == "crypto" else "QQQ"
+        
+        # DEMO FIX: Pick random symbol from watchlist if not specified
+        settings = get_settings()
+        if asset_class == "crypto":
+            pairs = settings.crypto_pairs.split(",") if hasattr(settings, "crypto_pairs") else ["BTCUSDT", "ETHUSDT"]
+            default_symbol = random.choice(pairs)
+        else:
+            watchlist = settings.watchlist.split(",") if hasattr(settings, "watchlist") else ["SPY", "QQQ", "AAPL", "NVDA", "MSFT"]
+            default_symbol = random.choice(watchlist)
+
         symbol = params.get("symbol", default_symbol)
         
         side = params.get("side", "buy").lower()
@@ -278,6 +301,13 @@ class ExecutionGateway(BaseAgent):
         side = trade_req["side"]
         qty = trade_req["qty"]
 
+        # 1.5 Duplicate Activation Protection (Priority 3)
+        if await self.positions.active_position_exists(sid, sym):
+            logger.info(f"Duplicate activation protection: Position already exists for {sid} on {sym}. Blocking new order.")
+            await self.tracker.transition(order_key, OrderState.CANCELLED, metadata={"reason": "duplicate_position_protection"})
+            await self.tracker.release_lock(order_key)
+            return False
+
         try:
             halted = await self.db.fetchval(
                 """
@@ -318,7 +348,25 @@ class ExecutionGateway(BaseAgent):
             elif self._scout_liquidity_regime == "thin":
                 qty = qty * 0.5
 
-            # 2c. Kill switch check
+            # 2c. Regime-weighted strategy prioritization
+            try:
+                regime = await self._get_current_regime()
+                selector = RegimeSelector()
+                ranked = await selector.get_regime_weighted_ranking(
+                    self.db, regime, limit=3
+                )
+                ranked_ids = {r["strategy_id"] for r in ranked}
+                if sid in ranked_ids:
+                    logger.info(f"{self.name}: Strategy {sid} matches current regime ({regime})")
+                else:
+                    logger.info(
+                        f"{self.name}: Strategy {sid} NOT in top-3 for regime "
+                        f"({regime}) — executing with standard priority"
+                    )
+            except Exception as e:
+                logger.debug(f"{self.name}: Regime selection skipped: {e}")
+
+            # 2d. Kill switch check
             if await KillSwitch.is_active(self.db):
                 await self.tracker.transition(order_key, OrderState.KILL_SWITCH_BLOCKED)
                 return False
@@ -369,27 +417,35 @@ class ExecutionGateway(BaseAgent):
                     metadata=fill
                 )
                 
+                # 5.5 Resolve Lineage early to pass it to downstream records
+                trace_id = await self.lineage.get_trace_by_strategy(sid)
+                feature_snapshot_id = strategy.get("feature_snapshot_id")
+
                 # 6. Open position
                 await self.positions.open_position(
                     strategy_id=sid, symbol=sym, side=side,
                     qty=filled_qty, avg_price=fill_price,
-                    broker_name=self.broker.broker_name
+                    broker_name=self.broker.broker_name,
+                    trace_id=trace_id,
+                    feature_snapshot_id=feature_snapshot_id 
                 )
 
                 # 7. Write to paper_trades for historical backwards compat
+                # Opening trade: Realized PnL is always 0.0
                 await self.db.save_paper_trade({
                     "strategy_id": sid,
                     "symbol": sym,
                     "side": side,
                     "quantity": filled_qty,
-                    "price": fill_price,  # The expected or requested price could go here
+                    "price": fill_price,
                     "fill_price": fill_price,
                     "status": "filled",
                     "pnl": 0.0,
+                    "trace_id": trace_id,
+                    "feature_snapshot_id": feature_snapshot_id
                 })
 
-                # 8. Record Lineage
-                trace_id = await self.lineage.get_trace_by_strategy(sid)
+                # 8. Record Lineage Event
                 if trace_id:
                     await self.lineage.create_event(
                         trace_id=trace_id,
@@ -436,6 +492,59 @@ class ExecutionGateway(BaseAgent):
         finally:
             self._active_lease_order_keys.discard(order_key)
             await self.tracker.release_lock(order_key)
+
+    async def _get_current_regime(self) -> str:
+        """
+        Determine the current market regime from feature data.
+        Falls back to 'ranging' if data is unavailable.
+        """
+        try:
+            from sqlalchemy import text
+            async with self.db.engine.connect() as conn:
+                r = await conn.execute(text("""
+                    SELECT
+                        symbol,
+                        value AS rsi_14
+                    FROM features
+                    WHERE feature_name = 'rsi_14'
+                    ORDER BY time DESC
+                    LIMIT 1
+                """))
+                row = r.fetchone()
+                if row is not None:
+                    rsi = float(row.rsi_14)
+                    if rsi < 35:
+                        return "oversold"
+                    elif rsi > 65:
+                        return "overbought"
+                # Try volatility_regime for finer-grained detection
+                r2 = await conn.execute(text("""
+                    SELECT value AS vol_regime
+                    FROM features
+                    WHERE feature_name = 'volatility_regime'
+                    ORDER BY time DESC
+                    LIMIT 1
+                """))
+                vol_row = r2.fetchone()
+                r3 = await conn.execute(text("""
+                    SELECT value AS ema_spread
+                    FROM features
+                    WHERE feature_name = 'ema_spread_pct'
+                    ORDER BY time DESC
+                    LIMIT 1
+                """))
+                ema_row = r3.fetchone()
+
+                vol = float(vol_row.vol_regime) if vol_row is not None else 1.0
+                ema = float(ema_row.ema_spread) if ema_row is not None else 0.0
+
+                if vol > 1.4:
+                    return "high_volatility"
+                elif abs(ema) > 0.003:
+                    return "trending"
+        except Exception as e:
+            logger.debug(f"{self.name}: Regime detection failed: {e}")
+        return "ranging"
 
     async def _refresh_scout_intelligence(self):
         """Refresh scout intelligence cache for dynamic adaptation."""

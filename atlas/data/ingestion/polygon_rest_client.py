@@ -78,6 +78,7 @@ class PolygonRestClient:
         poll_trades: float = 10.0,
         poll_snapshot: float = 10.0,
         calls_per_minute: int = 5,
+        fallback_fetch: Optional[Callable] = None,
     ):
         self.api_key = api_key
         self.symbols = symbols
@@ -98,6 +99,9 @@ class PolygonRestClient:
         # Dedup watermarks
         self._last_bar_time: Dict[str, int] = {}
         self._last_trade_id: Dict[str, int] = {}
+
+        # Optional async callable fallback_fetch(symbol, start_dt, end_dt) -> list[dict]
+        self._fallback_fetch = fallback_fetch
 
         # Metrics
         self.bars_written: int = 0
@@ -151,13 +155,27 @@ class PolygonRestClient:
         while not self._stop.is_set():
             try:
                 now = datetime.now(timezone.utc)
+                start_dt = now - timedelta(days=2)
                 data = await self._get(
                     f"/v2/aggs/ticker/{symbol}/range/1/minute/"
-                    f"{(now - timedelta(days=2)).strftime('%Y-%m-%d')}/"
+                    f"{start_dt.strftime('%Y-%m-%d')}/"
                     f"{now.strftime('%Y-%m-%d')}",
                     {"adjusted": "true", "sort": "asc", "limit": 5000},
                 )
+
+                # Polygon can return top-level status 'DELAYED' for free-tier keys
                 results = data.get("results", [])
+                status = data.get("status")
+
+                # If Polygon is delayed or returned no results, attempt fallback if provided
+                if (status == "DELAYED" or not results) and self._fallback_fetch:
+                    try:
+                        logger.info(f"[bars] {symbol} — Polygon delayed/empty, invoking fallback fetch")
+                        fb = await self._fallback_fetch(symbol, start_dt, now)
+                        if fb:
+                            results = fb
+                    except Exception as exc:
+                        logger.warning(f"[bars] fallback fetch error for {symbol}: {exc}")
                 new_count = 0
                 last_ts = self._last_bar_time.get(symbol, 0)
                 for bar in results:
@@ -180,6 +198,7 @@ class PolygonRestClient:
                         self.bars_written += 1
 
                 if results:
+                    # Ensure timestamp field accessibility regardless of source
                     self._last_bar_time[symbol] = max(int(r["t"]) for r in results)
 
                 if new_count:

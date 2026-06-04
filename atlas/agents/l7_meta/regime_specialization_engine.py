@@ -28,6 +28,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
+from atlas.core.persistence_integrity import canonical_uuid
 
 
 # Regime archetypes
@@ -94,7 +95,7 @@ class RegimeSpecializationEngine(BaseAgent):
 
         # Persist
         tracking = {
-            "id": str(uuid.uuid4()),
+            "id": canonical_uuid(None, field_name="id", context="RegimeSpecializationEngine._profiling_cycle"),
             "profiled_at": datetime.now(timezone.utc),
             "n_organisms_profiled": len(profiles),
             "regime_profiles": profiles,
@@ -108,7 +109,7 @@ class RegimeSpecializationEngine(BaseAgent):
 
         logger.info(
             f"{self.name}: Profiled {len(profiles)} organisms across "
-            f"{len([k for k, v in ecosystem.items() if v > 0.2])} regime dimensions"
+            f"{len([k for k, v in ecosystem.items() if isinstance(v, (int, float)) and v > 0.2])} regime dimensions"
         )
 
     async def _fetch_organisms(self) -> list[dict]:
@@ -326,9 +327,9 @@ class RegimeSpecializationEngine(BaseAgent):
                          :liq_sens, :alignment,
                          :primary_affinity, :confidence,
                          :archetype, :metadata)
-                    ON CONFLICT (strategy_id, profiled_at) DO NOTHING
+                    ON CONFLICT DO NOTHING
                 """, {
-                    "id": str(uuid.uuid4())[:16],
+                    "id": canonical_uuid(None, field_name="id", context="RegimeSpecializationEngine._persist_profiles"),
                     "strategy_id": sid,
                     "profiled_at": tracking["profiled_at"],
                     "bull": profile["bull_survivability"],

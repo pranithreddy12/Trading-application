@@ -89,7 +89,8 @@ class ValidationHarness:
         logger.info("ValidationHarness initialized (DB connected)")
 
     async def run_all(self) -> ValidationOutput:
-        self.trace_id = uuid.uuid4().hex[:12]
+        from atlas.core.persistence_integrity import canonical_uuid
+        self.trace_id = canonical_uuid(None, field_name="trace_id", context="validation_harness")
         output = ValidationOutput(
             timestamp=datetime.now(timezone.utc).isoformat(),
             environment=os.environ.get("ATLAS_ENV", "development"),

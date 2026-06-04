@@ -40,13 +40,20 @@ class MutationPolicyEngine(BaseAgent):
 
     # Default mutation type weights
     DEFAULT_WEIGHTS = {
-        "parameter_shift": 0.20,
+        # Bias toward proven survivors (phase request)
+        "repair::threshold_adjustment": 3.0,
+        "simplification::condition_removal": 2.5,
+        "repair::rsi_threshold_shift": 2.0,
+        "refinement::cooldown_adjustment": 0.5,
+        "refinement::hold_time_adjustment": 0.3,
+        # Keep some breadth for other mutation families (normalized later)
+        "parameter_shift": 0.2,
         "indicator_replace": 0.15,
         "threshold_tighten": 0.15,
         "threshold_loosen": 0.15,
-        "combine_with": 0.10,
-        "regime_adapt": 0.10,
-        "risk_adjust": 0.10,
+        "combine_with": 0.1,
+        "regime_adapt": 0.1,
+        "risk_adjust": 0.1,
         "exit_logic": 0.05,
     }
 
@@ -87,7 +94,29 @@ class MutationPolicyEngine(BaseAgent):
     async def _learn_policy(self):
         """Analyze mutation outcomes and adjust weights. DETERMINISTIC — canonical."""
         mutation_outcomes = await self._load_mutation_outcomes()
+        # If there are no observations, persist current default weights so DB reflects operator overrides.
         if not mutation_outcomes:
+            try:
+                await self.db._execute_insert(
+                    """
+                    INSERT INTO mutation_policy_state
+                        (id, learned_at, mutation_weights, per_type_success_rates,
+                         n_observations, details)
+                    VALUES
+                        (:id, NOW(), CAST(:weights AS jsonb), CAST(:rates AS jsonb),
+                         :n_obs, CAST(:details AS jsonb))
+                    """,
+                    {
+                        "id": self.select_trace_id(),
+                        "weights": json.dumps(self._weights),
+                        "rates": json.dumps({}),
+                        "n_obs": 0,
+                        "details": json.dumps({"note": "default_weights_persisted_no_observations"}),
+                    },
+                )
+                logger.info(f"{self.name}: persisted default weights (no observations)")
+            except Exception as e:
+                logger.warning(f"{self.name}: failed to persist default weights: {e}")
             return
 
         # Group by mutation type
@@ -157,7 +186,7 @@ class MutationPolicyEngine(BaseAgent):
                  :n_obs, CAST(:details AS jsonb))
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "weights": json.dumps(self._weights),
                 "rates": json.dumps(success_rates),
                 "n_obs": len(mutation_outcomes),
@@ -315,7 +344,7 @@ class MutationPolicyEngine(BaseAgent):
                 (:id, :mtype, :parent, :child, :score, NOW())
             """,
             {
-                "id": uuid.uuid4().hex[:16],
+                "id": self.select_trace_id(),
                 "mtype": mutation_type,
                 "parent": parent_strategy_id,
                 "child": child_strategy_id,
@@ -425,8 +454,8 @@ Output JSON:
                      CAST(:leaderboard AS jsonb), TRUE, CAST(:metadata AS jsonb), NOW())
                 """,
                 {
-                    "id": uuid.uuid4().hex[:16],
-                    "trace_id": uuid.uuid4().hex[:16],
+                    "id": self.select_trace_id(),
+                    "trace_id": self.select_trace_id(),
                     "confidence": 0.6 if advisory_text else 0.3,
                     "advisory": advisory_text,
                     "ee_balance": ee_balance,
