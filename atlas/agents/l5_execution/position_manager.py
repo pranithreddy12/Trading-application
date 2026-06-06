@@ -205,6 +205,8 @@ class PositionManager:
             res = await conn.execute(text(query), {"sid": strategy_id, "sym": symbol})
             return res.fetchone() is not None
 
+    MAX_NOTIONAL_PER_POS: float = 5_000.0  # PositionSizer guard — reject if exceeded
+
     async def open_position(
         self,
         strategy_id: str,
@@ -217,6 +219,15 @@ class PositionManager:
         feature_snapshot_id=None,
     ) -> float:
         """Record a new or updated open position, handling buys and sells correctly. Returns realized PnL."""
+        # Database-level notional guard — final safety gate before any position enters the system
+        notional = float(qty) * float(avg_price)
+        if notional > self.MAX_NOTIONAL_PER_POS:
+            raise ValueError(
+                f"Position notional ${notional:,.0f} for {symbol} "
+                f"exceeds MAX_NOTIONAL_PER_POS ${self.MAX_NOTIONAL_PER_POS:,.0f}. "
+                f"PositionSizer must be called before open_position."
+            )
+
         check_query = "SELECT id, side, qty, avg_price, trace_id, feature_snapshot_id FROM positions WHERE strategy_id = :strategy_id AND symbol = :symbol"
         realized_pnl = 0.0
         async with self.db.engine.begin() as conn:

@@ -27,7 +27,11 @@ from .order_tracker import OrderTracker, OrderState
 from .position_manager import PositionManager
 from .recovery_manager import RecoveryManager
 from .dead_letter import DeadLetterManager
+from .position_sizer import PositionSizer
 from atlas.agents.l3_backtest.regime_selector import RegimeSelector
+
+# Module-level singleton — shared across all gateway instances
+_position_sizer = PositionSizer()
 
 
 class ExecutionGateway(BaseAgent):
@@ -211,7 +215,7 @@ class ExecutionGateway(BaseAgent):
                     await asyncio.sleep(1)
                     continue
 
-                logger.error(
+                logger.debug(
                     f"GATEWAY_LOOP_ITERATION | status={self.status} recovery={self._recovery_complete}"
                 )
 
@@ -219,7 +223,7 @@ class ExecutionGateway(BaseAgent):
                     ignore_subscribe_messages=True, timeout=1.0
                 )
                 if message:
-                    logger.error(
+                    logger.debug(
                         f"SIGNAL_RECEIVED_RAW | type={message.get('type')} "
                         f"channel={message.get('channel')} "
                         f"data_type={type(message.get('data')).__name__} "
@@ -231,7 +235,7 @@ class ExecutionGateway(BaseAgent):
                         import json
 
                         data = json.loads(message["data"])
-                        logger.error(
+                        logger.debug(
                             f"SIGNAL_DECODED | type={data.get('type')} "
                             f"strategy_id={data.get('strategy_id')} "
                             f"symbol={data.get('symbol')} "
@@ -258,11 +262,11 @@ class ExecutionGateway(BaseAgent):
                                         "feature_snapshot_id"
                                     )
 
-                                    logger.error(
+                                    logger.debug(
                                         f"SIGNAL_EXECUTE_START | strategy_id={strategy_id} "
-                                        f"symbol={strategy.get('symbol')} "
-                                        f"side={strategy.get('side')} "
-                                        f"qty={strategy.get('qty')}"
+                                        f"symbol={data.get('symbol')} "
+                                        f"side={data.get('side')} "
+                                        f"qty={data.get('qty')}"
                                     )
                                     logger.info(
                                         f"{self.name}: Triggering execution for {strategy_id} on {strategy.get('symbol')} ({strategy.get('side')})"
@@ -346,16 +350,23 @@ class ExecutionGateway(BaseAgent):
                 )
                 symbol = random.choice(watchlist)
 
-        # Default fallback sizing if not specified
-        if qty is None:
-            qty = 10.0 if asset_class == "equity" else 0.05
+        if qty is not None:
+            logger.warning(
+                f"PositionSizer: ignoring signal-specified qty={qty} "
+                f"for {symbol} — signals must not specify quantity"
+            )
+
+        estimated_price = params.get("estimated_price") or params.get("price") or 0.0
+        stop_pct = params.get("stop_loss_pct") or None
 
         return {
             "strategy_id": str(strategy.get("id")),
             "symbol": symbol,
             "side": side.lower(),
-            "qty": float(qty),
+            "qty": 0.0,  # Will be sized asynchronously in execute()
             "price": 0.0,  # Filled at market for now
+            "estimated_price": float(estimated_price) if estimated_price else 0.0,
+            "stop_pct": float(stop_pct) if stop_pct else None,
         }
 
     async def execute(self, strategy: dict) -> bool:
@@ -369,7 +380,48 @@ class ExecutionGateway(BaseAgent):
         sid = trade_req["strategy_id"]
         sym = trade_req["symbol"]
         side = trade_req["side"]
-        qty = trade_req["qty"]
+
+        # 0. Risk-normalized position sizing (Phase 14 Fix)
+        # We must obtain a real market price to size the position correctly.
+        exec_price = trade_req.get("estimated_price", 0.0)
+        stop_pct = trade_req.get("stop_pct")
+
+        if exec_price <= 0:
+            try:
+                exec_price = float(await self.broker.get_current_price(sym) or 0.0)
+            except Exception as e:
+                logger.error(f"Failed to fetch live price for {sym}: {e}")
+                exec_price = 0.0
+
+        if exec_price <= 0:
+            logger.error(
+                f"Cannot execute {sym} - unable to determine market price for PositionSizer."
+            )
+            return False
+
+        qty = _position_sizer.calculate_qty(
+            symbol=sym, price=exec_price, stop_loss_pct=stop_pct
+        )
+        if qty <= 0:
+            logger.error(
+                f"PositionSizer returned qty 0 for {sym} at ${exec_price:,.2f}"
+            )
+            return False
+
+        notional = qty * exec_price
+        risk_usd = notional * (stop_pct if stop_pct else _position_sizer.STOP_LOSS_PCT)
+
+        logger.warning(
+            f"POSITION_SIZER_RESULT "
+            f"symbol={sym} "
+            f"qty={qty} "
+            f"price={exec_price} "
+            f"notional=${notional:,.2f} "
+            f"risk_usd=${risk_usd:,.2f}"
+        )
+
+        trade_req["qty"] = qty
+        trade_req["price"] = exec_price  # Store reference price
 
         # Use a unique key that includes side to avoid collision between entry and exit
         order_key = f"order:{sid}:{sym}:{side}:{uuid.uuid4().hex[:8]}"
@@ -451,14 +503,17 @@ class ExecutionGateway(BaseAgent):
             await self._refresh_scout_intelligence()
 
             # Phase 30: Relaxed from hard-reject to soft sizing reduction for dangerous liquidity
-            if self._scout_liquidity_regime == "dangerous":
-                # Reduce size instead of blocking entirely
-                qty = qty * 0.25
+            # Use canonical _scout_adjusted_qty() — Phase 30 values: thin=75%, dangerous=25%
+            adjusted_qty = self._scout_adjusted_qty(qty)
+            if adjusted_qty != qty:
+                regime_tag = self._scout_liquidity_regime or self._scout_execution_regime
                 logger.warning(
-                    f"Execution permitted with 75% size reduction: dangerous liquidity regime"
+                    f"LIQUIDITY_SCOUT_ADJUSTMENT symbol={sym} "
+                    f"regime={regime_tag} "
+                    f"pre_qty={qty:.6g} post_qty={adjusted_qty:.6g} "
+                    f"reduction={100*(1 - adjusted_qty/qty):.0f}%"
                 )
-            elif self._scout_liquidity_regime == "thin":
-                qty = qty * 0.5
+                qty = adjusted_qty
 
             # 2c. Regime-weighted strategy prioritization
             try:
@@ -485,7 +540,51 @@ class ExecutionGateway(BaseAgent):
                 await self.tracker.transition(order_key, OrderState.KILL_SWITCH_BLOCKED)
                 return False
 
-            # 3. Risk approval
+            # 3a. Notional cap validation (PositionSizer guard)
+            # Fetch existing symbol exposure from open positions before approving.
+            existing_notional = 0.0
+            try:
+                async with self.db.engine.connect() as _nc:
+                    _nr = await _nc.execute(
+                        text(
+                            "SELECT COALESCE(SUM(qty * avg_price), 0) "
+                            "FROM positions WHERE symbol = :sym"
+                        ),
+                        {"sym": sym},
+                    )
+                    existing_notional = float(_nr.scalar() or 0.0)
+            except Exception as _ne:
+                logger.debug(
+                    f"{self.name}: Could not fetch existing notional for {sym}: {_ne}"
+                )
+
+            # Get current price from broker for validation
+            _price_for_validation = 0.0
+            try:
+                _ticker = await self.broker.get_current_price(sym)
+                _price_for_validation = float(_ticker or 0.0)
+            except Exception:
+                pass
+
+            if _price_for_validation > 0:
+                _approved, _reason = _position_sizer.validate_notional(
+                    symbol=sym,
+                    qty=qty,
+                    price=_price_for_validation,
+                    existing_notional=existing_notional,
+                )
+                if not _approved:
+                    logger.warning(
+                        f"{self.name}: Order rejected by PositionSizer for {sym}: {_reason}"
+                    )
+                    await self.tracker.transition(
+                        order_key,
+                        OrderState.RISK_REJECTED,
+                        metadata={"reason": f"position_sizer: {_reason}"},
+                    )
+                    return False
+
+            # 3b. Risk controller approval
             if not await self.risk.approve_trade(trade_req):
                 await self.tracker.transition(
                     order_key,
@@ -542,6 +641,14 @@ class ExecutionGateway(BaseAgent):
                 trace_id = await self.lineage.get_trace_by_strategy(sid)
                 feature_snapshot_id = strategy.get("feature_snapshot_id")
 
+                logger.warning(
+                    f"FINAL_ORDER_QTY "
+                    f"symbol={sym} "
+                    f"qty={filled_qty} "
+                    f"price={fill_price} "
+                    f"notional={filled_qty * fill_price:.2f}"
+                )
+
                 # 6. Open position
                 logger.debug("before open_position()")
                 realized_pnl = await self.positions.open_position(
@@ -558,7 +665,7 @@ class ExecutionGateway(BaseAgent):
 
                 # 7. Write to paper_trades for historical backwards compat
                 # Realized PnL is non-zero only for closing trades
-                logger.error(
+                logger.info(
                     f"PERSISTING TRADE | "
                     f"strategy={sid} "
                     f"symbol={sym} "
@@ -584,7 +691,7 @@ class ExecutionGateway(BaseAgent):
                     }
                 )
 
-                logger.error(f"PAPER_TRADE INSERT COMPLETE | sid={sid}")
+                logger.info(f"PAPER_TRADE INSERT COMPLETE | sid={sid}")
 
                 # 8. Record Lineage Event
                 if trace_id:

@@ -8,18 +8,25 @@ from sqlalchemy.sql import text
 from atlas.core.agent_base import BaseAgent
 from atlas.data.storage.timescale_client import TimescaleClient
 
+
 class PaperStrategyRunner(BaseAgent):
     """
     PaperStrategyRunner — Runs promoted strategies against live features.
-    
+
     Subscribes to feature updates, evaluates strategies, and emits trade signals.
     """
+
     name = "PaperStrategyRunner"
     agent_type = "strategy_runner"
     layer = "L3"
 
     def __init__(self, redis_client: Redis, db_client: TimescaleClient):
-        super().__init__(name=self.name, agent_type=self.agent_type, layer=self.layer, redis_client=redis_client)
+        super().__init__(
+            name=self.name,
+            agent_type=self.agent_type,
+            layer=self.layer,
+            redis_client=redis_client,
+        )
         self.db = db_client
 
     async def run(self):
@@ -29,7 +36,9 @@ class PaperStrategyRunner(BaseAgent):
 
         try:
             while self.status == "running":
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
                 if message and message["type"] == "message":
                     try:
                         data = json.loads(message["data"])
@@ -70,10 +79,14 @@ class PaperStrategyRunner(BaseAgent):
                 logger.debug(f"{self.name}: No data found for {symbol}")
                 return
             if len(df) < 20:
-                logger.debug(f"{self.name}: Insufficient data for {symbol} ({len(df)} bars)")
+                logger.debug(
+                    f"{self.name}: Insufficient data for {symbol} ({len(df)} bars)"
+                )
                 return
 
-            logger.debug(f"{self.name}: Evaluating {len(strategies)} strategies for {symbol} with {len(df)} bars")
+            logger.debug(
+                f"{self.name}: Evaluating {len(strategies)} strategies for {symbol} with {len(df)} bars"
+            )
             for strat in strategies:
                 sid, code, params, status = strat
                 try:
@@ -81,17 +94,21 @@ class PaperStrategyRunner(BaseAgent):
                     if signal in (1, -1):
                         side = "buy" if signal == 1 else "sell"
                         logger.info(f"PAPER SIGNAL: {sid} | {symbol} | {side}")
-                        
+
                         # Publish trade signal for ExecutionGateway
-                        await self._redis.publish("strategy_signals", json.dumps({
-                            "type": "signal",
-                            "strategy_id": str(sid),
-                            "symbol": symbol,
-                            "side": side,
-                            "qty": 10.0,
-                            "mode": status,
-                            "feature_snapshot_id": None
-                        }))
+                        await self._redis.publish(
+                            "strategy_signals",
+                            json.dumps(
+                                {
+                                    "type": "signal",
+                                    "strategy_id": str(sid),
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "mode": status,
+                                    "feature_snapshot_id": None,
+                                }
+                            ),
+                        )
                 except Exception as e:
                     logger.debug(f"Eval failed for {sid}: {e}")
 
@@ -106,15 +123,17 @@ class PaperStrategyRunner(BaseAgent):
                 ORDER BY time DESC
                 LIMIT 100
             """),
-            {"sym": symbol}
+            {"sym": symbol},
         )
         rows = res.fetchall()
         if not rows:
             return pd.DataFrame()
-        
-        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+
+        df = pd.DataFrame(
+            rows, columns=["time", "open", "high", "low", "close", "volume"]
+        )
         df = df.sort_values("time")
-        
+
         # 2. Get wide features
         feat_res = await conn.execute(
             text("""
@@ -123,7 +142,7 @@ class PaperStrategyRunner(BaseAgent):
                 ORDER BY time DESC
                 LIMIT 100
             """),
-            {"sym": symbol}
+            {"sym": symbol},
         )
         feat_rows = feat_res.fetchall()
         if feat_rows:
@@ -133,7 +152,7 @@ class PaperStrategyRunner(BaseAgent):
                 feat_df = feat_df.drop(columns=["symbol"])
             df = df.merge(feat_df, on="time", how="left")
             df = df.sort_values("time").ffill().bfill()
-        
+
         return df
 
     async def _run_strategy_code(self, code: str, df: pd.DataFrame) -> int:
@@ -142,36 +161,39 @@ class PaperStrategyRunner(BaseAgent):
             # Prepare namespace
             namespace = {"pd": pd, "np": __import__("numpy")}
             exec(code, namespace)
-            
+
             # Find Strategy class
             strat_class = None
             for item in namespace.values():
                 if isinstance(item, type) and hasattr(item, "generate_signals"):
                     strat_class = item
                     break
-            
+
             if not strat_class:
                 return 0
-                
+
             instance = strat_class()
             # FUTURE LEAKAGE GUARD: deep copy without time column
             _bt_df = df.drop(columns=["time"], errors="ignore").copy()
             signals = instance.generate_signals(_bt_df)
-            
+
             if isinstance(signals, pd.Series) and not signals.empty:
                 last_val = signals.iloc[-1]
-                if last_val >= 1: return 1
-                if last_val <= -1: return -1
-                
+                if last_val >= 1:
+                    return 1
+                if last_val <= -1:
+                    return -1
+
             return 0
         except Exception as e:
             raise Exception(f"Code exec error: {e}")
+
 
 if __name__ == "__main__":
     # For standalone testing
     import sys
     from atlas.config.settings import get_settings
-    
+
     async def main():
         settings = get_settings()
         db = TimescaleClient(settings.database_url)
@@ -179,5 +201,5 @@ if __name__ == "__main__":
         runner = PaperStrategyRunner(redis, db)
         await runner.start()
         await asyncio.Event().wait()
-        
+
     asyncio.run(main())
