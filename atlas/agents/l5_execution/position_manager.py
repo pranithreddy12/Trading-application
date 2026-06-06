@@ -154,6 +154,16 @@ class PositionManager:
     ):
         """Simulate closing a position and recording the realized trade."""
         exit_side = "sell" if side == "buy" else "buy"
+        logger.info(
+            f"EXIT_EXECUTED "
+            f"symbol={symbol} "
+            f"reason={reason} "
+            f"pnl={realized_pnl:.2f} "
+            f"price={exit_price} "
+            f"qty={qty} "
+            f"side={exit_side} "
+            f"strategy={strategy_id[:8]}"
+        )
         import uuid
 
         # Insert exit trade into paper_trades
