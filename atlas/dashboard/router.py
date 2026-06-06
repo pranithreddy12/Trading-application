@@ -680,7 +680,11 @@ async def dashboard_portfolio():
                 # Clamp exposure to 0%%-500%% for dashboard sanity
                 clamped_exposure = max(0.0, min(5.0, raw_exposure))
                 if raw_exposure != clamped_exposure:
-                    import logging; logging.warning(f"Exposure clamped: {raw_exposure:.2f} -> {clamped_exposure:.2f} (source data out of bounds)")
+                    import logging
+
+                    logging.warning(
+                        f"Exposure clamped: {raw_exposure:.2f} -> {clamped_exposure:.2f} (source data out of bounds)"
+                    )
                 ca = {
                     "computed_at": row[0].isoformat()
                     if hasattr(row[0], "isoformat")
@@ -910,7 +914,9 @@ async def dashboard_scouts():
 
             total_all_time = 0
             try:
-                r = await conn.execute(text("SELECT COUNT(*) FROM external_scout_memory"))
+                r = await conn.execute(
+                    text("SELECT COUNT(*) FROM external_scout_memory")
+                )
                 total_all_time = r.scalar() or 0
             except Exception:
                 pass
@@ -924,7 +930,8 @@ async def dashboard_scouts():
             "external": {
                 "total_signals": sum(external_by_source.values()),
                 "by_source": external_by_source,
-                "recent": external_signals, "total_all_time": total_all_time,
+                "recent": external_signals,
+                "total_all_time": total_all_time,
             },
         }
     except Exception as exc:
@@ -1039,6 +1046,59 @@ async def dashboard_validation():
         }
     except Exception as exc:
         logger.error(f"Dashboard validation error: {exc}")
+        return {"error": str(exc)}
+
+
+@router.get("/dashboard/api/paper-performance")
+async def dashboard_paper_performance(
+    sort_by: str = Query("monthly_return_pct"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """Phase 31: Paper trading strategy performance metrics."""
+    try:
+        db = await _get_db()
+        from atlas.analytics.paper_performance import PaperPerformanceMetrics
+
+        perf = PaperPerformanceMetrics(db)
+
+        # Compute fresh metrics for all strategies with trades
+        await perf.compute_all()
+
+        # Return ranked results
+        ranked = await perf.get_ranked(sort_by=sort_by, limit=limit)
+
+        # Summary stats
+        summary = {}
+        async with db.engine.connect() as conn:
+            r = await conn.execute(text("SELECT COUNT(*) FROM strategy_performance"))
+            summary["strategies_with_metrics"] = r.scalar() or 0
+
+            r = await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM strategy_performance WHERE is_qualified = TRUE"
+                )
+            )
+            summary["qualified"] = r.scalar() or 0
+
+            r = await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM strategy_performance WHERE monthly_return_pct >= 20"
+                )
+            )
+            summary["above_20pct_monthly"] = r.scalar() or 0
+
+            r = await conn.execute(
+                text("SELECT COALESCE(SUM(realized_pnl), 0) FROM strategy_performance")
+            )
+            summary["total_realized_pnl"] = float(r.scalar() or 0.0)
+
+        return {
+            "summary": summary,
+            "ranked": ranked,
+            "sort_by": sort_by,
+        }
+    except Exception as exc:
+        logger.error(f"Dashboard paper performance error: {exc}")
         return {"error": str(exc)}
 
 
@@ -1862,21 +1922,22 @@ async def dashboard_agents_list(limit: int = Query(default=50, ge=1, le=200)):
         return {"error": str(exc)}
 
 
-
-
 @router.get("/dashboard/api/agents/live")
 async def dashboard_agents_live():
     """Read live agent statuses from Redis heartbeats."""
     try:
         from redis.asyncio import Redis
         from atlas.config.settings import get_settings as get_stg
+
         stg = get_stg()
         redis_client = Redis.from_url(stg.redis_url)
         try:
             cursor = 0
             live_agents = []
             while True:
-                cursor, keys = await redis_client.scan(cursor=cursor, match="agent:*", count=100)
+                cursor, keys = await redis_client.scan(
+                    cursor=cursor, match="agent:*", count=100
+                )
                 for key in keys:
                     data = await redis_client.hgetall(key)
                     if data:
@@ -1887,14 +1948,16 @@ async def dashboard_agents_live():
                             k_str = k.decode() if isinstance(k, bytes) else k
                             v_str = v.decode() if isinstance(v, bytes) else v
                             decoded[k_str] = v_str
-                        live_agents.append({
-                            "agent_id": agent_id,
-                            "name": decoded.get("name", "unknown"),
-                            "type": decoded.get("agent_type", ""),
-                            "layer": decoded.get("layer", ""),
-                            "status": decoded.get("status", "stopped"),
-                            "advisory_only": decoded.get("advisory_only", "false"),
-                        })
+                        live_agents.append(
+                            {
+                                "agent_id": agent_id,
+                                "name": decoded.get("name", "unknown"),
+                                "type": decoded.get("agent_type", ""),
+                                "layer": decoded.get("layer", ""),
+                                "status": decoded.get("status", "stopped"),
+                                "advisory_only": decoded.get("advisory_only", "false"),
+                            }
+                        )
                 if cursor == 0:
                     break
             return {"agents": live_agents, "count": len(live_agents)}
@@ -1906,6 +1969,7 @@ async def dashboard_agents_live():
     except Exception as exc:
         logger.error(f"Dashboard live agents error: {exc}")
         return {"error": str(exc), "agents": [], "count": 0}
+
 
 # ================================================================
 # STRATEGY DETAIL â Full strategy with validation reasons + trades
@@ -2937,6 +3001,8 @@ async def dashboard_copy_quality(limit: int = Query(default=20, le=100)):
             }
     except Exception as exc:
         return {"error": str(exc)}
+
+
 # ================================================================
 # REGRESSION DETECTION — Strategy health monitoring
 # ================================================================
@@ -3027,23 +3093,25 @@ async def dashboard_regression(limit: int = Query(default=50, ge=1, le=200)):
                     if is_regressed:
                         active_regressed += 1
 
-                deployments.append({
-                    "deployment_id": str(row[0]),
-                    "strategy_id": str(row[1]),
-                    "strategy_name": str(row[2]) if row[2] else "unknown",
-                    "mode": str(row[3]) if row[3] else "",
-                    "status": dep_status,
-                    "proposed_at": str(row[5]) if row[5] else "",
-                    "activated_at": str(row[6]) if row[6] else None,
-                    "regression": {
-                        "walk_forward_score": round(wf, 2),
-                        "overfit_probability": round(of, 2),
-                        "regime_survival": round(rs, 2),
-                        "monte_carlo_survival": round(mc, 2),
-                        "signals_fired": regression_signals,
-                        "is_regressed": is_regressed,
-                    },
-                })
+                deployments.append(
+                    {
+                        "deployment_id": str(row[0]),
+                        "strategy_id": str(row[1]),
+                        "strategy_name": str(row[2]) if row[2] else "unknown",
+                        "mode": str(row[3]) if row[3] else "",
+                        "status": dep_status,
+                        "proposed_at": str(row[5]) if row[5] else "",
+                        "activated_at": str(row[6]) if row[6] else None,
+                        "regression": {
+                            "walk_forward_score": round(wf, 2),
+                            "overfit_probability": round(of, 2),
+                            "regime_survival": round(rs, 2),
+                            "monte_carlo_survival": round(mc, 2),
+                            "signals_fired": regression_signals,
+                            "is_regressed": is_regressed,
+                        },
+                    }
+                )
 
             # 2. Rollback history summary
             r = await conn.execute(
@@ -3061,28 +3129,34 @@ async def dashboard_regression(limit: int = Query(default=50, ge=1, le=200)):
             )
             rollbacks = []
             for row in r.fetchall():
-                rollbacks.append({
-                    "deployment_id": str(row[0]),
-                    "strategy_id": str(row[1]),
-                    "strategy_name": str(row[2]) if row[2] else "unknown",
-                    "mode": str(row[3]) if row[3] else "",
-                    "approved_by": str(row[4]) if row[4] else "",
-                    "proposed_at": str(row[5]) if row[5] else "",
-                    "activated_at": str(row[6]) if row[6] else None,
-                    "rolled_back_at": str(row[7]) if row[7] else "",
-                })
+                rollbacks.append(
+                    {
+                        "deployment_id": str(row[0]),
+                        "strategy_id": str(row[1]),
+                        "strategy_name": str(row[2]) if row[2] else "unknown",
+                        "mode": str(row[3]) if row[3] else "",
+                        "approved_by": str(row[4]) if row[4] else "",
+                        "proposed_at": str(row[5]) if row[5] else "",
+                        "activated_at": str(row[6]) if row[6] else None,
+                        "rolled_back_at": str(row[7]) if row[7] else "",
+                    }
+                )
 
             # 3. Summary stats
             r = await conn.execute(text("SELECT COUNT(*) FROM deployment_governance"))
             total_deployments = r.scalar() or 0
 
             r = await conn.execute(
-                text("SELECT COUNT(*) FROM deployment_governance WHERE status = 'rolled_back'")
+                text(
+                    "SELECT COUNT(*) FROM deployment_governance WHERE status = 'rolled_back'"
+                )
             )
             total_rollbacks = r.scalar() or 0
 
             r = await conn.execute(
-                text("SELECT COUNT(*) FROM deployment_governance WHERE status = 'rejected'")
+                text(
+                    "SELECT COUNT(*) FROM deployment_governance WHERE status = 'rejected'"
+                )
             )
             total_rejected = r.scalar() or 0
 
@@ -3093,7 +3167,9 @@ async def dashboard_regression(limit: int = Query(default=50, ge=1, le=200)):
                 "active_regressed": active_regressed,
                 "total_rollbacks": total_rollbacks,
                 "total_rejected": total_rejected,
-                "regression_rate_pct": round((active_regressed / total_active * 100), 1) if total_active > 0 else 0.0,
+                "regression_rate_pct": round((active_regressed / total_active * 100), 1)
+                if total_active > 0
+                else 0.0,
             },
             "deployments": deployments,
             "rollbacks": rollbacks,
@@ -3101,4 +3177,3 @@ async def dashboard_regression(limit: int = Query(default=50, ge=1, le=200)):
     except Exception as exc:
         logger.error(f"Dashboard regression error: {exc}")
         return {"error": str(exc)}
-

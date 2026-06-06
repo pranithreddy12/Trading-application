@@ -123,6 +123,7 @@
     <a onclick="navigate('scouts')">Scouts</a>
     <a onclick="navigate('governance')">Governance</a>
     <a onclick="navigate('validation')">Validation</a>
+    <a onclick="navigate('performance')">Performance</a>
   </nav>
   <div id="errors"></div>
 
@@ -193,6 +194,23 @@
   <!-- === PAGE: Validation === -->
   <div id="page-validation" class="page"><div class="loading">Loading validation...</div></div>
 
+  <!-- === PAGE: Paper Performance === -->
+  <div id="page-performance" class="page">
+    <div class="page-title">Paper Trading Performance</div>
+    <div class="flex mb-8" style="align-items:center;justify-content:space-between">
+      <div class="filter-group" id="perfFilters">
+        <button class="filter-btn active" data-sort="monthly_return_pct" onclick="loadPerformance('monthly_return_pct')">Monthly Return</button>
+        <button class="filter-btn" data-sort="sharpe_ratio" onclick="loadPerformance('sharpe_ratio')">Sharpe</button>
+        <button class="filter-btn" data-sort="profit_factor" onclick="loadPerformance('profit_factor')">Profit Factor</button>
+        <button class="filter-btn" data-sort="win_rate" onclick="loadPerformance('win_rate')">Win Rate</button>
+        <button class="filter-btn" data-sort="total_return_pct" onclick="loadPerformance('total_return_pct')">Total Return</button>
+        <button class="filter-btn" data-sort="realized_pnl" onclick="loadPerformance('realized_pnl')">Realized PnL</button>
+      </div>
+    </div>
+    <div id="performance-summary" class="grid" style="margin-bottom:16px"></div>
+    <div id="performance-breakdown" class="card"><div class="loading">Loading performance data...</div></div>
+  </div>
+
   <div class="last-updated" id="footerUpdate">Auto-refreshing</div>
 </div>
 
@@ -235,6 +253,7 @@ function loadPage(page, params) {
     case 'scouts': loadScouts(); break;
     case 'governance': loadGovernance(); break;
     case 'validation': loadValidation(); break;
+    case 'performance': loadPerformance(); break;
   }
 }
 
@@ -909,6 +928,63 @@ async function loadValidation() {
   } catch(e) { setContent('page-validation', '<div class="error-banner">' + esc(e.message) + '</div>'); }
 }
 
+// === PAPER PERFORMANCE PAGE ===
+async function loadPerformance(sortBy) {
+  try {
+    if (sortBy) {
+      _currentPerfSort = sortBy;
+      document.querySelectorAll('#perfFilters .filter-btn').forEach(b => b.classList.toggle('active', b.dataset.sort === sortBy));
+    }
+    const s = _currentPerfSort || 'monthly_return_pct';
+    const data = await fetchJSON(API + '/dashboard/api/paper-performance?sort_by=' + s + '&limit=50');
+    const { summary, ranked } = data;
+
+    // Summary cards
+    let html = '';
+    if (summary) {
+      const cards = [
+        { label: 'Strategies with Trades', val: summary.strategies_with_metrics || 0, sub: 'with metrics' },
+        { label: 'Qualified for Promotion', val: summary.qualified || 0, sub: 'meet all criteria' },
+        { label: 'Above 20% Monthly', val: summary.above_20pct_monthly || 0, sub: 'high performers' },
+        { label: 'Total Realized PnL', val: '$' + (summary.total_realized_pnl || 0).toLocaleString(undefined, { minimumFractionDigits: 2 }), sub: 'all strategies', cls: (summary.total_realized_pnl || 0) >= 0 ? 'pnl-pos' : 'pnl-neg' },
+      ];
+      for (const c of cards) {
+        html += '<div class="card"><h3>' + c.label + '</h3><div class="value' + (c.cls ? ' ' + c.cls : '') + '">' + c.val + '</div><div class="sub">' + c.sub + '</div></div>';
+      }
+    }
+    setContent('performance-summary', html);
+
+    // Ranked table
+    if (ranked && ranked.length) {
+      html = '<div class="scroll-x"><table><thead><tr><th>#</th><th>Strategy</th><th class="text-right">Monthly Return</th><th class="text-right">Sharpe</th><th class="text-right">Profit Factor</th><th class="text-right">Win Rate</th><th class="text-right">Max DD</th><th class="text-right">Total Return</th><th class="text-right">PnL</th><th class="text-right">Trades</th><th>Qualified</th></tr></thead><tbody>';
+      for (let i = 0; i < ranked.length; i++) {
+        const r = ranked[i];
+        const mdd = r.max_drawdown_pct || 0;
+        html += '<tr>';
+        html += '<td style="color:#8b949e">' + (i + 1) + '</td>';
+        html += '<td><strong>' + esc(r.name || 'Unnamed') + '</strong></td>';
+        html += '<td class="text-right" style="color:' + (r.monthly_return_pct >= 20 ? '#3fb950' : r.monthly_return_pct >= 0 ? '#d29922' : '#f85149') + '">' + r.monthly_return_pct.toFixed(2) + '%</td>';
+        html += '<td class="text-right" style="color:' + (r.sharpe_ratio >= 1.5 ? '#3fb950' : r.sharpe_ratio >= 0 ? '#d29922' : '#f85149') + '">' + r.sharpe_ratio.toFixed(2) + '</td>';
+        html += '<td class="text-right" style="color:' + (r.profit_factor >= 1.3 ? '#3fb950' : r.profit_factor >= 1 ? '#d29922' : '#f85149') + '">' + r.profit_factor.toFixed(2) + '</td>';
+        html += '<td class="text-right">' + (r.win_rate * 100).toFixed(0) + '%</td>';
+        html += '<td class="text-right" style="color:' + (mdd <= 15 ? '#3fb950' : mdd <= 30 ? '#d29922' : '#f85149') + '">' + mdd.toFixed(2) + '%</td>';
+        html += '<td class="text-right">' + r.total_return_pct.toFixed(2) + '%</td>';
+        html += '<td class="text-right ' + (r.realized_pnl >= 0 ? 'pnl-pos' : 'pnl-neg') + '">$' + r.realized_pnl.toFixed(2) + '</td>';
+        html += '<td class="text-right">' + r.total_trades + '</td>';
+        html += '<td>' + (r.is_qualified ? '<span class="chip green">PASS</span>' : '<span class="chip gray">--</span>') + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table><div class="sub" style="margin-top:8px">Showing ' + ranked.length + ' strategies sorted by ' + s.replace(/_/g, ' ') + '</div></div>';
+    } else {
+      html = '<div class="sub" style="padding:16px">No paper trade performance data yet. Run some paper trades first.</div>';
+    }
+    setContent('performance-breakdown', html);
+    touchLastUpdate();
+  } catch(e) { setContent('performance-breakdown', '<div class="error-banner">' + esc(e.message) + '</div>'); }
+}
+
+let _currentPerfSort = 'monthly_return_pct';
+
 // === HELPERS ===
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -968,6 +1044,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (_currentPage === 'scouts') loadScouts();
     if (_currentPage === 'governance') loadGovernance();
     if (_currentPage === 'validation') loadValidation();
+    if (_currentPage === 'performance') loadPerformance();
   }, SLOW_REFRESH_MS);
 });
 </script>

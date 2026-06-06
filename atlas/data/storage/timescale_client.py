@@ -2955,6 +2955,94 @@ class TimescaleClient:
                     logger.warning(f"Failed to apply Phase 30 migrations: {e}")
 
                 # ================================================================
+                # PHASE 31 — PAPER TRADING PERFORMANCE TABLES
+                # ================================================================
+                try:
+                    # strategy_performance
+                    await conn.execute(
+                        text("""
+                        CREATE TABLE IF NOT EXISTS strategy_performance (
+                            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                            strategy_id UUID NOT NULL REFERENCES strategies(id),
+                            computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            daily_return_pct NUMERIC,
+                            weekly_return_pct NUMERIC,
+                            monthly_return_pct NUMERIC,
+                            rolling_30d_return_pct NUMERIC,
+                            total_return_pct NUMERIC,
+                            realized_pnl NUMERIC,
+                            unrealized_pnl NUMERIC,
+                            sharpe_ratio NUMERIC,
+                            profit_factor NUMERIC,
+                            win_rate NUMERIC,
+                            max_drawdown_pct NUMERIC,
+                            avg_trade_pnl NUMERIC,
+                            total_trades INT,
+                            is_qualified BOOLEAN DEFAULT FALSE,
+                            qualified_at TIMESTAMPTZ,
+                            UNIQUE (strategy_id)
+                        )
+                        """)
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_strat_perf_monthly ON strategy_performance (monthly_return_pct DESC)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_strat_perf_sharpe ON strategy_performance (sharpe_ratio DESC)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_strat_perf_qualified ON strategy_performance (is_qualified) WHERE is_qualified = TRUE"
+                        )
+                    )
+
+                    # strategy_promotion_audit
+                    await conn.execute(
+                        text("""
+                        CREATE TABLE IF NOT EXISTS strategy_promotion_audit (
+                            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                            strategy_id UUID NOT NULL REFERENCES strategies(id),
+                            checked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            result TEXT NOT NULL CHECK (result IN ('PASS', 'FAIL')),
+                            monthly_return_pct NUMERIC,
+                            sharpe_ratio NUMERIC,
+                            profit_factor NUMERIC,
+                            max_drawdown_pct NUMERIC,
+                            total_trades INT,
+                            fail_reasons JSONB DEFAULT '[]'::jsonb,
+                            details TEXT
+                        )
+                        """)
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_promo_audit_strategy ON strategy_promotion_audit (strategy_id)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_promo_audit_result ON strategy_promotion_audit (result)"
+                        )
+                    )
+                    await conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS idx_promo_audit_time ON strategy_promotion_audit (checked_at DESC)"
+                        )
+                    )
+
+                    await conn.execute(
+                        text(
+                            "INSERT INTO schema_version (version, description) VALUES ('v31.0', 'Phase 31: Paper trading performance metrics & promotion audit') ON CONFLICT DO NOTHING"
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to apply Phase 31 migrations: {e}")
+
+                # ================================================================
                 # SCHEMA VERSIONING — Phase 24: Post-migration validation
                 # ================================================================
                 await conn.execute(
