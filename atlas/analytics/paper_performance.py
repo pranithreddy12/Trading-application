@@ -268,6 +268,8 @@ class PaperPerformanceMetrics:
             }
 
     async def _audit_qualification(self, strategy_id: str, result: dict) -> None:
+        import json
+
         async with self.db.engine.begin() as conn:
             await conn.execute(
                 text("""
@@ -289,7 +291,7 @@ class PaperPerformanceMetrics:
                     "pf": result["profit_factor"],
                     "mdd": result["max_drawdown_pct"],
                     "tt": result["total_trades"],
-                    "reasons": str(result["fail_reasons"]),
+                    "reasons": json.dumps(result["fail_reasons"]),
                     "details": f"Qualification check at {datetime.now(timezone.utc).isoformat()}",
                 },
             )
