@@ -28,6 +28,28 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Optional
 
+ARCHETYPE_MAP = {
+    "statistical_anomaly": {
+        "rsi_14": "Mean Reversion",
+        "bollinger_band_position": "Mean Reversion",
+        "macd": "Momentum",
+        "macd_signal": "Momentum",
+        "price_vs_vwap_pct": "Momentum",
+        "trend_strength": "Trend Following",
+        "rolling_volatility": "Volatility Expansion",
+        "relative_volume": "Liquidity Shock",
+    },
+    "anomaly_cluster": {
+        "bullish": "Breakout",
+        "bearish": "Liquidity Shock",
+    },
+}
+
+PATTERN_TYPE_ARCHETYPES = {
+    "latent_structure": "Regime Shift",
+    "market_cluster": "Market Structure",
+}
+
 import numpy as np
 import pandas as pd
 from loguru import logger
@@ -46,7 +68,9 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-    logger.warning("sklearn not available — pattern_recognition_engine will use statistical methods only")
+    logger.warning(
+        "sklearn not available — pattern_recognition_engine will use statistical methods only"
+    )
 
 
 class PatternRecognitionEngine(BaseAgent):
@@ -90,13 +114,23 @@ class PatternRecognitionEngine(BaseAgent):
 
         # Selected feature columns for pattern analysis
         self.FEATURE_COLS = [
-            "returns", "log_returns", "rsi_14", "macd", "macd_signal",
-            "price_vs_vwap_pct", "ema_spread_pct", "relative_volume",
-            "bollinger_band_position", "rolling_volatility", "trend_strength",
+            "returns",
+            "log_returns",
+            "rsi_14",
+            "macd",
+            "macd_signal",
+            "price_vs_vwap_pct",
+            "ema_spread_pct",
+            "relative_volume",
+            "bollinger_band_position",
+            "rolling_volatility",
+            "trend_strength",
         ]
 
     async def run(self):
-        logger.info(f"{self.name}: starting pattern analysis loop (every {self.run_interval}s)")
+        logger.info(
+            f"{self.name}: starting pattern analysis loop (every {self.run_interval}s)"
+        )
         while self.status == "running":
             try:
                 results = await self._analyze_patterns()
@@ -151,7 +185,7 @@ class PatternRecognitionEngine(BaseAgent):
         """Fetch enriched features from features_wide."""
         try:
             async with self.db.engine.connect() as conn:
-                cols = ", ".join(f"\"{c}\"" for c in self.FEATURE_COLS if c != "time")
+                cols = ", ".join(f'"{c}"' for c in self.FEATURE_COLS if c != "time")
                 result = await conn.execute(
                     text(f"""
                         SELECT time, {cols}
@@ -191,23 +225,30 @@ class PatternRecognitionEngine(BaseAgent):
         anomaly_indices = self._detect_anomalies_isolation_forest(X)
         if anomaly_indices:
             anomaly_rets = close[anomaly_indices]
-            avg_anomaly_ret = float(np.mean(anomaly_rets)) if len(anomaly_rets) > 0 else 0.0
+            avg_anomaly_ret = (
+                float(np.mean(anomaly_rets)) if len(anomaly_rets) > 0 else 0.0
+            )
             directions = []
             if avg_anomaly_ret > 0.001:
                 directions.append("bullish")
             elif avg_anomaly_ret < -0.001:
                 directions.append("bearish")
 
-            discoveries.append({
-                "pattern_type": "anomaly_cluster",
-                "symbol": symbol,
-                "confidence": round(min(1.0, len(anomaly_indices) / len(df) * 5), 4),
-                "sample_size": int(len(anomaly_indices)),
-                "avg_anomaly_return": round(avg_anomaly_ret, 6),
-                "direction": directions,
-                "method": "isolation_forest",
-                "detail": f"Detected {len(anomaly_indices)} anomalies in {symbol} features",
-            })
+            discoveries.append(
+                {
+                    "pattern_type": "anomaly_cluster",
+                    "symbol": symbol,
+                    "confidence": round(
+                        min(1.0, len(anomaly_indices) / len(df) * 5), 4
+                    ),
+                    "sample_size": int(len(anomaly_indices)),
+                    "avg_anomaly_return": round(avg_anomaly_ret, 6),
+                    "direction": directions,
+                    "method": "isolation_forest",
+                    "score": round(len(anomaly_indices) / len(df) * 100, 1),
+                    "detail": f"Detected {len(anomaly_indices)} anomalies in {symbol} features",
+                }
+            )
 
         # ---- 2. DBSCAN Clustering ----
         clusters = self._cluster_dbscan(X)
@@ -220,45 +261,56 @@ class PatternRecognitionEngine(BaseAgent):
                 cluster_features = np.mean(X[members], axis=0)
                 top_features = self._top_features(feature_cols, cluster_features)
 
-                discoveries.append({
-                    "pattern_type": "market_cluster",
-                    "symbol": symbol,
-                    "confidence": round(min(1.0, len(members) / 50), 4),
-                    "sample_size": int(len(members)),
-                    "avg_cluster_return": round(avg_ret, 6),
-                    "cluster_id": int(cluster_id),
-                    "top_features": top_features[:3],
-                    "method": "dbscan",
-                    "detail": f"Cluster {cluster_id}: {len(members)} bars, top features: {', '.join(top_features[:3])}",
-                })
+                discoveries.append(
+                    {
+                        "pattern_type": "market_cluster",
+                        "symbol": symbol,
+                        "confidence": round(min(1.0, len(members) / 50), 4),
+                        "sample_size": int(len(members)),
+                        "avg_cluster_return": round(avg_ret, 6),
+                        "cluster_id": int(cluster_id),
+                        "top_features": top_features[:3],
+                        "method": "dbscan",
+                        "score": round(len(members) / 50 * 100, 1),
+                        "detail": f"Cluster {cluster_id}: {len(members)} bars, top features: {', '.join(top_features[:3])}",
+                    }
+                )
 
         # ---- 3. PCA Latent Structure ----
         pca_result = self._pca_analysis(X, feature_cols)
         if pca_result:
-            discoveries.append({
-                "pattern_type": "latent_structure",
-                "symbol": symbol,
-                "confidence": round(pca_result["explained_variance_ratio"], 4),
-                "sample_size": len(df),
-                "pca_components": self.pca_components,
-                "top_loadings": pca_result["top_loadings"],
-                "method": "pca",
-                "detail": f"PCA: {pca_result['explained_variance_ratio']:.1%} variance in {self.pca_components} components",
-            })
+            discoveries.append(
+                {
+                    "pattern_type": "latent_structure",
+                    "symbol": symbol,
+                    "confidence": round(pca_result["explained_variance_ratio"], 4),
+                    "sample_size": len(df),
+                    "pca_components": self.pca_components,
+                    "top_loadings": pca_result["top_loadings"],
+                    "method": "pca",
+                    "score": round(pca_result["explained_variance_ratio"] * 100, 1),
+                    "detail": f"Market Regime Compression Detected — {pca_result['explained_variance_ratio']:.1%} of variance explained by {self.pca_components} dominant factors ({', '.join(pca_result['top_loadings'][:3])})",
+                }
+            )
 
         # ---- 4. Statistical Anomaly Scoring ----
         stat_anomalies = self._statistical_anomalies(X, feature_cols)
         for anomaly in stat_anomalies:
-            discoveries.append({
-                "pattern_type": "statistical_anomaly",
-                "symbol": symbol,
-                "confidence": round(anomaly["z_score"] / 5.0, 4),  # normalize to [0, 1]
-                "sample_size": anomaly["count"],
-                "feature": anomaly["feature"],
-                "z_score": round(anomaly["z_score"], 2),
-                "method": "z_score",
-                "detail": f"Z-score {anomaly['z_score']:.1f} on feature {anomaly['feature']}",
-            })
+            discoveries.append(
+                {
+                    "pattern_type": "statistical_anomaly",
+                    "symbol": symbol,
+                    "confidence": round(
+                        anomaly["z_score"] / 5.0, 4
+                    ),  # normalize to [0, 1]
+                    "sample_size": anomaly["count"],
+                    "feature": anomaly["feature"],
+                    "z_score": round(anomaly["z_score"], 2),
+                    "method": "z_score",
+                    "score": round(anomaly["z_score"], 2),
+                    "detail": f"Z-score {anomaly['z_score']:.1f} on feature {anomaly['feature']}",
+                }
+            )
 
         return discoveries
 
@@ -324,14 +376,18 @@ class PatternRecognitionEngine(BaseAgent):
             top_loadings = [feature_cols[i] for i in top_idx]
 
             return {
-                "explained_variance_ratio": float(np.sum(pca.explained_variance_ratio_)),
+                "explained_variance_ratio": float(
+                    np.sum(pca.explained_variance_ratio_)
+                ),
                 "top_loadings": top_loadings,
                 "n_components": n_comp,
             }
         except Exception:
             return None
 
-    def _statistical_anomalies(self, X: np.ndarray, feature_cols: list[str]) -> list[dict]:
+    def _statistical_anomalies(
+        self, X: np.ndarray, feature_cols: list[str]
+    ) -> list[dict]:
         """Detect features with extreme statistical anomalies."""
         anomalies = []
         for j, col in enumerate(feature_cols):
@@ -343,18 +399,36 @@ class PatternRecognitionEngine(BaseAgent):
             z = abs(np.mean(vals)) / (np.std(vals) + 1e-10)
             if z > 2.0:
                 n_extreme = int(np.sum(np.abs(vals) > q75 + 1.5 * iqr))
-                anomalies.append({
-                    "feature": col,
-                    "z_score": float(z),
-                    "count": n_extreme,
-                    "direction": "elevated" if np.mean(vals) > 0 else "depressed",
-                })
+                anomalies.append(
+                    {
+                        "feature": col,
+                        "z_score": float(z),
+                        "count": n_extreme,
+                        "direction": "elevated" if np.mean(vals) > 0 else "depressed",
+                    }
+                )
         return anomalies[:5]
 
     def _top_features(self, feature_cols: list[str], loadings: np.ndarray) -> list[str]:
         """Return top features by absolute loading weight."""
         idx = np.argsort(np.abs(loadings))[::-1]
         return [feature_cols[i] for i in idx]
+
+    def _classify_archetype(self, d: dict) -> str:
+        pattern_type = d["pattern_type"]
+        if pattern_type in ARCHETYPE_MAP:
+            mapping = ARCHETYPE_MAP[pattern_type]
+            if isinstance(mapping, dict):
+                if pattern_type == "statistical_anomaly":
+                    feature = d.get("feature", "")
+                    return mapping.get(feature, "Momentum")
+                elif pattern_type == "anomaly_cluster":
+                    directions = d.get("direction", [])
+                    if isinstance(directions, list) and len(directions) > 0:
+                        return mapping.get(directions[0], "Market Regime")
+                    return "Market Regime"
+            return mapping
+        return PATTERN_TYPE_ARCHETYPES.get(pattern_type, "Market Structure")
 
     async def _persist_discoveries(self, discoveries: list[dict]) -> None:
         """Save pattern discoveries to pattern_memory."""
@@ -365,13 +439,10 @@ class PatternRecognitionEngine(BaseAgent):
                 pattern_type = d["pattern_type"]
                 symbol = d.get("symbol", "all")
                 confidence = d["confidence"]
-                direction = d.get("direction")
-                if isinstance(direction, list) and len(direction) > 0:
-                    archetype = direction[0]
-                elif isinstance(direction, str):
-                    archetype = direction
-                else:
-                    archetype = "unknown"
+                archetype = self._classify_archetype(d)
+
+                id_key = f"{pattern_type}:{symbol}:{d.get('detail', '')}"
+                det_id = uuid.uuid5(uuid.NAMESPACE_DNS, id_key)
 
                 await self.db._execute_insert(
                     """
@@ -385,20 +456,31 @@ class PatternRecognitionEngine(BaseAgent):
                          :md, NOW(), NOW())
                     ON CONFLICT (id) DO UPDATE SET
                         updated_at = NOW(),
+                        archetype = EXCLUDED.archetype,
+                        composite_score_avg = EXCLUDED.composite_score_avg,
                         confidence_score = EXCLUDED.confidence_score,
-                        recommendation = EXCLUDED.recommendation
+                        recommendation = EXCLUDED.recommendation,
+                        motif_details = EXCLUDED.motif_details
                     """,
                     {
-                        "id": str(uuid.uuid4()),
+                        "id": str(det_id),
                         "pt": pattern_type,
                         "arch": archetype,
-                        "ff": [d.get("method", "unknown")] if d.get("method") else ["statistical"],
+                        "ff": [d.get("method", "unknown")]
+                        if d.get("method")
+                        else ["statistical"],
                         "ac": "crypto",
                         "tf": "1h",
-                        "csa": d.get("avg_anomaly_return", d.get("avg_cluster_return", 0)),
+                        "csa": d.get("score", 0),
                         "cs": confidence,
                         "rec": d.get("detail", ""),
-                        "md": safe_json_dumps({k: v for k, v in d.items() if k not in ("pattern_type", "confidence", "detail")}),
+                        "md": safe_json_dumps(
+                            {
+                                k: v
+                                for k, v in d.items()
+                                if k not in ("pattern_type", "confidence", "detail")
+                            }
+                        ),
                     },
                 )
             except Exception as e:

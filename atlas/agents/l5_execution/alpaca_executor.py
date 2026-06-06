@@ -85,6 +85,7 @@ class AlpacaExecutor(BaseAgent):
             "fill_price": trade_req["price"],
             "status": "filled",
             "pnl": 0.0,
+            "origin": "execution",
         })
 
     async def _execute_strategy(self, strategy: dict) -> bool:

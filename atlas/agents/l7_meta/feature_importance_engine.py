@@ -31,6 +31,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.agent_base import BaseAgent
+from atlas.agents.l7_meta.drift_detection_engine import DriftDetectionEngine
 
 
 class FeatureImportanceEngine(BaseAgent):
@@ -59,6 +60,7 @@ class FeatureImportanceEngine(BaseAgent):
         redis_client=None,
         db_client=None,
         run_interval: int = 7200,
+        drift_engine: Optional[DriftDetectionEngine] = None,
     ):
         super().__init__(
             name=self.name,
@@ -68,6 +70,7 @@ class FeatureImportanceEngine(BaseAgent):
         )
         self.db = db_client
         self.run_interval = run_interval
+        self._drift_engine = drift_engine
 
     async def run(self):
         logger.info(f"{self.name}: starting feature importance analysis (every {self.run_interval}s)")
@@ -77,6 +80,13 @@ class FeatureImportanceEngine(BaseAgent):
                 if rankings:
                     await self._persist_rankings(rankings)
                     await self._publish(rankings)
+                    # Notify DriftDetectionEngine directly (in addition to Redis pub/sub)
+                    if self._drift_engine is not None:
+                        try:
+                            await self._drift_engine.trigger("feature_importance_updated")
+                            logger.debug(f"{self.name}: triggered drift engine after ranking update")
+                        except Exception as trig_err:
+                            logger.warning(f"{self.name}: drift engine trigger failed: {trig_err}")
             except Exception as e:
                 logger.error(f"{self.name}: analysis failed: {e}")
             await asyncio.sleep(self.run_interval)

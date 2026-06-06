@@ -17,6 +17,12 @@ from atlas.agents.l3_backtest.short_window_evaluator import (
 )
 from atlas.core.event_lineage import EventLineageClient
 
+# Lazy imports for advanced validation agents (wired post-backtest)
+from atlas.agents.l3_validation.walk_forward_analyzer import WalkForwardAnalyzer
+from atlas.agents.l3_validation.overfitting_detector import OverfittingDetector
+from atlas.agents.l3_validation.regime_validator import RegimeValidator
+from atlas.agents.l3_validation.monte_carlo_simulator import MonteCarloSimulator
+
 
 def clean_metrics(obj):
     if isinstance(obj, dict):
@@ -34,6 +40,10 @@ class DummyStrategy:
     Emergency fallback only for debugging.
     In production pipeline we mark failed code separately.
     """
+
+    def __init__(self):
+        self.stop_loss_pct = 0.0  # disabled by default
+        self.take_profit_pct = 0.0  # disabled by default
 
     def generate_signals(self, df):
         return pd.Series(
@@ -56,7 +66,7 @@ class BacktestRunner(BaseAgent):
         self.commission_pct = 0.001
         self.slippage_pct = 0.0005
         self.spread_cost_pct = 0.0005
-        self.position_size = 0.10
+        self.position_size = 0.10  # fixed position size (10% per trade)
 
         # Dynamic slippage config
         self.DYN_SLIPPAGE_MIN_MULT = 0.5
@@ -351,7 +361,9 @@ class BacktestRunner(BaseAgent):
                 feat_df["time"] = pd.to_datetime(feat_df["time"])
                 df = df.merge(feat_df, on="time", how="left")
                 df = df.sort_values("time")
-                df = df.ffill().bfill()
+                # NOTE: bfill() removed to prevent future lookahead leakage
+                # Remaining NaNs (no prior data) are filled with 0
+                df = df.ffill().fillna(0)
 
             logger.info(f"{strategy_id}: Columns available: {df.columns.tolist()}")
 
@@ -507,7 +519,7 @@ class BacktestRunner(BaseAgent):
             )
             if bt_result is None:
                 return
-            results, trades = bt_result
+            results, trades, signals = bt_result
             results = clean_metrics(results)
 
             # Log dynamic slippage stats
@@ -518,6 +530,17 @@ class BacktestRunner(BaseAgent):
                     f"min={mult.min():.2f}x median={np.nanmedian(mult):.2f}x "
                     f"max={mult.max():.2f}x"
                 )
+
+            # =====================================================
+            # ADVANCED VALIDATION — walk-forward, overfitting, regime, Monte Carlo
+            # =====================================================
+            await self._run_advanced_validation(
+                strategy_id=strategy_id,
+                df=df,
+                signals=signals,
+                trades=trades,
+                trace_id=trace_id,
+            )
 
             # =====================================================
             # SAVE RESULTS
@@ -668,7 +691,8 @@ class BacktestRunner(BaseAgent):
         - trending / ranging: based on trend_strength
         - overbought / oversold: based on bollinger_band_position
         """
-        entry_signals = signals[signals == 1]
+        # Include both long (1) and short (-1) entry signals for regime scoring
+        entry_signals = signals[signals != 0]
         if entry_signals.empty:
             return 0.0
 
@@ -750,6 +774,113 @@ class BacktestRunner(BaseAgent):
 
         return combined
 
+    def _compute_vol_adjusted_position_size(self, df: pd.DataFrame, base_size: float = 0.10) -> np.ndarray:
+        """
+        Compute per-bar volatility-adjusted position size.
+        
+        Uses rolling_volatility to scale position size inversely:
+        - Low vol (< 50th percentile): increase size up to vol_position_max (20%)
+        - High vol (> 80th percentile): decrease size down to vol_position_min (5%)
+        - Normal vol: use base_size (10%)
+        """
+        if "rolling_volatility" not in df.columns:
+            return np.full(len(df), base_size)
+        
+        vol = df["rolling_volatility"].astype(float).values
+        median_vol = np.nanmedian(vol)
+        if not np.isfinite(median_vol) or median_vol <= 0:
+            return np.full(len(df), base_size)
+        
+        # Ratio: <1 = low vol (increase size), >1 = high vol (decrease size)
+        vol_ratio = vol / median_vol
+        vol_ratio = np.clip(vol_ratio, 0.1, 5.0)
+        
+        # Inverse sqrt scaling: low vol = larger position
+        position_sizing = base_size / np.sqrt(vol_ratio)
+        # Clamp to reasonable bounds
+        min_pos_size = 0.05
+        max_pos_size = 0.20
+        position_sizing = np.clip(position_sizing, min_pos_size, max_pos_size)
+        position_sizing = np.where(np.isfinite(position_sizing), position_sizing, base_size)
+        
+        return position_sizing
+
+    async def _run_advanced_validation(
+        self,
+        strategy_id: str,
+        df: pd.DataFrame,
+        signals: pd.Series,
+        trades: list[dict],
+        trace_id: str | None = None,
+    ) -> None:
+        """
+        Run advanced validation agents (walk-forward, overfitting, regime, Monte Carlo)
+        after the backtest completes. These feed the walk_forward_analysis,
+        overfitting_analysis, regime_validation, and monte_carlo_analysis tables
+        so that DeploymentGovernor can query them during the promotion gate.
+        """
+        try:
+            # ---- Walk-Forward Analysis ----
+            wf = WalkForwardAnalyzer(db_client=self.timescale)
+            wf_result = await wf.analyze(
+                strategy_id=strategy_id,
+                df=df,
+                signals=signals,
+                background_results={},
+            )
+            logger.info(
+                f"{strategy_id}: Walk-forward score={wf_result.get('walk_forward_score', 0):.2f} "
+                f"({wf_result.get('n_windows_survived', 0)}/{wf_result.get('n_windows_total', 0)} windows)"
+            )
+        except Exception as e:
+            logger.warning(f"{strategy_id}: Walk-forward analysis failed: {e}")
+
+        try:
+            # ---- Overfitting Detection ----
+            od = OverfittingDetector(db_client=self.timescale)
+            od_result = await od.detect(
+                strategy_id=strategy_id,
+                df=df,
+                signals=signals,
+                params=None,
+            )
+            logger.info(
+                f"{strategy_id}: Overfit prob={od_result.get('overfit_probability', 0):.2f} "
+                f"robustness={od_result.get('robustness_score', 0):.2f}"
+            )
+        except Exception as e:
+            logger.warning(f"{strategy_id}: Overfitting detection failed: {e}")
+
+        try:
+            # ---- Regime Validation ----
+            rv = RegimeValidator(db_client=self.timescale)
+            rv_result = await rv.validate(
+                strategy_id=strategy_id,
+                df=df,
+                signals=signals,
+            )
+            logger.info(
+                f"{strategy_id}: Regime survival score={rv_result.get('regime_survival_score', 0):.2f} "
+                f"({rv_result.get('n_regimes_survived', 0)}/{rv_result.get('n_regimes_total', 0)} regimes)"
+            )
+        except Exception as e:
+            logger.warning(f"{strategy_id}: Regime validation failed: {e}")
+
+        try:
+            # ---- Monte Carlo Simulation ----
+            mc = MonteCarloSimulator(db_client=self.timescale)
+            mc_result = await mc.simulate(
+                strategy_id=strategy_id,
+                trades=trades,
+                background_results={},
+            )
+            logger.info(
+                f"{strategy_id}: Monte Carlo survival={mc_result.get('monte_carlo_survival_score', 0):.2f} "
+                f"tail_drawdown={mc_result.get('expected_tail_drawdown', 0):.4f}"
+            )
+        except Exception as e:
+            logger.warning(f"{strategy_id}: Monte Carlo simulation failed: {e}")
+
     def _calc_sharpe(self, trade_returns: list, symbol: str = "") -> float:
         """
         Diagnostic Sharpe calculation for discrete trade returns (per-trade PnL pct).
@@ -797,9 +928,13 @@ class BacktestRunner(BaseAgent):
         df: pd.DataFrame,
         symbol: str = "",
         strategy_id: str = "unknown",
-        trace_id: str | None = None,
-    ) -> tuple[dict, list]:
-        signals = strategy.generate_signals(df)
+        trace_id: str | None = None,        ) -> tuple[dict, list] | None:
+        # FUTURE LEAKAGE GUARD: Pass a deep copy WITHOUT the time column.
+        # This prevents strategies from using absolute timestamps to infer
+        # their position in the data sequence (which would enable lookahead).
+        # The time column is re-added below after signal generation.
+        _backtest_df = df.drop(columns=["time"], errors="ignore").copy()
+        signals = strategy.generate_signals(_backtest_df)
 
         if not isinstance(signals, pd.Series):
             raise TypeError(
@@ -810,10 +945,11 @@ class BacktestRunner(BaseAgent):
 
         entry_count = int((signals == 1).sum())
         exit_count = int((signals == -1).sum())
+        total_signals = int((signals != 0).sum())
 
-        if entry_count == 0:
+        if total_signals == 0:
             logger.warning(
-                f"Strategy produced 0 entry signals — marking as no_signal_strategy"
+                f"Strategy produced 0 signals — marking as no_signal_strategy"
             )
             await self.timescale.update_strategy_status(
                 strategy_id,
@@ -848,11 +984,20 @@ class BacktestRunner(BaseAgent):
         df["signal"] = signals
 
         # =====================================================
-        # STATE MACHINE TRADE EXTRACTION
-        # FLAT (0) → ENTRY (+1) → LONG (1) → EXIT (-1) → FLAT (0)
         # =====================================================
+        # STATE MACHINE TRADE EXTRACTION
+        # FLAT (0) → LONG (+1) or SHORT (-1)
+        # Signal conventions:
+        #   1  = enter long OR exit short
+        #   -1 = enter short OR exit long
+        # Also checks stop-loss/take-profit on each bar while in position.
+        # =====================================================
+        # Extract SL/TP from strategy instance (default: disabled)
+        sl_pct = getattr(strategy, "stop_loss_pct", 0.0)
+        tp_pct = getattr(strategy, "take_profit_pct", 0.0)
+
         trades = []
-        pos = 0  # 0 = flat, 1 = long
+        pos = 0  # -1 = short, 0 = flat, 1 = long
         entry_price = 0.0
         entry_time = None
         entry_bar = 0
@@ -865,15 +1010,37 @@ class BacktestRunner(BaseAgent):
 
             if pos == 0:
                 if sig == 1:
+                    # Enter long
                     pos = 1
                     entry_price = float(df["close"].iloc[i])
                     entry_time = df["time"].iloc[i]
                     entry_bar = i
+                elif sig == -1:
+                    # Enter short
+                    pos = -1
+                    entry_price = float(df["close"].iloc[i])
+                    entry_time = df["time"].iloc[i]
+                    entry_bar = i
             elif pos == 1:
-                if sig == -1:
-                    exit_price = float(df["close"].iloc[i])
+                # In a LONG position — exit on signal -1, stop-loss, or take-profit
+                current_price = float(df["close"].iloc[i])
+                _sl_triggered = (
+                    sl_pct > 0 and current_price <= entry_price * (1.0 - sl_pct)
+                )
+                _tp_triggered = (
+                    tp_pct > 0 and current_price >= entry_price * (1.0 + tp_pct)
+                )
+                _exit_signal = sig == -1
+
+                if _exit_signal or _sl_triggered or _tp_triggered:
+                    exit_price = current_price
                     pnl = exit_price - entry_price
                     pnl_pct = pnl / entry_price if entry_price != 0 else 0.0
+                    _exit_reason = (
+                        "stop_loss" if _sl_triggered else
+                        "take_profit" if _tp_triggered else
+                        "signal"
+                    )
                     trades.append(
                         {
                             "entry_time": entry_time,
@@ -884,7 +1051,45 @@ class BacktestRunner(BaseAgent):
                             "pnl": round(pnl, 8),
                             "pnl_pct": round(pnl_pct, 8),
                             "bars_held": i - entry_bar,
-                            "exit_reason": "signal",
+                            "exit_reason": _exit_reason,
+                        }
+                    )
+                    pos = 0
+                    closed_positions_count += 1
+            elif pos == -1:
+                # In a SHORT position — exit on signal 1, stop-loss, or take-profit
+                current_price = float(df["close"].iloc[i])
+                # SL for short: price rises above entry * (1 + sl%)
+                _sl_triggered = (
+                    sl_pct > 0 and current_price >= entry_price * (1.0 + sl_pct)
+                )
+                # TP for short: price drops below entry * (1 - tp%)
+                _tp_triggered = (
+                    tp_pct > 0 and current_price <= entry_price * (1.0 - tp_pct)
+                )
+                _exit_signal = sig == 1
+
+                if _exit_signal or _sl_triggered or _tp_triggered:
+                    exit_price = current_price
+                    # Short PnL = entry_price - exit_price (profitable when price falls)
+                    pnl = entry_price - exit_price
+                    pnl_pct = pnl / entry_price if entry_price != 0 else 0.0
+                    _exit_reason = (
+                        "stop_loss" if _sl_triggered else
+                        "take_profit" if _tp_triggered else
+                        "signal"
+                    )
+                    trades.append(
+                        {
+                            "entry_time": entry_time,
+                            "exit_time": df["time"].iloc[i],
+                            "entry_price": round(entry_price, 8),
+                            "exit_price": round(exit_price, 8),
+                            "side": "short",
+                            "pnl": round(pnl, 8),
+                            "pnl_pct": round(pnl_pct, 8),
+                            "bars_held": i - entry_bar,
+                            "exit_reason": _exit_reason,
                         }
                     )
                     pos = 0
@@ -920,7 +1125,7 @@ class BacktestRunner(BaseAgent):
         train_end = int(n * 0.6)
         test_end = int(n * 0.8)
 
-        def calc_metrics_institutional(sub_df, dyn_mult=None):
+        def calc_metrics_institutional(sub_df, dyn_mult=None, pos_size=None):
             if len(sub_df) == 0:
                 return (0.0, 0.0, 0.0, 0.0, 0.0, 0, 1.0)
 
@@ -945,9 +1150,11 @@ class BacktestRunner(BaseAgent):
                 0.0,
             )
 
+            # Use per-bar position size if provided, fall back to fixed
+            _pos_size = pos_size if pos_size is not None else self.position_size
             sub_df["strategy_return"] = (
-                sub_df["position"] * sub_df["market_return"] * self.position_size
-            ) - (sub_df["trade_cost"] * self.position_size)
+                sub_df["position"] * sub_df["market_return"] * _pos_size
+            ) - (sub_df["trade_cost"] * _pos_size)
 
             sub_df["cum_return"] = (1 + sub_df["strategy_return"]).cumprod()
 
@@ -987,8 +1194,10 @@ class BacktestRunner(BaseAgent):
             # Cap extreme Sharpe values from sparse signals
             sharpe_ratio = max(min(sharpe_ratio, 10.0), -10.0)
 
-            roll_max = sub_df["cum_return"].cummax()
-            drawdown = sub_df["cum_return"] / roll_max - 1
+            # SAFETY: Cap cum_return at 0 before computing drawdown to prevent below-100% values
+            _cum_safe = sub_df["cum_return"].clip(lower=0)
+            roll_max = _cum_safe.cummax()
+            drawdown = _cum_safe / roll_max - 1
             max_drawdown = drawdown.min()
 
             winning_periods = sub_df[sub_df["strategy_return"] > 0]
@@ -1103,16 +1312,24 @@ class BacktestRunner(BaseAgent):
         dyn_mult = self._compute_dynamic_slippage(df)
         df["_dyn_slippage_mult"] = dyn_mult
 
+        # Volatility-adjusted position sizing (per-bar)
+        pos_size_arr = self._compute_vol_adjusted_position_size(df, self.position_size)
+        df["_pos_size"] = pos_size_arr
+
         train_mult = dyn_mult[:train_end]
         test_mult = dyn_mult[train_end:test_end]
         holdout_mult = dyn_mult[test_end:]
+
+        train_pos_size = pos_size_arr[:train_end]
+        test_pos_size = pos_size_arr[train_end:test_end]
+        holdout_pos_size = pos_size_arr[test_end:]
 
         if is_short_window(df):
             sw_train = compute_short_window_metrics(
                 train_df,
                 train_df["position"],
                 train_df["market_return"],
-                self.position_size,
+                train_pos_size,
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
@@ -1122,7 +1339,7 @@ class BacktestRunner(BaseAgent):
                 test_df,
                 test_df["position"],
                 test_df["market_return"],
-                self.position_size,
+                test_pos_size,
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
@@ -1132,7 +1349,7 @@ class BacktestRunner(BaseAgent):
                 holdout_df,
                 holdout_df["position"],
                 holdout_df["market_return"],
-                self.position_size,
+                holdout_pos_size,
                 self.commission_pct,
                 self.slippage_pct,
                 self.spread_cost_pct,
@@ -1167,12 +1384,13 @@ class BacktestRunner(BaseAgent):
             holdout_sharpe = (
                 per_trade_sharpe if per_trade_sharpe != 0.0 else per_bar_sharpe
             )
-            # Use same since trades aren't split by train/test/holdout windows
-            train_sharpe = holdout_sharpe
-            test_sharpe = holdout_sharpe
+            # Window-specific per-bar Sharpe for overfit detection
+            train_sharpe = sw_train.get("sharpe_ratio", 0.0)
+            test_sharpe = sw_test.get("sharpe_ratio", 0.0)
 
             logger.info(
-                f"Sharpe: per_bar={per_bar_sharpe:.4f} per_trade={per_trade_sharpe:.4f} "
+                f"Sharpe: train_per_bar={train_sharpe:.4f} test_per_bar={test_sharpe:.4f} "
+                f"holdout_per_trade={holdout_sharpe:.4f} "
                 f"(from {len(all_trade_returns)} trade returns, {len(trades)} closed trades)"
             )
 
@@ -1206,14 +1424,14 @@ class BacktestRunner(BaseAgent):
                 "trade_returns": all_trade_returns,
                 "regime_score": float(regime_score),
             }
-            return results, trades
+            return results, trades, signals
 
         # INSTITUTIONAL MODE — full annualized Sharpe (requires >20k bars)
         _, _, train_sharpe, _, _, _, _, _, _ = calc_metrics_institutional(
-            train_df, train_mult
+            train_df, train_mult, train_pos_size
         )
         _, _, test_sharpe, _, _, _, _, _, _ = calc_metrics_institutional(
-            test_df, test_mult
+            test_df, test_mult, test_pos_size
         )
 
         (
@@ -1226,19 +1444,21 @@ class BacktestRunner(BaseAgent):
             h_profit_factor,
             h_sortino,
             h_expectancy,
-        ) = calc_metrics_institutional(holdout_df, holdout_mult)
+        ) = calc_metrics_institutional(holdout_df, holdout_mult, holdout_pos_size)
 
         calmar_ratio = h_cagr / abs(h_max_drawdown) if h_max_drawdown < -0.0001 else 0.0
 
         regime_score = self._compute_regime_score(df, signals)
 
-        # Composite Fitness Engine (Phase 28A)
+        # Composite Fitness Engine (fixed normalization)
         # Blends Sharpe, Sortino, Calmar, Win Rate, and Expectancy
+        # Expectancy is per-bar decimal; normalize so 0.1%/bar = 0.5 pts (capped at 5.0)
+        _norm_expectancy = min(h_expectancy * 500, 5.0)
         composite_fitness_score = (
             (holdout_sharpe * 0.3)
             + (h_sortino * 0.3)
             + (calmar_ratio * 0.2)
-            + (h_expectancy * 1000 * 0.1)
+            + (_norm_expectancy * 0.1)
             + (h_win_rate * 0.1)
         )
 
@@ -1267,7 +1487,7 @@ class BacktestRunner(BaseAgent):
             "cost_burden": 0.0,
             "avg_return_per_trade": 0.0,
             "regime_score": float(regime_score),
-        }, trades
+        }, trades, signals
 
 
 async def main():

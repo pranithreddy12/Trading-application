@@ -28,28 +28,30 @@ class ValidatorAgent(BaseAgent):
     PROD_RULES = {
         "min_sharpe": 1.0,
         "max_drawdown": -25.0,
-        "min_trades": 30,
+        "min_trades": 50,
         "min_win_rate": 0.45,
         "min_profit_factor": 1.2,
+        "max_drawdown_absolute": -100.0,  # HARD GATE: No drawdown below -100%
         "overfit_ratio": 0.5,
     }
 
-    # Phase 30: Relaxed dev/staging thresholds for maximum trade density
+    # Dev/staging thresholds (hardened - no invalid metrics)
     DEV_RULES = {
-        "min_sharpe": -0.5,  # allow negative Sharpe (exploratory organisms)
-        "max_drawdown": -95.0,  # very lenient drawdown limit
-        "min_trades": 2,  # lowered from 5
-        "min_win_rate": 0.10,  # lowered from 0.25
-        "min_profit_factor": 0.30,  # lowered from 0.75
-        "overfit_ratio": 0.0,
+        "min_sharpe": 0.5,  # minimum Sharpe of 0.5 required (was 0.0!)
+        "max_drawdown": -50.0,  # -50% max drawdown
+        "min_trades": 20,  # minimum 20 trades for statistical significance (was 3!)
+        "min_win_rate": 0.20,  # 20% win rate minimum
+        "min_profit_factor": 0.60,  # 0.6 PF minimum
+        "max_drawdown_absolute": -100.0,  # HARD GATE: No drawdown below -100%
+        "overfit_ratio": 0.3,  # holdout must be >= 30% of train Sharpe
     }
 
-    # Phase 30: Relaxed structural minimums to increase trade density and exploratory throughput
+    # Structural minimums (balanced for dev throughput while ensuring signal)
     STRUCTURAL_RULES = {
-        "min_entry_count": 2,
-        "min_total_trades": 2,
-        "max_entry_pct": 0.60,  # relaxed from 50% to allow more trade exploration
-        "max_exit_pct": 0.95,  # unchanged
+        "min_entry_count": 5,
+        "min_total_trades": 5,
+        "max_entry_pct": 0.50,  # max 50% of bars have entries
+        "max_exit_pct": 0.90,  # max 90% of bars have exits
     }
 
     # Scout Intelligence Cache for dynamic adjustments
@@ -102,12 +104,19 @@ class ValidatorAgent(BaseAgent):
 
         return self._scout_adjustment
 
-    # Cost Governance Rules (NEW) — applied based on trade frequency
-    # These enforce economic viability, not just statistical viability
+    # Cost Governance Rules — applied based on trade frequency
+    # These enforce economic viability, not just statistical viability.
+    # In dev/staging, cost info is logged but does NOT block validation.
     @property
-    def COST_GOVERNANCE_ENABLED(self) -> bool:
+    def COST_GOVERNANCE_BLOCKS(self) -> bool:
+        """Only block bad economics in production."""
         env = getattr(settings, "environment", "dev")
         return env not in ("dev", "staging")
+
+    @property
+    def COST_GOVERNANCE_ENABLED(self) -> bool:
+        """Always compute cost governance metrics for logging."""
+        return True
 
     @property
     def RULES(self):
@@ -201,7 +210,7 @@ class ValidatorAgent(BaseAgent):
                     scored_passed = False
                     failed_tests.append(f"scout_strict: adjusted_score {adjusted_score:.1f} < 50")
 
-            status = self._assign_tier(score, scored_passed)
+            status = self._assign_tier(score, scored_passed, result)
             notes = self._build_notes(result, score, grade, status, failed_tests)
 
             # Persist validation metrics into strategy parameters via update (as validation_notes)
@@ -296,11 +305,11 @@ class ValidatorAgent(BaseAgent):
 
         sr = self.STRUCTURAL_RULES.copy()
         
-        # Phase 29: Relax structural validation in dev/staging to prevent blocking viable strategies
+        # Dev/staging: slightly relaxed but still meaningful
         env = getattr(settings, "environment", "dev")
         if env in ("dev", "staging"):
-            sr["min_entry_count"] = 1
-            sr["min_total_trades"] = 1
+            sr["min_entry_count"] = 2
+            sr["min_total_trades"] = 3
 
         if entry_c < sr["min_entry_count"]:
             fails.append(f"Entry count {entry_c} < {sr['min_entry_count']}")
@@ -322,16 +331,24 @@ class ValidatorAgent(BaseAgent):
     # ------------------------------------------------------------------
     # PHASE 4 — TIER ASSIGNMENT
     # ------------------------------------------------------------------
-    def _assign_tier(self, score: float, passed: bool) -> str:
+    def _assign_tier(self, score: float, passed: bool, result: dict | None = None) -> str:
         # New Day-4 status buckets
         if not passed:
             return "failed_validation"
 
         env = getattr(settings, "environment", "dev")
+        
+        # HARD GATE: Trades < 50 cannot become validated (Phase 8 requirement)
+        total_trades = 0
+        if result:
+            total_trades = int(self._safe(self._extract(result, "total_trades"), 0))
+        
         if env in ("dev", "staging"):
             if score >= 60:
-                return "elite"
+                return "elite" if total_trades >= 50 else "validated"
             if score >= 35:
+                if total_trades < 50:
+                    return "research_candidate"  # Cannot be validated with <50 trades
                 return "validated"
             if score >= 25:
                 return "research_candidate"
@@ -340,8 +357,10 @@ class ValidatorAgent(BaseAgent):
             return "failed_validation"
 
         if score >= 90:
-            return "elite"
+            return "elite" if total_trades >= 50 else "validated"
         if score >= 70:
+            if total_trades < 50:
+                return "research_candidate"
             return "validated"
         if score >= 50:
             return "research_candidate"
@@ -468,19 +487,29 @@ class ValidatorAgent(BaseAgent):
         asset_class = result.get("asset_class", "crypto")
 
         if eval_mode == "short_window":
+            # HARD NULL CHECKS: Reject if profit_factor or expectancy is null
+            _raw_pf = self._extract(result, "profit_factor")
+            if _raw_pf is None:
+                failed.append("profit_factor IS NULL")
+            _raw_expectancy = self._extract(result, "expectancy")
+            if _raw_expectancy is None:
+                failed.append("expectancy IS NULL")
             composite = self._safe(self._extract(result, "composite_score"))
             env = getattr(settings, "environment", "dev")
             
-            # Phase 30: Further relaxed thresholds to increase trade density
-            composite_threshold = 10.0 if env in ("dev", "staging") else 20.0
-            min_trades = 1 if env in ("dev", "staging") else 2
-            min_pf = 0.05 if env in ("dev", "staging") else 0.30
-            min_wr = 0.05 if env in ("dev", "staging") else 0.15
+            # Dev/staging thresholds (meaningful, not generous)
+            composite_threshold = 30.0 if env in ("dev", "staging") else 20.0
+            min_trades = 3 if env in ("dev", "staging") else 3
+            min_pf = 0.60 if env in ("dev", "staging") else 0.50
+            min_wr = 0.25 if env in ("dev", "staging") else 0.20
             
             if composite < composite_threshold:
                 failed.append(f"composite_score {composite:.1f} < {composite_threshold}")
+            # HARD GATE: Drawdown below -100% is mathematically impossible
             if drawdown < -80.0:
                 failed.append(f"drawdown {drawdown:.1f}% < -80%")
+            if drawdown < -100.0:
+                failed.append(f"drawdown_impossible: {drawdown:.1f}% < -100%")
             if trades < min_trades:
                 failed.append(f"trades {trades} < {min_trades}")
             if win_rate < min_wr:
@@ -489,8 +518,9 @@ class ValidatorAgent(BaseAgent):
                 failed.append(f"profit_factor {pf:.2f} < {min_pf}")
             
             # ─────────────────────────────────────────────────────────
-            # COST GOVERNANCE GATE (NEW)
+            # COST GOVERNANCE GATE
             # ─────────────────────────────────────────────────────────
+            cost_alerts = []
             if self.COST_GOVERNANCE_ENABLED and trades >= 3:
                 try:
                     # Get cost governance thresholds for this frequency
@@ -501,29 +531,36 @@ class ValidatorAgent(BaseAgent):
                     # Check if edge survives costs
                     min_edge_bps = thresholds["min_edge_per_trade_bps"]
                     if edge_per_trade_bps < min_edge_bps:
-                        failed.append(
-                            f"cost_trap: edge {edge_per_trade_bps:.1f} bps < "
-                            f"min {min_edge_bps:.1f} bps for {trades} trades"
-                        )
+                        msg = f"cost_trap: edge {edge_per_trade_bps:.1f} bps < min {min_edge_bps:.1f} bps for {trades} trades"
+                        if self.COST_GOVERNANCE_BLOCKS:
+                            failed.append(msg)
+                        else:
+                            cost_alerts.append(msg)
                     
                     # Check win rate threshold
                     min_wr = thresholds["min_win_rate"]
                     if win_rate < min_wr:
-                        failed.append(
-                            f"cost_fragile: win_rate {win_rate:.2f} < "
-                            f"min {min_wr:.2f} for {trades} trades"
-                        )
+                        msg = f"cost_fragile: win_rate {win_rate:.2f} < min {min_wr:.2f} for {trades} trades"
+                        if self.COST_GOVERNANCE_BLOCKS:
+                            failed.append(msg)
+                        else:
+                            cost_alerts.append(msg)
                     
                     # Check profit factor threshold
                     min_pf = thresholds["min_profit_factor"]
                     if pf < min_pf:
-                        failed.append(
-                            f"cost_margin: profit_factor {pf:.2f} < "
-                            f"min {min_pf:.2f} for {trades} trades"
-                        )
+                        msg = f"cost_margin: profit_factor {pf:.2f} < min {min_pf:.2f} for {trades} trades"
+                        if self.COST_GOVERNANCE_BLOCKS:
+                            failed.append(msg)
+                        else:
+                            cost_alerts.append(msg)
                         
                 except Exception as e:
                     logger.warning(f"Cost governance check failed: {e}")
+            
+            # Log cost alerts in dev even if they don't block
+            if cost_alerts:
+                logger.info(f"Cost governance alerts (informational in dev): {'; '.join(cost_alerts)}")
             
             return len(failed) == 0, failed
 
@@ -544,8 +581,9 @@ class ValidatorAgent(BaseAgent):
             failed.append(f"profit_factor {pf:.2f} < {self.RULES['min_profit_factor']}")
         
         # ─────────────────────────────────────────────────────────
-        # COST GOVERNANCE GATE FOR INSTITUTIONAL (NEW)
+        # COST GOVERNANCE GATE FOR INSTITUTIONAL
         # ─────────────────────────────────────────────────────────
+        cost_alerts_inst = []
         if self.COST_GOVERNANCE_ENABLED and trades >= 30:
             try:
                 thresholds = get_cost_governance_thresholds(trades, asset_class)
@@ -553,12 +591,16 @@ class ValidatorAgent(BaseAgent):
                 
                 min_edge_bps = thresholds["min_edge_per_trade_bps"]
                 if edge_per_trade_bps < min_edge_bps:
-                    failed.append(
-                        f"cost_trap: edge {edge_per_trade_bps:.1f} bps < "
-                        f"min {min_edge_bps:.1f} bps for {trades} trades"
-                    )
+                    msg = f"cost_trap: edge {edge_per_trade_bps:.1f} bps < min {min_edge_bps:.1f} bps for {trades} trades"
+                    if self.COST_GOVERNANCE_BLOCKS:
+                        failed.append(msg)
+                    else:
+                        cost_alerts_inst.append(msg)
             except Exception as e:
                 logger.warning(f"Cost governance check failed (institutional): {e}")
+        
+        if cost_alerts_inst:
+            logger.info(f"Cost governance alerts (informational in dev): {'; '.join(cost_alerts_inst)}")
 
         # Overfitting guard
         ratio = self.RULES["overfit_ratio"]

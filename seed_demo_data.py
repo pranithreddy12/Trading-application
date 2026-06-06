@@ -145,7 +145,7 @@ def execute(data):
     entry_price = 100.0
     exit_price = 111.0
     qty = 10
-    realized_pnl = qty * (exit_price - entry_price)
+    realized_pnl = qty * (exit_price - entry_price) if side == "sell" else qty * (entry_price - exit_price)
 
     # Buy leg
     await conn.execute("""

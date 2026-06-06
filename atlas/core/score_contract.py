@@ -5,14 +5,16 @@ This contract normalizes scoring logic across the entire ATLAS ecosystem (Valida
 It resolves schema drift by strictly mapping physical backtest result fields to a unified 'institutional_score'.
 
 Phase 11 Extension — Advanced Validation & Pattern Intelligence Scoring:
+NOTE: These fields are NOW populated by BacktestRunner._run_advanced_validation()
+      after each backtest completes (wired June 2026).
 
 New weighted score inputs (optional, additive):
-- walk_forward_score      — temporal robustness from Walk-Forward Analyzer
-- monte_carlo_survival    — survival rate from Monte Carlo Simulator
-- robustness_score        — overfitting resistance from Overfitting Detector
-- regime_survival_score   — regime count from Regime Validator
-- cost_survival_score     — cost stress survival from Cost Stress Tester
-- feature_quality_score   — feature ranking quality from Feature Importance Engine
+- walk_forward_score      — temporal robustness from Walk-Forward Analyzer (NOW WIRED)
+- monte_carlo_survival    — survival rate from Monte Carlo Simulator (NOW WIRED)
+- robustness_score        — overfitting resistance from Overfitting Detector (NOW WIRED)
+- regime_survival_score   — regime count from Regime Validator (NOW WIRED)
+- cost_survival_score     — cost stress survival from Cost Stress Tester (not yet wired)
+- feature_quality_score   — feature ranking quality from Feature Importance Engine (not yet wired)
 
 Final scoring formula:
   composite = base_score × regime_adjustment
@@ -70,6 +72,24 @@ def compute_institutional_score(results: dict) -> float:
       - Regime_score of 0 (no trades) has no effect
     """
     if not results:
+        return 0.0
+
+    # HARD SANITY GATE: Insufficient trades = zero score
+    total_trades = int(results.get("total_trades", 0) or 0)
+    if total_trades < 20:
+        return 0.0  # Inadequate sample size for statistical significance
+
+    # HARD SANITY GATE: Invalid or missing Sharpe = zero score
+    sharpe = results.get("sharpe_ratio", results.get("sharpe", results.get("holdout_sharpe", 0.0)))
+    if sharpe is None or sharpe == 0.0 or (isinstance(sharpe, float) and (sharpe != sharpe)):
+        return 0.0
+    
+    # HARD SANITY GATE: Missing profit_factor or expectancy = zero score
+    pf = results.get("profit_factor")
+    if pf is None or (isinstance(pf, float) and (pf != pf)):
+        return 0.0
+    expectancy = results.get("expectancy")
+    if expectancy is None or (isinstance(expectancy, float) and (expectancy != expectancy)):
         return 0.0
 
     # If the system has migrated to explicitly passing 'institutional_score'

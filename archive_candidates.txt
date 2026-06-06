@@ -1,0 +1,75 @@
+# ARCHIVE_ONLY candidates — Move to archive/ instead of deleting
+# Generated: June 1, 2026
+# These files are referenced by scripts but are generated outputs, not runtime code
+
+# === Soak/Analysis Results ===
+atlas/phase25_soak_results.json
+atlas/phase26_ab_test_results.json
+atlas/post_soak_analysis_results.json
+post_soak_analysis_results.json
+atlas/scripts/phase25_soak_results.json
+
+# === Generated Governance Reports ===
+atlas/governance/governance_analytics_4a4d0fdf04214ccd90559123d22c15da.json
+atlas/governance/governance_analytics_7f7bd9f93b0640a99791dab11187d41a.json
+atlas/governance/governance_analytics_c742339145c749a6832c00c59c42fcae.json
+atlas/governance/governance_audit_report_4a4d0fdf04214ccd90559123d22c15da.json
+
+# === Validation Outputs ===
+atlas/scripts/day5/validation_output.json
+scripts/day5/live_validation_output.json
+
+# === atlas/ duplicate files ===
+atlas/requirements.txt
+
+# === Root-level duplicated phase reports (also in docs/reports/) ===
+docs/PHASE33_ADAPTIVE_INTELLIGENCE_REPORT.md
+docs/PHASE33_ECONOMIC_PERFORMANCE_REPORT.md
+docs/PHASE33_EVOLUTIONARY_PERFORMANCE_REPORT.md
+docs/PHASE33_FINAL_BENCHMARK_CERTIFICATION.md
+docs/PHASE33_PORTFOLIO_SURVIVABILITY_REPORT.md
+docs/PHASE33_REGIME_STRESS_REPORT.md
+docs/PHASE33_RUNTIME_STABILITY_REPORT.md
+docs/PHASE34_DASHBOARD_VISIBILITY_REPORT.md
+docs/PHASE34_DELIVERY_DOCUMENTATION_REPORT.md
+docs/PHASE34_END_TO_END_FLOW_REPORT.md
+docs/PHASE34_FINAL_DELIVERY_CERTIFICATION.md
+docs/PHASE34_REPO_CLEANUP_REPORT.md
+docs/PHASE34_SYSTEM_COVERAGE_REPORT.md
+
+# === Root-level phase reports ===
+PHASE35_PAPER_TRADING_REPORT.md
+PHASE36_ADVANCED_VALIDATION_REPORT.md
+PHASE36_EXECUTION_ACTIVATION_REPORT.md
+PHASE36_EXECUTION_REALISM_REPORT.md
+PHASE36_FULL_ECOSYSTEM_CERTIFICATION.md
+PHASE36_OBSERVABILITY_REPORT.md
+PHASE36_SCOUT_ECOSYSTEM_REPORT.md
+PHASE36_SPECIALIZATION_REPORT.md
+PHASE37_ADAPTIVE_CAPITAL_FLOW_REPORT.md
+PHASE37_CAPITAL_MIGRATION_REPORT.md
+PHASE37_LONG_HORIZON_CERTIFICATION.md
+PHASE37_MUTATION_DOMINANCE_REPORT.md
+PHASE37_MUTATION_RESPONSE_REPORT.md
+PHASE37_REGIME_PERTURBATION_REPORT.md
+PHASE37_SCOUT_DIVERGENCE_REPORT.md
+PHASE37_SCOUT_INTELLIGENCE_REPORT.md
+PHASE37_SHORT_INTELLIGENCE_CERTIFICATION.md
+PHASE37_SHORT_REGIME_ANALYSIS.md
+PHASE37_SPECIALIZATION_EVOLUTION_REPORT.md
+PHASE37_SURVIVAL_QUALITY_REPORT.md
+POST_SOAK_ANALYSIS_REPORT.md
+ATLAS_FINAL_DELIVERY_CERTIFICATION.md
+ATLAS_FINAL_EXECUTION_CERTIFICATION.md
+ATLAS_FINAL_FAILURE_LEDGER.md
+ATLAS_FINAL_OPERATIONAL_SCORECARD.md
+ATLAS_FINAL_PORTFOLIO_CERTIFICATION.md
+ATLAS_FINAL_REPLAY_CERTIFICATION.md
+ATLAS_FINAL_SCOUT_CERTIFICATION.md
+ATLAS_OPERATIONAL_VALIDATION_REPORT.md
+ATLAS_Pipeline_Demo_Guide_For_Shakir.md
+ATLAS_DATABASE_SAMPLE_DATA.md
+
+# === One-off fix/hotfix scripts (development artifacts) ===
+atlas/scripts/phase26_critical_fixes.py
+atlas/scripts/phase26_hotfix_agents.py

@@ -253,6 +253,24 @@ class CapitalAllocator(BaseAgent):
         # Step 6: Compute capital redistribution signals
         redistribution = self._compute_redistribution(final_weights, strategies)
 
+        # Re-normalize final_weights to ensure they sum to exactly 1.0.
+        # This is defense-in-depth: _apply_constraints normalizes, but
+        # regime adjustments and capped rounding can introduce drift.
+        raw_sum = sum(w["weight"] for w in final_weights)
+        if raw_sum > 1e-10 and abs(raw_sum - 1.0) > 0.01:
+            scale = 1.0 / raw_sum
+            for fw in final_weights:
+                fw["weight"] = round(fw["weight"] * scale, 4)
+            logger.info(
+                f"{self.name}: re-normalized final_weights by {scale:.6f}x "
+                f"(raw sum was {raw_sum:.4f})"
+            )
+
+        # Safety clamp: total_exposure must be 0.0-2.0 (0%-200%).
+        # If it exceeds this range, the normalization in _apply_constraints
+        # likely failed (e.g. division by near-zero total or empty strategy list).
+        safe_exposure = self._safe_total_exposure(sum(w["weight"] for w in final_weights))
+
         allocation_record = {
             "id": str(uuid.uuid4()),
             "computed_at": datetime.utcnow().isoformat(),
@@ -262,7 +280,7 @@ class CapitalAllocator(BaseAgent):
             "vol_target_weights": vol_weights,
             "risk_parity_weights": parity_weights,
             "final_allocations": final_weights,
-            "total_exposure": round(sum(w["weight"] for w in final_weights), 4),
+            "total_exposure": safe_exposure,
             "regime_applied": regime,
             "redistribution_signals": redistribution,
             "leverage_cap_applied": 1.0,
@@ -383,6 +401,10 @@ class CapitalAllocator(BaseAgent):
             po = portfolio_map.get(sid, 0)
 
             combined = kelly_blend * k + vol_blend * v + parity_blend * p + portfolio_blend * po
+            # Floor: if combined is 0 (all components zero),
+            # give a tiny baseline so normalization doesn't explode
+            if combined < 1e-8:
+                combined = 1e-6
             results.append({
                 "strategy_id": sid,
                 "strategy_name": s["name"],
@@ -440,10 +462,28 @@ class CapitalAllocator(BaseAgent):
             pass
 
         # Step 4: Normalize to sum to 1
+        # CRITICAL: If total is too small (< 1e-6), division w/total produces
+        # explosively large weights (e.g. 0.000001 -> 833103067% exposure bug).
+        # In this case, fall back to equal weighting across all strategies.
+        MIN_NORMALIZATION_TOTAL = 1e-6
         total = sum(capped.values())
-        if total > 0:
+        if total > MIN_NORMALIZATION_TOTAL:
             normalized = {sid: w / total for sid, w in capped.items()}
         else:
+            logger.warning(
+                f"{self.name}: normalization total too small ({total:.10f}) — "
+                f"falling back to equal weighting for {len(strategies)} strategies"
+            )
+            n = len(strategies)
+            normalized = {s["id"]: 1.0 / n for s in strategies}
+
+        # Sanity check: normalized weights MUST sum to ~1.0
+        norm_sum = sum(normalized.values())
+        if abs(norm_sum - 1.0) > 0.01:
+            logger.error(
+                f"{self.name}: normalization invariant violated — weights sum to {norm_sum:.4f} "
+                f"instead of 1.0. Forcing proportional fallback."
+            )
             n = len(strategies)
             normalized = {s["id"]: 1.0 / n for s in strategies}
 
@@ -526,6 +566,21 @@ class CapitalAllocator(BaseAgent):
             )
         except Exception as e:
             logger.warning(f"{self.name}: persist failed: {e}")
+
+    @staticmethod
+    def _safe_total_exposure(raw_exposure: float) -> float:
+        """
+        Clamp total_exposure to a sane range [0.0, 2.0] (0%-200%).
+        Logs a warning if the raw value is out of bounds, indicating
+        a possible normalization bug upstream.
+        """
+        if not (0.0 <= raw_exposure <= 2.0):
+            logger.warning(
+                f"CapitalAllocator: total_exposure out of bounds ({raw_exposure:.4f}) "
+                f"— normalization may have failed. Clamping to safe range."
+            )
+        clamped = max(0.0, min(2.0, raw_exposure))
+        return round(clamped, 4)
 
     async def _publish_allocations(self, allocation: dict) -> None:
         """Publish allocation update to Redis."""

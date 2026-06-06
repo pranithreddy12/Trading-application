@@ -435,11 +435,27 @@ class SimulatorAdapter(BrokerAdapter):
             "filled_avg_price": fill_price,
         }
         self._orders[order_id] = order
-        # Track simulated position
-        self._positions.append({
-            "symbol": symbol, "qty": qty, "side": side,
-            "avg_price": fill_price, "market_value": qty * fill_price,
-        })
+        # Track simulated position with netting
+        existing = next((p for p in self._positions if p["symbol"] == symbol), None)
+        if existing:
+            if existing["side"].lower() == side.lower():
+                # Increase
+                new_qty = existing["qty"] + qty
+                existing["avg_price"] = (existing["avg_price"] * existing["qty"] + fill_price * qty) / new_qty
+                existing["qty"] = new_qty
+                existing["market_value"] = new_qty * fill_price
+            else:
+                # Reduce/Close
+                if qty >= existing["qty"]:
+                    self._positions = [p for p in self._positions if p["symbol"] != symbol]
+                else:
+                    existing["qty"] -= qty
+                    existing["market_value"] = existing["qty"] * fill_price
+        else:
+            self._positions.append({
+                "symbol": symbol, "qty": qty, "side": side,
+                "avg_price": fill_price, "market_value": qty * fill_price,
+            })
         return order
 
     async def get_order_status(self, broker_order_id: str) -> dict:

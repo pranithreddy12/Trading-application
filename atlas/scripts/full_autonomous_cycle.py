@@ -46,10 +46,14 @@ from atlas.agents.l1_pattern.pattern_recognition_engine import PatternRecognitio
 from atlas.agents.l7_meta.feature_importance_engine import FeatureImportanceEngine
 from atlas.agents.l7_meta.drift_detection_engine import DriftDetectionEngine
 from atlas.agents.l7_meta.strategy_retirement_engine import StrategyRetirementEngine
-from atlas.agents.l6_portfolio.portfolio_intelligence_engine import PortfolioIntelligenceEngine
+from atlas.agents.l6_portfolio.portfolio_intelligence_engine import (
+    PortfolioIntelligenceEngine,
+)
 from atlas.agents.l6_portfolio.capital_allocator import CapitalAllocator
 from atlas.agents.l6_portfolio.ensemble_execution_engine import EnsembleExecutionEngine
-from atlas.agents.l6_portfolio.advanced_portfolio_optimizer import AdvancedPortfolioOptimizer
+from atlas.agents.l6_portfolio.advanced_portfolio_optimizer import (
+    AdvancedPortfolioOptimizer,
+)
 from atlas.agents.l5_execution.execution_realism_engine import ExecutionRealismEngine
 from atlas.agents.l4_risk.systemic_risk_engine import SystemicRiskEngine
 from atlas.agents.l4_risk.stress_test_engine import StressTestEngine
@@ -74,6 +78,7 @@ from atlas.agents.l7_meta.anti_poisoning_engine import AntiPoisoningEngine
 from atlas.agents.l7_meta.economic_attribution_engine import EconomicAttributionEngine
 from atlas.agents.l7_meta.economic_efficiency_engine import EconomicEfficiencyEngine
 from atlas.agents.l7_meta.entropy_governance_engine import EntropyGovernanceEngine
+from atlas.agents.l3_backtest.paper_strategy_runner import PaperStrategyRunner
 from atlas.config.settings import get_settings
 from atlas.core.event_lineage import EventLineageClient
 from atlas.data.storage.timescale_client import TimescaleClient
@@ -81,7 +86,9 @@ from atlas.scripts.soak.phase24_monitor import SoakMonitor
 
 
 def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
-    broker = SimulatorAdapter(default_price=100.0, fill_latency_ms=10, db_client=db_client)
+    broker = SimulatorAdapter(
+        default_price=100.0, fill_latency_ms=10, db_client=db_client
+    )
     risk = RiskController(redis_client, db_client)
     lineage = EventLineageClient(db_client)
 
@@ -135,9 +142,9 @@ def _build_agents(redis_client: Redis, db_client: TimescaleClient) -> list:
         HypothesisValidationEngine(redis_client, db_client),
         ScoutSynthesisEngine(redis_client, db_client),
         AntiPoisoningEngine(redis_client, db_client),
-        EconomicAttributionEngine(redis_client, db_client),
         EconomicEfficiencyEngine(redis_client, db_client),
         EntropyGovernanceEngine(redis_client, db_client),
+        PaperStrategyRunner(redis_client, db_client),
         # L2-L5: Core pipeline
 
         IdeatorAgentV2(0, 0.5, redis_client, db_client, mode="rich"),
@@ -166,7 +173,9 @@ async def _stop_agents(agents: list) -> None:
     )
     for agent, result in zip(reversed(agents), stop_results):
         if isinstance(result, Exception):
-            logger.warning(f"Agent stop failed — {getattr(agent, 'name', agent)}: {result}")
+            logger.warning(
+                f"Agent stop failed — {getattr(agent, 'name', agent)}: {result}"
+            )
 
 
 async def main() -> None:
@@ -204,7 +213,9 @@ async def main() -> None:
     try:
         await db_client.connect()
     except Exception as mig_error:
-        logger.warning(f"Migration attempt 1 failed: {mig_error} — retrying (may create remaining tables)")
+        logger.warning(
+            f"Migration attempt 1 failed: {mig_error} — retrying (may create remaining tables)"
+        )
         await db_client.close()
         db_client = TimescaleClient(settings.database_url)
         await db_client.connect()
@@ -215,6 +226,8 @@ async def main() -> None:
             logger.info(f"Seeded paper_trades from execution history: {seeded} rows")
     except Exception as e:
         logger.warning(f"paper_trades bootstrap sync failed: {e}")
+    # DASHBOARD AND CYCLE STARTUP ARE READ-ONLY — no trade seeding or backtest copying
+    # Real execution trades are produced by ExecutionGateway.save_paper_trade() only
     redis_client = Redis.from_url(settings.redis_url)
 
     agents = _build_agents(redis_client, db_client)
@@ -225,14 +238,16 @@ async def main() -> None:
         await monitor.start()
         logger.info("SoakMonitor started — capturing metrics every 300s")
     except Exception as e:
-        logger.error(f"SoakMonitor failed to start: {e} — continuing without monitoring")
+        logger.error(
+            f"SoakMonitor failed to start: {e} — continuing without monitoring"
+        )
         monitor = None
 
     logger.info(
         "Starting institutional cycle with L1 ingestion + Phases 13-18: "
         "ingest -> portfolio -> risk -> meta-learn -> scout -> execute -> govern -> monitor"
     )
-    
+
     # Pre-seed ingestion to ensure data is present for strategies
     logger.info("Pre-seeding market data from L1 ingestion agents...")
     for agent in agents:
@@ -244,7 +259,7 @@ async def main() -> None:
                 logger.info(f"Pre-seeded data for {agent.name}")
             except Exception as e:
                 logger.warning(f"Failed to pre-seed {agent.name}: {e}")
-                
+
     tasks = await _start_agents(agents)
 
     runtime_seconds = max(1, args.duration_minutes) * 60
@@ -258,16 +273,16 @@ async def main() -> None:
             elapsed = asyncio.get_event_loop().time() - start
 
             if elapsed >= runtime_seconds:
-                logger.info("Autonomous cycle duration reached; shutting down supervisor")
+                logger.info(
+                    "Autonomous cycle duration reached; shutting down supervisor"
+                )
                 break
 
             for i, task in enumerate(tasks):
                 if task.done() and i not in _reported:
                     agent = agents[i] if i < len(agents) else None
                     agent_name = (
-                        getattr(agent, "name", f"agent_{i}")
-                        if agent
-                        else f"task_{i}"
+                        getattr(agent, "name", f"agent_{i}") if agent else f"task_{i}"
                     )
 
                     exc = task.exception()
@@ -301,11 +316,17 @@ async def main() -> None:
                                     tasks[i] = agent._main_task
                                     _reported.discard(i)
                                     restart_succeeded = True
-                                    logger.info(f"Agent restarted successfully — {agent_name}")
+                                    logger.info(
+                                        f"Agent restarted successfully — {agent_name}"
+                                    )
                                 else:
-                                    logger.error(f"Agent restart failed (no new task) — {agent_name}")
+                                    logger.error(
+                                        f"Agent restart failed (no new task) — {agent_name}"
+                                    )
                             except Exception as restart_exc:
-                                logger.error(f"Agent restart raised exception — {agent_name}: {restart_exc}")
+                                logger.error(
+                                    f"Agent restart raised exception — {agent_name}: {restart_exc}"
+                                )
                             finally:
                                 # ALWAYS apply exponential backoff after any restart attempt
                                 # (success or failure) to prevent tight loops from fast-exiting agents.

@@ -8,7 +8,9 @@ Strategy → OrderTracker → Risk → KillSwitch → BrokerAdapter → Position
 
 import asyncio
 import random
+import uuid
 from typing import Optional
+from sqlalchemy.sql import text
 
 from loguru import logger
 from redis.asyncio import Redis
@@ -76,7 +78,12 @@ class ExecutionGateway(BaseAgent):
         self.positions = PositionManager(redis_client, db_client, broker)
         self.dead_letter = DeadLetterManager(redis_client, db_client)
         self.recovery = RecoveryManager(
-            redis_client, db_client, broker, self.tracker, self.positions, self.dead_letter
+            redis_client,
+            db_client,
+            broker,
+            self.tracker,
+            self.positions,
+            self.dead_letter,
         )
 
         self._recovery_complete = False
@@ -114,13 +121,17 @@ class ExecutionGateway(BaseAgent):
 
                     renewed = await self.tracker.renew_lease(order_key)
                     if not renewed:
-                        logger.warning(f"Lease lost for {order_key} — removing from active set")
+                        logger.warning(
+                            f"Lease lost for {order_key} — removing from active set"
+                        )
                         self._active_lease_order_keys.discard(order_key)
                         stale_count += 1
 
                 if stale_count > 0:
-                    logger.info(f"Lease maintenance: pruned {stale_count} stale entries, "
-                                f"{len(self._active_lease_order_keys)} active remaining")
+                    logger.info(
+                        f"Lease maintenance: pruned {stale_count} stale entries, "
+                        f"{len(self._active_lease_order_keys)} active remaining"
+                    )
 
                 await asyncio.sleep(self.LEASE_RENEWAL_INTERVAL)
             except Exception as e:
@@ -157,23 +168,32 @@ class ExecutionGateway(BaseAgent):
         recovery_ok = await self.recovery.run_startup_reconciliation()
         self._recovery_complete = recovery_ok
         if not recovery_ok:
-            logger.warning("Recovery reconciliation did not complete; execution remains locked.")
+            logger.warning(
+                "Recovery reconciliation did not complete; execution remains locked."
+            )
 
         # 1b. Start lease maintenance background task (distributed governance)
         self._lease_maintenance_task = self._track_background_task(
             asyncio.create_task(self._lease_maintenance())
         )
 
-        # 1c. Detect and recover lost orders from this instance
+        # 1c. Detect and recover lost orders from this instance (with timeout)
         try:
-            lost_orders = await self.tracker.get_lost_orders()
+            lost_orders = await asyncio.wait_for(
+                self.tracker.get_lost_orders(), timeout=30.0
+            )
             if lost_orders:
-                logger.warning(f"Found {len(lost_orders)} lost orders from this instance — marking for recovery")
+                logger.warning(
+                    f"Found {len(lost_orders)} lost orders from this instance — marking for recovery"
+                )
                 for lost_key in lost_orders:
                     await self.tracker.transition(
-                        lost_key, OrderState.DEAD_LETTER,
-                        error_message="lease_expired_failover_recovery"
+                        lost_key,
+                        OrderState.DEAD_LETTER,
+                        error_message="lease_expired_failover_recovery",
                     )
+        except asyncio.TimeoutError:
+            logger.warning("Lost order recovery timed out (30s) — skipping")
         except Exception as e:
             logger.warning(f"Lost order recovery failed: {e}")
 
@@ -191,24 +211,68 @@ class ExecutionGateway(BaseAgent):
                     await asyncio.sleep(1)
                     continue
 
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                logger.error(
+                    f"GATEWAY_LOOP_ITERATION | status={self.status} recovery={self._recovery_complete}"
+                )
+
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=1.0
+                )
+                if message:
+                    logger.error(
+                        f"SIGNAL_RECEIVED_RAW | type={message.get('type')} "
+                        f"channel={message.get('channel')} "
+                        f"data_type={type(message.get('data')).__name__} "
+                        f"data_len={len(message.get('data', b''))} "
+                        f"data_preview={message.get('data', b'')[:80]}"
+                    )
                 if message and message["type"] == "message":
                     try:
                         import json
+
                         data = json.loads(message["data"])
+                        logger.error(
+                            f"SIGNAL_DECODED | type={data.get('type')} "
+                            f"strategy_id={data.get('strategy_id')} "
+                            f"symbol={data.get('symbol')} "
+                            f"side={data.get('side')} "
+                            f"keys={list(data.keys())}"
+                        )
                         # Expecting {"type": "validated", "strategy_id": "...", ...}
-                        if data.get("type") == "validated":
-                            # Fetch full strategy from DB to ensure we have all specs
+                        if (
+                            data.get("type") == "validated"
+                            or data.get("type") == "signal"
+                        ):
                             strategy_id = data.get("strategy_id")
+                            logger.debug(
+                                f"{self.name}: Received {data.get('type')} signal for {strategy_id}"
+                            )
                             if strategy_id:
-                                # We need a method to get strategy by ID, or pass the dict directly
-                                # Assuming data contains enough info, but ideally fetch from DB.
-                                # Let's fetch it:
                                 strategy = await self._get_strategy_by_id(strategy_id)
                                 if strategy:
-                                    # Create a task so we don't block the pubsub loop
+                                    # BRIDGE FIX: Merge dynamic signal data into strategy spec for execution
+                                    strategy["symbol"] = data.get("symbol")
+                                    strategy["side"] = data.get("side")
+                                    strategy["qty"] = data.get("qty")
+                                    strategy["feature_snapshot_id"] = data.get(
+                                        "feature_snapshot_id"
+                                    )
+
+                                    logger.error(
+                                        f"SIGNAL_EXECUTE_START | strategy_id={strategy_id} "
+                                        f"symbol={strategy.get('symbol')} "
+                                        f"side={strategy.get('side')} "
+                                        f"qty={strategy.get('qty')}"
+                                    )
+                                    logger.info(
+                                        f"{self.name}: Triggering execution for {strategy_id} on {strategy.get('symbol')} ({strategy.get('side')})"
+                                    )
                                     self._track_background_task(
                                         asyncio.create_task(self.execute(strategy))
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"{self.name}: Strategy {strategy_id} not found in DB"
                                     )
                     except Exception as e:
                         logger.error(f"Error processing signal: {e}")
@@ -221,6 +285,7 @@ class ExecutionGateway(BaseAgent):
 
     async def _get_strategy_by_id(self, strategy_id: str) -> Optional[dict]:
         from sqlalchemy.sql import text
+
         async with self.db.engine.connect() as conn:
             result = await conn.execute(
                 text("""
@@ -231,7 +296,7 @@ class ExecutionGateway(BaseAgent):
                     ORDER BY b.start_date DESC NULLS LAST
                     LIMIT 1
                 """),
-                {"id": strategy_id}
+                {"id": strategy_id},
             )
             row = result.fetchone()
             if row:
@@ -239,53 +304,78 @@ class ExecutionGateway(BaseAgent):
         return None
 
     def _build_trade_request(self, strategy: dict) -> dict:
-        """Extract needed trade params from strategy spec."""
+        """Extract needed trade params from strategy spec, allowing overrides."""
+        # BRIDGE FIX: Support explicit overrides in strategy dict (from dynamic signals)
+        symbol = strategy.get("symbol")
+        side = strategy.get("side")
+        qty = strategy.get("qty")
+
         params = strategy.get("parameters", {})
         if isinstance(params, str):
             import json
+
             try:
                 params = json.loads(params)
             except Exception:
                 params = {}
 
-        asset_class = params.get("asset_class", "equity").lower()
-        
-        # DEMO FIX: Pick random symbol from watchlist if not specified
-        settings = get_settings()
-        if asset_class == "crypto":
-            pairs = settings.crypto_pairs.split(",") if hasattr(settings, "crypto_pairs") else ["BTCUSDT", "ETHUSDT"]
-            default_symbol = random.choice(pairs)
-        else:
-            watchlist = settings.watchlist.split(",") if hasattr(settings, "watchlist") else ["SPY", "QQQ", "AAPL", "NVDA", "MSFT"]
-            default_symbol = random.choice(watchlist)
-
-        symbol = params.get("symbol", default_symbol)
-        
-        side = params.get("side", "buy").lower()
-        # Default fallback sizing if not specified
-        qty = params.get("qty")
+        if not symbol:
+            symbol = params.get("symbol")
+        if not side:
+            side = params.get("side", "buy").lower()
         if qty is None:
-            # We would typically ask risk controller or position manager for size,
-            # but we fall back to a dummy fixed size if needed
+            qty = params.get("qty")
+
+        asset_class = params.get("asset_class", "equity").lower()
+
+        # Fallback to random symbol from watchlist ONLY if still not specified
+        if not symbol:
+            settings = get_settings()
+            if asset_class == "crypto":
+                pairs = (
+                    settings.crypto_pairs.split(",")
+                    if hasattr(settings, "crypto_pairs")
+                    else ["BTCUSDT", "ETHUSDT"]
+                )
+                symbol = random.choice(pairs)
+            else:
+                watchlist = (
+                    settings.watchlist.split(",")
+                    if hasattr(settings, "watchlist")
+                    else ["SPY", "QQQ", "AAPL", "NVDA", "MSFT"]
+                )
+                symbol = random.choice(watchlist)
+
+        # Default fallback sizing if not specified
+        if qty is None:
             qty = 10.0 if asset_class == "equity" else 0.05
 
         return {
             "strategy_id": str(strategy.get("id")),
             "symbol": symbol,
-            "side": side,
+            "side": side.lower(),
             "qty": float(qty),
-            "price": 0.0, # Filled at market for now
+            "price": 0.0,  # Filled at market for now
         }
 
     async def execute(self, strategy: dict) -> bool:
+        logger.debug("entering execute()")
         """
         The constitutional execution path.
         Returns True if fully executed (or already executed), False otherwise.
         """
-        order_key = self.tracker.make_order_key(strategy)
+        # Ensure we have a fresh copy of strategy with all overrides for building trade request
+        trade_req = self._build_trade_request(strategy)
+        sid = trade_req["strategy_id"]
+        sym = trade_req["symbol"]
+        side = trade_req["side"]
+        qty = trade_req["qty"]
+
+        # Use a unique key that includes side to avoid collision between entry and exit
+        order_key = f"order:{sid}:{sym}:{side}:{uuid.uuid4().hex[:8]}"
         client_order_id = self.tracker.make_client_order_id(order_key)
-        
-        # 1. Idempotency gate
+
+        # 1. Idempotency gate (simplified for signals)
         if await self.tracker.is_processed(order_key):
             logger.info(f"Order {order_key} already processed.")
             return True
@@ -295,18 +385,33 @@ class ExecutionGateway(BaseAgent):
             logger.warning(f"Order {order_key} currently locked by another process.")
             return False
 
-        trade_req = self._build_trade_request(strategy)
-        sid = trade_req["strategy_id"]
-        sym = trade_req["symbol"]
-        side = trade_req["side"]
-        qty = trade_req["qty"]
+        # 1.5 Duplicate Activation Protection (BRIDGE FIX: Allow Closing Trades)
+        async with self.db.engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT side, qty FROM positions WHERE strategy_id = :sid AND symbol = :sym LIMIT 1"
+                ),
+                {"sid": sid, "sym": sym},
+            )
+            existing_pos = res.fetchone()
 
-        # 1.5 Duplicate Activation Protection (Priority 3)
-        if await self.positions.active_position_exists(sid, sym):
-            logger.info(f"Duplicate activation protection: Position already exists for {sid} on {sym}. Blocking new order.")
-            await self.tracker.transition(order_key, OrderState.CANCELLED, metadata={"reason": "duplicate_position_protection"})
-            await self.tracker.release_lock(order_key)
-            return False
+        if existing_pos:
+            existing_side = existing_pos[0].lower()
+            if existing_side == side.lower():
+                logger.info(
+                    f"Duplicate activation protection: {side} position already exists for {sid} on {sym}. Blocking duplicate entry."
+                )
+                await self.tracker.transition(
+                    order_key,
+                    OrderState.CANCELLED,
+                    metadata={"reason": "duplicate_position_protection"},
+                )
+                await self.tracker.release_lock(order_key)
+                return False
+            else:
+                logger.info(
+                    f"Allowing closing trade: Strategy {sid} has {existing_side} on {sym}, executing {side} to close."
+                )
 
         try:
             halted = await self.db.fetchval(
@@ -328,9 +433,14 @@ class ExecutionGateway(BaseAgent):
 
         # Track base state
         await self.tracker.transition(
-            order_key, OrderState.SIGNAL_RECEIVED, 
-            strategy_id=sid, symbol=sym, side=side, quantity=qty,
-            client_order_id=client_order_id, broker_name=self.broker.broker_name
+            order_key,
+            OrderState.SIGNAL_RECEIVED,
+            strategy_id=sid,
+            symbol=sym,
+            side=side,
+            quantity=qty,
+            client_order_id=client_order_id,
+            broker_name=self.broker.broker_name,
         )
 
         # Track lease for distributed governance
@@ -344,7 +454,9 @@ class ExecutionGateway(BaseAgent):
             if self._scout_liquidity_regime == "dangerous":
                 # Reduce size instead of blocking entirely
                 qty = qty * 0.25
-                logger.warning(f"Execution permitted with 75% size reduction: dangerous liquidity regime")
+                logger.warning(
+                    f"Execution permitted with 75% size reduction: dangerous liquidity regime"
+                )
             elif self._scout_liquidity_regime == "thin":
                 qty = qty * 0.5
 
@@ -357,7 +469,9 @@ class ExecutionGateway(BaseAgent):
                 )
                 ranked_ids = {r["strategy_id"] for r in ranked}
                 if sid in ranked_ids:
-                    logger.info(f"{self.name}: Strategy {sid} matches current regime ({regime})")
+                    logger.info(
+                        f"{self.name}: Strategy {sid} matches current regime ({regime})"
+                    )
                 else:
                     logger.info(
                         f"{self.name}: Strategy {sid} NOT in top-3 for regime "
@@ -374,8 +488,9 @@ class ExecutionGateway(BaseAgent):
             # 3. Risk approval
             if not await self.risk.approve_trade(trade_req):
                 await self.tracker.transition(
-                    order_key, OrderState.RISK_REJECTED,
-                    metadata={"reason": "risk_limits_breached"}
+                    order_key,
+                    OrderState.RISK_REJECTED,
+                    metadata={"reason": "risk_limits_breached"},
                 )
                 return False
 
@@ -387,63 +502,89 @@ class ExecutionGateway(BaseAgent):
                 # Exhausted retries
                 fail_reason = "submission_exhausted"
                 await self.tracker.transition(
-                    order_key, OrderState.DEAD_LETTER,
-                    error_message=fail_reason
+                    order_key, OrderState.DEAD_LETTER, error_message=fail_reason
                 )
                 await self.dead_letter.record(
-                    order_key, sid, sym, side, qty,
-                    fail_reason, OrderState.RISK_APPROVED.value,
+                    order_key,
+                    sid,
+                    sym,
+                    side,
+                    qty,
+                    fail_reason,
+                    OrderState.RISK_APPROVED.value,
                     client_order_id=client_order_id,
-                    severity="high"
+                    severity="high",
                 )
                 return False
 
             broker_oid = order["id"]
             await self.tracker.transition(
-                order_key, OrderState.BROKER_ACK,
-                broker_order_id=broker_oid
+                order_key, OrderState.BROKER_ACK, broker_order_id=broker_oid
             )
 
             # 5. Poll fill with partial awareness
             fill = await self._poll_fill(broker_oid)
-            
+
             if fill.get("status") in ("filled", "closed"):
                 fill_price = fill.get("filled_avg_price", 0.0)
                 filled_qty = fill.get("filled_qty", qty)
 
                 await self.tracker.transition(
-                    order_key, OrderState.FILLED,
-                    broker_order_id=broker_oid, price=fill_price, quantity=filled_qty,
-                    metadata=fill
+                    order_key,
+                    OrderState.FILLED,
+                    broker_order_id=broker_oid,
+                    price=fill_price,
+                    quantity=filled_qty,
+                    metadata=fill,
                 )
-                
+
                 # 5.5 Resolve Lineage early to pass it to downstream records
                 trace_id = await self.lineage.get_trace_by_strategy(sid)
                 feature_snapshot_id = strategy.get("feature_snapshot_id")
 
                 # 6. Open position
-                await self.positions.open_position(
-                    strategy_id=sid, symbol=sym, side=side,
-                    qty=filled_qty, avg_price=fill_price,
+                logger.debug("before open_position()")
+                realized_pnl = await self.positions.open_position(
+                    strategy_id=sid,
+                    symbol=sym,
+                    side=side,
+                    qty=filled_qty,
+                    avg_price=fill_price,
                     broker_name=self.broker.broker_name,
                     trace_id=trace_id,
-                    feature_snapshot_id=feature_snapshot_id 
+                    feature_snapshot_id=feature_snapshot_id,
                 )
+                logger.debug("after open_position()")
 
                 # 7. Write to paper_trades for historical backwards compat
-                # Opening trade: Realized PnL is always 0.0
-                await self.db.save_paper_trade({
-                    "strategy_id": sid,
-                    "symbol": sym,
-                    "side": side,
-                    "quantity": filled_qty,
-                    "price": fill_price,
-                    "fill_price": fill_price,
-                    "status": "filled",
-                    "pnl": 0.0,
-                    "trace_id": trace_id,
-                    "feature_snapshot_id": feature_snapshot_id
-                })
+                # Realized PnL is non-zero only for closing trades
+                logger.error(
+                    f"PERSISTING TRADE | "
+                    f"strategy={sid} "
+                    f"symbol={sym} "
+                    f"side={side} "
+                    f"qty={filled_qty} "
+                    f"price={fill_price} "
+                    f"pnl={realized_pnl} "
+                    f"trace_id={trace_id}"
+                )
+                await self.db.save_paper_trade(
+                    {
+                        "strategy_id": sid,
+                        "symbol": sym,
+                        "side": side,
+                        "quantity": filled_qty,
+                        "price": fill_price,
+                        "fill_price": fill_price,
+                        "status": "filled",
+                        "pnl": realized_pnl,
+                        "trace_id": trace_id,
+                        "feature_snapshot_id": feature_snapshot_id,
+                        "origin": "execution",
+                    }
+                )
+
+                logger.error(f"PAPER_TRADE INSERT COMPLETE | sid={sid}")
 
                 # 8. Record Lineage Event
                 if trace_id:
@@ -453,40 +594,64 @@ class ExecutionGateway(BaseAgent):
                         status="completed",
                         actor="ExecutionGateway",
                         strategy_id=sid,
-                        metadata={"broker": self.broker.broker_name, "qty": filled_qty, "price": fill_price}
+                        metadata={
+                            "broker": self.broker.broker_name,
+                            "qty": filled_qty,
+                            "price": fill_price,
+                        },
                     )
 
                 return True
 
             elif fill.get("status") == "partially_filled":
                 await self.tracker.transition(
-                    order_key, OrderState.PARTIALLY_FILLED,
+                    order_key,
+                    OrderState.PARTIALLY_FILLED,
                     broker_order_id=broker_oid,
-                    metadata=fill
+                    metadata=fill,
                 )
                 # Need human/system resolution
                 await self.dead_letter.record(
-                    order_key, sid, sym, side, qty,
-                    "partial_fill_abandoned", OrderState.PARTIALLY_FILLED.value,
-                    broker_order_id=broker_oid, client_order_id=client_order_id,
-                    severity="medium", metadata=fill
+                    order_key,
+                    sid,
+                    sym,
+                    side,
+                    qty,
+                    "partial_fill_abandoned",
+                    OrderState.PARTIALLY_FILLED.value,
+                    broker_order_id=broker_oid,
+                    client_order_id=client_order_id,
+                    severity="medium",
+                    metadata=fill,
                 )
                 return False
-                
+
             else:
                 # Handle timeout → cancel
-                await self.tracker.transition(order_key, OrderState.FILL_TIMEOUT, broker_order_id=broker_oid)
+                await self.tracker.transition(
+                    order_key, OrderState.FILL_TIMEOUT, broker_order_id=broker_oid
+                )
                 cancel_res = await self.broker.cancel_order(broker_oid)
-                await self.tracker.transition(order_key, OrderState.CANCELLED, broker_order_id=broker_oid)
+                await self.tracker.transition(
+                    order_key, OrderState.CANCELLED, broker_order_id=broker_oid
+                )
                 return False
 
         except Exception as e:
             logger.error(f"Execution gateway error for {order_key}: {e}")
-            await self.tracker.transition(order_key, OrderState.DEAD_LETTER, error_message=str(e))
+            await self.tracker.transition(
+                order_key, OrderState.DEAD_LETTER, error_message=str(e)
+            )
             await self.dead_letter.record(
-                order_key, sid, sym, side, qty,
-                f"unhandled_exception: {e}", OrderState.DEAD_LETTER.value,
-                client_order_id=client_order_id, severity="critical"
+                order_key,
+                sid,
+                sym,
+                side,
+                qty,
+                f"unhandled_exception: {e}",
+                OrderState.DEAD_LETTER.value,
+                client_order_id=client_order_id,
+                severity="critical",
             )
             return False
         finally:
@@ -500,8 +665,10 @@ class ExecutionGateway(BaseAgent):
         """
         try:
             from sqlalchemy import text
+
             async with self.db.engine.connect() as conn:
-                r = await conn.execute(text("""
+                r = await conn.execute(
+                    text("""
                     SELECT
                         symbol,
                         value AS rsi_14
@@ -509,7 +676,8 @@ class ExecutionGateway(BaseAgent):
                     WHERE feature_name = 'rsi_14'
                     ORDER BY time DESC
                     LIMIT 1
-                """))
+                """)
+                )
                 row = r.fetchone()
                 if row is not None:
                     rsi = float(row.rsi_14)
@@ -518,21 +686,25 @@ class ExecutionGateway(BaseAgent):
                     elif rsi > 65:
                         return "overbought"
                 # Try volatility_regime for finer-grained detection
-                r2 = await conn.execute(text("""
+                r2 = await conn.execute(
+                    text("""
                     SELECT value AS vol_regime
                     FROM features
                     WHERE feature_name = 'volatility_regime'
                     ORDER BY time DESC
                     LIMIT 1
-                """))
+                """)
+                )
                 vol_row = r2.fetchone()
-                r3 = await conn.execute(text("""
+                r3 = await conn.execute(
+                    text("""
                     SELECT value AS ema_spread
                     FROM features
                     WHERE feature_name = 'ema_spread_pct'
                     ORDER BY time DESC
                     LIMIT 1
-                """))
+                """)
+                )
                 ema_row = r3.fetchone()
 
                 vol = float(vol_row.vol_regime) if vol_row is not None else 1.0
@@ -549,6 +721,7 @@ class ExecutionGateway(BaseAgent):
     async def _refresh_scout_intelligence(self):
         """Refresh scout intelligence cache for dynamic adaptation."""
         import time
+
         now = time.time()
         if now - self._scout_cache_time < self._scout_cache_ttl:
             return
@@ -564,7 +737,7 @@ class ExecutionGateway(BaseAgent):
 
     def _scout_adjusted_qty(self, base_qty: float) -> float:
         """Reduce order size in stressed market conditions.
-        
+
         Phase 26D: Also reduces sizing based on entropy when available.
         Phase 30: Less aggressive reduction to maintain trade density.
         """
@@ -577,7 +750,11 @@ class ExecutionGateway(BaseAgent):
             adjusted *= 0.50  # Previously 0.25
         # Phase 26D: Entropy-based sizing reduction (fetched from risk controller's state)
         try:
-            entropy_val = self.risk._scout_entropy if hasattr(self.risk, '_scout_entropy') else 0.0
+            entropy_val = (
+                self.risk._scout_entropy
+                if hasattr(self.risk, "_scout_entropy")
+                else 0.0
+            )
             if entropy_val > 0.7:
                 adjusted *= 0.75  # Previously 0.5
             elif entropy_val > 0.5:
@@ -597,20 +774,19 @@ class ExecutionGateway(BaseAgent):
             return base_slippage * 5.0
         return base_slippage
 
-    async def _submit_with_retry(self, client_order_id: str, symbol: str, side: str, qty: float, max_retries=3) -> Optional[dict]:
+    async def _submit_with_retry(
+        self, client_order_id: str, symbol: str, side: str, qty: float, max_retries=3
+    ) -> Optional[dict]:
         for attempt in range(max_retries):
             try:
                 # By passing client_order_id, the broker handles idempotency on its end
                 order = await self.broker.submit_order(
-                    client_order_id=client_order_id,
-                    symbol=symbol,
-                    side=side,
-                    qty=qty
+                    client_order_id=client_order_id, symbol=symbol, side=side, qty=qty
                 )
                 return order
             except Exception as e:
-                logger.warning(f"Submit attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(2 ** attempt)
+                logger.warning(f"Submit attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(2**attempt)
         return None
 
     async def _poll_fill(self, broker_order_id: str, timeout: int = 30) -> dict:
@@ -618,7 +794,13 @@ class ExecutionGateway(BaseAgent):
         while asyncio.get_event_loop().time() - start < timeout:
             try:
                 status = await self.broker.get_order_status(broker_order_id)
-                if status.get("status") in ("filled", "partially_filled", "closed", "cancelled", "rejected"):
+                if status.get("status") in (
+                    "filled",
+                    "partially_filled",
+                    "closed",
+                    "cancelled",
+                    "rejected",
+                ):
                     return status
             except Exception as e:
                 logger.debug(f"Poll error: {e}")

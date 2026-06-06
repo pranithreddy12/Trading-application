@@ -299,6 +299,15 @@ class FeatureAgent(BaseAgent):
 
             await self.insert_features(symbol, feature_df)
 
+            # BRIDGE FIX: Publish update signal to Redis so PaperStrategyRunner acts
+            if self._redis:
+                import json
+                await self._redis.publish("strategy_signals", json.dumps({
+                    "symbol": symbol,
+                    "feature_count": len(generated_keys),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }))
+
             logger.info(
                 f"✓ Features updated for {symbol}: {len(feature_df)} bars @ "
                 f"{feature_df['timestamp'].iloc[-1]}"

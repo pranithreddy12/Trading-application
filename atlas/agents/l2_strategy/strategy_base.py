@@ -9,6 +9,10 @@ class StrategyBase(ABC):
     @abstractmethod
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         """
+        WARNING: The dataframe passed here has the 'time' column removed.
+        This is an anti-leakage measure. Do NOT rely on index position
+        to infer future data — only use column-based computations.
+
         Returns pd.Series with values:
         1  = buy signal
         -1 = sell signal  

@@ -48,6 +48,10 @@ class EventLineageClient:
 
     def __init__(self, db):
         self.db = db
+        from atlas.core.event_store import EventStore
+        from atlas.core.audit_ledger import AuditLedger
+        self.event_store = EventStore(db)
+        self.audit_ledger = AuditLedger(db)
 
     async def create_trace(
         self,
@@ -103,6 +107,36 @@ class EventLineageClient:
                     "metadata": safe_json_dumps(metadata or {}),
                 }),
             )
+            
+        # Phase 13 Integration: Write to Immutable Event Store
+        try:
+            await self.event_store.append_event(
+                event_type=f"{stage}_{status}",
+                trace_id=trace_id,
+                data={"status": status, "stage": stage, **(metadata or {})},
+                aggregate_id=str(strategy_id) if strategy_id else trace_id,
+                aggregate_type="strategy",
+                parent_event_id=parent_event_id,
+                metadata=metadata
+            )
+        except Exception as e:
+            logger.warning(f"Failed to append to event_store: {e}")
+
+        # Phase 13 Integration: Write to Audit Ledger
+        try:
+            await self.audit_ledger.record(
+                event_type=f"lifecycle_{stage}",
+                actor=actor or "system",
+                action=status,
+                trace_id=trace_id,
+                resource_type="strategy",
+                resource_id=str(strategy_id) if strategy_id else trace_id,
+                details=metadata,
+                severity="info" if status == "completed" else "warning"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to record to audit_ledger: {e}")
+            
         return event_id
 
     async def get_lineage(self, trace_id: str) -> list[LifecycleEvent]:

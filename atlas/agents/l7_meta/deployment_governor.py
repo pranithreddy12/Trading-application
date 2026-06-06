@@ -72,6 +72,7 @@ class DeploymentGovernor(BaseAgent):
 
     async def _sleep(self, seconds: int):
         import asyncio
+
         await asyncio.sleep(seconds)
 
     async def propose_deployment(
@@ -100,7 +101,9 @@ class DeploymentGovernor(BaseAgent):
                 "metadata": json.dumps(metadata or {}),
             },
         )
-        logger.info(f"{self.name}: Deployment proposed {dep_id} for {strategy_id} ({mode})")
+        logger.info(
+            f"{self.name}: Deployment proposed {dep_id} for {strategy_id} ({mode})"
+        )
         return dep_id
 
     async def approve_deployment(
@@ -122,10 +125,14 @@ class DeploymentGovernor(BaseAgent):
                 {"id": deployment_id, "approved_by": approved_by},
             )
             if r.rowcount == 0:
-                logger.warning(f"{self.name}: Cannot approve {deployment_id} — not pending")
+                logger.warning(
+                    f"{self.name}: Cannot approve {deployment_id} — not pending"
+                )
                 return False
 
-        logger.info(f"{self.name}: Deployment {deployment_id} approved by {approved_by}")
+        logger.info(
+            f"{self.name}: Deployment {deployment_id} approved by {approved_by}"
+        )
         return True
 
     async def execute_deployment(self, deployment_id: str) -> bool:
@@ -150,7 +157,9 @@ class DeploymentGovernor(BaseAgent):
         passed = await self._validate_deployment_gate(strategy_id, mode=target_mode)
         if not passed:
             await self._update_status(deployment_id, "rejected")
-            logger.warning(f"{self.name}: Deployment {deployment_id} rejected — validation failed")
+            logger.warning(
+                f"{self.name}: Deployment {deployment_id} rejected — validation failed"
+            )
             return False
 
         # Execute
@@ -167,10 +176,12 @@ class DeploymentGovernor(BaseAgent):
                         "type": "validated",
                         "strategy_id": strategy_id,
                         "deployment_id": deployment_id,
-                        "mode": target_mode
-                    }
+                        "mode": target_mode,
+                    },
                 )
-                logger.info(f"{self.name}: Published activation signal for {strategy_id}")
+                logger.info(
+                    f"{self.name}: Published activation signal for {strategy_id}"
+                )
             except Exception as e:
                 logger.warning(f"{self.name}: Failed to publish activation signal: {e}")
 
@@ -246,20 +257,24 @@ class DeploymentGovernor(BaseAgent):
             rows = r.fetchall()
 
         if not rows:
-            logger.debug(f"{self.name}: No elite/validated strategies available for promotion")
+            logger.debug(
+                f"{self.name}: No elite/validated strategies available for promotion"
+            )
             return
 
         # Convert to dicts for tournament selection
         candidates = []
         for row in rows:
-            candidates.append({
-                "id": str(row[0]),
-                "name": str(row[1] or ""),
-                "composite_fitness": float(row[2] or 0),
-                "short_window_score": float(row[3] or 0),
-                "sharpe": float(row[4] or 0),
-                "win_rate": float(row[5] or 0),
-            })
+            candidates.append(
+                {
+                    "id": str(row[0]),
+                    "name": str(row[1] or ""),
+                    "composite_fitness": float(row[2] or 0),
+                    "short_window_score": float(row[3] or 0),
+                    "sharpe": float(row[4] or 0),
+                    "win_rate": float(row[5] or 0),
+                }
+            )
 
         # Tournament select 1 candidate for promotion (promotes diversity)
         selected = tournament_select_unique(
@@ -316,53 +331,53 @@ class DeploymentGovernor(BaseAgent):
                 )
                 await self.rollback_deployment(dep_id)
 
-    async def _validate_deployment_gate(self, strategy_id: str, mode: str = "paper") -> bool:
+    # Deployment gate thresholds by mode
+    # Progressive: paper (lenient) → shadow → partial_live → live (strict)
+    GATE_THRESHOLDS = {
+        "paper": {
+            "min_walk_forward_score": 0.0,
+            "max_overfit_probability": 1.0,
+            "min_regime_survival": 0.0,
+            "min_monte_carlo_survival": 0.0,
+        },
+        "shadow": {
+            "min_walk_forward_score": 30.0,
+            "max_overfit_probability": 0.7,
+            "min_regime_survival": 0.2,  # At least 1/5 regimes
+            "min_monte_carlo_survival": 0.3,  # 30% sims positive
+        },
+        "partial_live": {
+            "min_walk_forward_score": 40.0,
+            "max_overfit_probability": 0.6,
+            "min_regime_survival": 0.4,  # At least 2/5 regimes
+            "min_monte_carlo_survival": 0.5,  # 50% sims positive
+        },
+        "live": {
+            "min_walk_forward_score": 50.0,
+            "max_overfit_probability": 0.5,
+            "min_regime_survival": 0.6,  # At least 3/5 regimes
+            "min_monte_carlo_survival": 0.7,  # 70% sims positive
+        },
+    }
+
+    async def _validate_deployment_gate(
+        self, strategy_id: str, mode: str = "paper"
+    ) -> bool:
         """
-        Validate that a strategy is fit for deployment.
+        Validate that a strategy is fit for deployment using real data from
+        the advanced validation tables (walk_forward_analysis, overfitting_analysis,
+        regime_validation, monte_carlo_analysis).
 
-        For paper mode, the gate is lenient — if analysis tables don't exist
-        or have no data, the deployment is allowed to proceed (paper trading
-        is inherently low-risk).
+        These tables are now populated by BacktestRunner._run_advanced_validation()
+        after each backtest completes, so data SHOULD exist for every backtested strategy.
+
+        Returns False (rejects deployment) if:
+        - Required analysis tables are missing
+        - No analysis data exists for this strategy
+        - Any metric fails its mode-specific threshold
         """
-        # Paper mode: lenient gate — allow through if data unavailable
-        if mode == "paper":
-            try:
-                async with self.db.engine.connect() as conn:
-                    r = await conn.execute(
-                        text("""
-                            SELECT
-                                (SELECT walk_forward_score
-                                 FROM walk_forward_analysis
-                                 WHERE strategy_id = :sid
-                                 ORDER BY analyzed_at DESC LIMIT 1) AS wf_score,
-                                (SELECT overfit_probability
-                                 FROM overfitting_analysis
-                                 WHERE strategy_id = :sid
-                                 ORDER BY analyzed_at DESC LIMIT 1) AS overfit_prob
-                        """),
-                        {"sid": strategy_id},
-                    )
-                    row = r.fetchone()
-            except ProgrammingError:
-                # Tables may not exist — allow paper deployment
-                return True
+        thresholds = self.GATE_THRESHOLDS.get(mode, self.GATE_THRESHOLDS["paper"])
 
-            if not row:
-                return True
-
-            wf_score = row[0]  # May be None if no data
-            overfit_prob = row[1]  # May be None if no data
-
-            # No analysis data available — allow paper deployment
-            if wf_score is None or overfit_prob is None:
-                return True
-
-            wf_score = float(wf_score)
-            overfit_prob = float(overfit_prob)
-            # Paper mode: only flag extreme issues
-            return wf_score >= 20.0 and overfit_prob < 0.8
-
-        # Non-paper modes: strict gate
         try:
             async with self.db.engine.connect() as conn:
                 r = await conn.execute(
@@ -373,35 +388,119 @@ class DeploymentGovernor(BaseAgent):
                                 FROM walk_forward_analysis
                                 WHERE strategy_id = :sid
                                 ORDER BY analyzed_at DESC LIMIT 1
-                            ), 0) as wf_score,
+                            ), 0) AS wf_score,
                             COALESCE((
                                 SELECT overfit_probability
                                 FROM overfitting_analysis
                                 WHERE strategy_id = :sid
                                 ORDER BY analyzed_at DESC LIMIT 1
-                            ), 1.0) as overfit_prob
+                            ), 1.0) AS overfit_prob,
+                            COALESCE((
+                                SELECT regime_survival_score
+                                FROM regime_validation
+                                WHERE strategy_id = :sid
+                                ORDER BY validated_at DESC LIMIT 1
+                            ), 0.0) AS regime_survival,
+                            COALESCE((
+                                SELECT monte_carlo_survival_score
+                                FROM monte_carlo_analysis
+                                WHERE strategy_id = :sid
+                                ORDER BY simulated_at DESC LIMIT 1
+                            ), 0.0) AS mc_survival
                     """),
                     {"sid": strategy_id},
                 )
                 row = r.fetchone()
-        except Exception:
-            return False  # Tables must exist for non-paper deployment
+        except ProgrammingError:
+            logger.warning(
+                f"{self.name}: Analysis tables missing — rejecting {mode} deployment for {strategy_id}"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"{self.name}: Gate query failed for {strategy_id}: {e}")
+            return False
 
         if not row:
+            logger.warning(
+                f"{self.name}: No analysis data for {strategy_id} — rejecting {mode} deployment"
+            )
             return False
 
         wf_score = float(row[0] or 0)
         overfit_prob = float(row[1] or 1.0)
-        return wf_score >= 50.0 and overfit_prob < 0.5
+        regime_survival = float(row[2] or 0.0)
+        mc_survival = float(row[3] or 0.0)
+
+        # Check all thresholds
+        failures = []
+        if wf_score < thresholds["min_walk_forward_score"]:
+            failures.append(
+                f"walk_forward {wf_score:.2f} < {thresholds['min_walk_forward_score']}"
+            )
+        if overfit_prob >= thresholds["max_overfit_probability"]:
+            failures.append(
+                f"overfit_prob {overfit_prob:.2f} >= {thresholds['max_overfit_probability']}"
+            )
+        if regime_survival < thresholds["min_regime_survival"]:
+            failures.append(
+                f"regime_survival {regime_survival:.2f} < {thresholds['min_regime_survival']}"
+            )
+        if mc_survival < thresholds["min_monte_carlo_survival"]:
+            failures.append(
+                f"mc_survival {mc_survival:.2f} < {thresholds['min_monte_carlo_survival']}"
+            )
+
+        if failures:
+            logger.info(
+                f"{self.name}: {mode} deployment gate FAILED for {strategy_id}: "
+                f"{' | '.join(failures)}"
+            )
+            return False
+
+        logger.info(
+            f"{self.name}: {mode} deployment gate PASSED for {strategy_id}: "
+            f"wf={wf_score:.2f} overfit={overfit_prob:.2f} "
+            f"regime={regime_survival:.2f} mc={mc_survival:.2f}"
+        )
+        return True
 
     async def _detect_regression(self, strategy_id: str) -> bool:
-        """Check if a strategy has regressed compared to backtest."""
+        """
+        Check if a strategy has regressed compared to backtest.
+
+        Uses multi-dimensional regression detection from the advanced
+        validation tables (walk_forward_analysis, overfitting_analysis,
+        regime_validation, monte_carlo_analysis). A strategy is flagged
+        as regressed if 2+ of 4 metrics signal degradation.
+        """
         async with self.db.engine.connect() as conn:
             r = await conn.execute(
                 text("""
-                    SELECT short_window_score FROM backtest_results
-                    WHERE strategy_id = :sid
-                    ORDER BY start_date DESC LIMIT 1
+                    SELECT
+                        COALESCE((
+                            SELECT walk_forward_score
+                            FROM walk_forward_analysis
+                            WHERE strategy_id = :sid
+                            ORDER BY analyzed_at DESC LIMIT 1
+                        ), 0) AS wf_score,
+                        COALESCE((
+                            SELECT overfit_probability
+                            FROM overfitting_analysis
+                            WHERE strategy_id = :sid
+                            ORDER BY analyzed_at DESC LIMIT 1
+                        ), 1.0) AS overfit_prob,
+                        COALESCE((
+                            SELECT regime_survival_score
+                            FROM regime_validation
+                            WHERE strategy_id = :sid
+                            ORDER BY validated_at DESC LIMIT 1
+                        ), 0.0) AS regime_survival,
+                        COALESCE((
+                            SELECT monte_carlo_survival_score
+                            FROM monte_carlo_analysis
+                            WHERE strategy_id = :sid
+                            ORDER BY simulated_at DESC LIMIT 1
+                        ), 0.0) AS mc_survival
                 """),
                 {"sid": strategy_id},
             )
@@ -409,8 +508,35 @@ class DeploymentGovernor(BaseAgent):
             if not row:
                 return False
 
-            score = float(row[0] or 0)
-            return score < 30.0  # Significant degradation
+            wf_score = float(row[0] or 0)
+            overfit_prob = float(row[1] or 1.0)
+            regime_survival = float(row[2] or 0.0)
+            mc_survival = float(row[3] or 0.0)
+
+            # Count regression signals across 4 dimensions
+            regression_signals = 0
+
+            if wf_score < 20.0:
+                regression_signals += 1
+            if overfit_prob > 0.6:
+                regression_signals += 1
+            if regime_survival < 0.2:
+                regression_signals += 1
+            if mc_survival < 0.3:
+                regression_signals += 1
+
+            # Flag if 2+ of 4 metrics indicate degradation
+            is_regressed = regression_signals >= 2
+
+            if is_regressed:
+                logger.warning(
+                    f"{self.name}: Regression detected for {strategy_id}: "
+                    f"wf={wf_score:.2f} overfit={overfit_prob:.2f} "
+                    f"regime={regime_survival:.2f} mc={mc_survival:.2f} "
+                    f"signals={regression_signals}/4"
+                )
+
+            return is_regressed
 
     async def _update_status(self, deployment_id: str, status: str):
         await self.db._execute_insert(
@@ -457,16 +583,26 @@ class DeploymentGovernor(BaseAgent):
             )
             recent = []
             for row in r.fetchall():
-                recent.append({
-                    "id": str(row[0]),
-                    "strategy_id": str(row[1]),
-                    "mode": str(row[2]),
-                    "status": str(row[3]),
-                    "proposed_by": str(row[4]),
-                    "approved_by": str(row[5]) if row[5] else None,
-                    "proposed_at": row[6].isoformat() if row[6] and hasattr(row[6], "isoformat") else str(row[6]) if row[6] else None,
-                    "activated_at": row[7].isoformat() if row[7] and hasattr(row[7], "isoformat") else str(row[7]) if row[7] else None,
-                })
+                recent.append(
+                    {
+                        "id": str(row[0]),
+                        "strategy_id": str(row[1]),
+                        "mode": str(row[2]),
+                        "status": str(row[3]),
+                        "proposed_by": str(row[4]),
+                        "approved_by": str(row[5]) if row[5] else None,
+                        "proposed_at": row[6].isoformat()
+                        if row[6] and hasattr(row[6], "isoformat")
+                        else str(row[6])
+                        if row[6]
+                        else None,
+                        "activated_at": row[7].isoformat()
+                        if row[7] and hasattr(row[7], "isoformat")
+                        else str(row[7])
+                        if row[7]
+                        else None,
+                    }
+                )
 
             return {
                 "by_status": by_status,

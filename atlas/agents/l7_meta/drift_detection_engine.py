@@ -50,24 +50,87 @@ class DriftDetectionEngine(BaseAgent):
         self.STRATEGY_DRIFT_THRESHOLD = 0.20      # 20% score deviation
         self.PERFORMANCE_DECAY_THRESHOLD = 0.10   # 10% per week
 
+        # Event channels to listen to for real-time triggering
+        self.EVENT_CHANNELS = [
+            "feature_importance_updates",
+            "drift_trigger",
+        ]
+
         # Rolling window for drift computation
         self.LOOKBACK_DAYS = 30
         self.BASELINE_PERIODS = 3  # number of prior periods to compare
 
+        # Event-driven trigger tracking
+        self._trigger_requested = False
+        self._trigger_reason = ""
+        self._pubsub = None
+
     async def run(self):
         logger.info(f"{self.name}: starting drift detection (every {self.run_interval}s)")
+        # Set up pub/sub for event-driven triggers
+        pubsub = None
+        if self._redis:
+            try:
+                pubsub = self._redis.pubsub()
+                await pubsub.subscribe(*self.EVENT_CHANNELS)
+                self._pubsub = pubsub
+                logger.info(f"{self.name}: subscribed to {self.EVENT_CHANNELS}")
+            except Exception as e:
+                logger.warning(f"{self.name}: pub/sub subscribe failed: {e}")
+
+        import time as _time
+        last_full_run = _time.monotonic() - self.run_interval - 1  # trigger immediate first run
+
         while self.status == "running":
             try:
-                drift_report = await self._compute_drift_report()
-                if drift_report:
-                    await self._persist_drift(drift_report)
-                    await self._publish_drift(drift_report)
-                    # Check for retirement candidates
-                    if drift_report.get("retirement_candidates"):
-                        await self._notify_retirement(drift_report["retirement_candidates"])
+                # Check for trigger events from pub/sub (non-blocking)
+                triggered = False
+                if pubsub:
+                    try:
+                        message = await pubsub.get_message(
+                            ignore_subscribe_messages=True, timeout=0.1
+                        )
+                        if message:
+                            channel = message.get("channel", b"").decode()
+                            logger.info(
+                                f"{self.name}: triggered by event on channel '{channel}'"
+                            )
+                            triggered = True
+                            self._trigger_reason = f"event:{channel}"
+                    except Exception as e:
+                        logger.debug(f"{self.name}: pub/sub read error: {e}")
+
+                # Also check for programmatic trigger requests
+                if self._trigger_requested:
+                    triggered = True
+                    self._trigger_requested = False
+
+                # Only run the full drift report if triggered OR interval elapsed
+                now = _time.monotonic()
+                if triggered or (now - last_full_run) >= self.run_interval:
+                    if triggered:
+                        logger.info(f"{self.name}: event-triggered drift check")
+                    last_full_run = now
+                    drift_report = await self._compute_drift_report()
+                    if drift_report:
+                        await self._persist_drift(drift_report)
+                        await self._publish_drift(drift_report)
+                        if drift_report.get("retirement_candidates"):
+                            await self._notify_retirement(
+                                drift_report["retirement_candidates"]
+                            )
             except Exception as e:
                 logger.error(f"{self.name}: drift analysis failed: {e}")
-            await asyncio.sleep(self.run_interval)
+
+            # Short sleep keeps pub/sub responsive without 180x DB load
+            await asyncio.sleep(1)
+
+        # Clean up pub/sub on stop
+        if pubsub:
+            try:
+                await pubsub.unsubscribe(*self.EVENT_CHANNELS)
+            except Exception:
+                pass
 
     async def _compute_drift_report(self) -> Optional[dict]:
         """Compute multi-dimensional drift analysis."""
@@ -107,6 +170,12 @@ class DriftDetectionEngine(BaseAgent):
             "retirement_candidates": retirement_candidates,
             "retrain_recommendations": retrain_recommendations,
             "n_strategies_monitored": len(strategy_drift.get("per_strategy", [])),
+            "data_status": {
+                "feature_drift": "ok" if feature_drift.get("n_features_analyzed", 0) > 0 else "insufficient_data",
+                "strategy_drift": "ok" if strategy_drift.get("n_strategies_analyzed", 0) > 0 else "insufficient_data",
+                "regime_drift": "ok" if "regime_shift_magnitude" in regime_drift else "insufficient_data",
+                "execution_drift": "ok" if "fill_degradation" in execution_drift else "insufficient_data",
+            },
         }
         return report
 
@@ -136,23 +205,44 @@ class DriftDetectionEngine(BaseAgent):
                     "computed_at": r[4],
                 })
 
-            # Detect decaying features
+            if not features:
+                return {"drift_detected": False, "drift_score": 0,
+                        "error": "no_features", "n_features_analyzed": 0}
+
+            # ---- Approach 1: Decay-based drift (preferred) ----
             decaying_features = [f for f in features if f["decay"] < (1.0 - self.FEATURE_DRIFT_THRESHOLD)]
+            avg_decay = float(np.mean([f["decay"] for f in features]))
+            decay_drift_score = 1.0 - avg_decay
+
+            # ---- Approach 2: Importance distribution drift (fallback) ----
+            # When decay_score == 1.0 for all features (insufficient temporal data),
+            # compute drift as coefficient of variation of importance scores.
+            # High CV = features are diverging (real signal), low CV = uniform.
+            all_decay_identical = all(abs(f["decay"] - 1.0) < 0.001 for f in features)
+            importance_drift_score = 0.0
+            if all_decay_identical and len(features) >= 3:
+                imp_scores = [f["importance"] for f in features if f["importance"] > 0]
+                if len(imp_scores) >= 3:
+                    mean_imp = float(np.mean(imp_scores))
+                    std_imp = float(np.std(imp_scores))
+                    cv = std_imp / mean_imp if mean_imp > 0 else 0
+                    # Normalize CV to [0, 1]: CV of 0.5 (50% variation) = drift 0.25
+                    importance_drift_score = min(1.0, cv * 0.5)
+
+            # Use decay drift first; fall back to importance CV if decay is uniform
+            drift_score = decay_drift_score if not all_decay_identical else importance_drift_score
+
             # Detect emerging features (high importance but low usage)
             emerging_features = [f for f in features if f["importance"] > 0.5 and f["n_uses"] < 10]
 
-            drift_score = 0.0
-            if features:
-                avg_decay = float(np.mean([f["decay"] for f in features]))
-                drift_score = 1.0 - avg_decay
-
             return {
-                "drift_detected": len(decaying_features) > 0,
+                "drift_detected": drift_score > self.FEATURE_DRIFT_THRESHOLD,
                 "drift_score": round(drift_score, 4),
                 "decaying_features": [f["name"] for f in decaying_features[:10]],
                 "emerging_features": [f["name"] for f in emerging_features[:5]],
                 "n_features_analyzed": len(features),
-                "avg_feature_decay": round(float(np.mean([f["decay"] for f in features])), 4) if features else 1.0,
+                "avg_feature_decay": round(avg_decay, 4) if features else 1.0,
+                "method_used": "decay" if not all_decay_identical else "importance_cv",
             }
         except Exception as e:
             logger.warning(f"{self.name}: feature drift detection failed: {e}")
@@ -371,6 +461,24 @@ class DriftDetectionEngine(BaseAgent):
                     "reason": f"drift_detected_at_{drift['drift_score']:.2f}",
                 })
         return recommendations
+
+    async def trigger(self, reason: str = "external") -> Optional[dict]:
+        """
+        Public method for external agents to trigger an immediate drift check.
+        Returns the drift report, or None if DB is unavailable.
+        Does NOT set _trigger_requested -- runs the check inline to avoid
+        double computation when the run() loop also polls.
+
+        Usage:
+            await drift_engine.trigger("feature_importance_updated")
+        """
+        logger.info(f"{self.name}: triggered by external agent (reason={reason})")
+        self._trigger_reason = reason
+        report = await self._compute_drift_report()
+        if report:
+            await self._persist_drift(report)
+            await self._publish_drift(report)
+        return report
 
     async def _persist_drift(self, report: dict) -> None:
         """Persist drift report to drift_detection table."""

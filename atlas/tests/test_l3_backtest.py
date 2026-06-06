@@ -54,7 +54,7 @@ async def test_backtest_train_test_holdout_no_leakage(mock_redis, dummy_market_d
     runner = BacktestRunner(mock_redis)
     strategy = DummyStrategy()
     
-    results, trades = await runner._run_backtest(strategy, dummy_market_data)
+    results, trades, _ = await runner._run_backtest(strategy, dummy_market_data)
     
     # 60/20/20 split means train on 60, test on 20, holdout on 20
     # The output should have keys for all 3 sharpes
@@ -92,7 +92,7 @@ async def test_backtest_slippage_and_commission_applied(mock_redis, dummy_market
     strategy = BuyHoldStrategy()
     
     # We will test the _run_backtest directly.
-    results, trades = await runner._run_backtest(strategy, dummy_market_data)
+    results, trades, _ = await runner._run_backtest(strategy, dummy_market_data)
     
     # Because position sizing is 10%, and we enter once, trade cost should apply
     # We can't easily isolate the exact dollar amount without rewriting the test,
@@ -108,7 +108,7 @@ async def test_backtest_slippage_and_commission_applied(mock_redis, dummy_market
             s[-1] = 1
             return pd.Series(s, index=df.index)
             
-    results2, trades2 = await runner._run_backtest(FrequentTradeStrategy(), dummy_market_data)
+    results2, trades2, _ = await runner._run_backtest(FrequentTradeStrategy(), dummy_market_data)
     assert results2["total_trades"] > 0
 
 @pytest.mark.asyncio

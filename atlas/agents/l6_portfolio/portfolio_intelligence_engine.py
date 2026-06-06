@@ -359,7 +359,9 @@ class PortfolioIntelligenceEngine(BaseAgent):
         cluster_benefit = min(1.0, n_clusters / 5.0)
 
         survivability = portfolio_score * corr_penalty * (0.7 + 0.3 * cluster_benefit)
-        return max(0.0, min(100.0, survivability))
+        # Clamp survivability to 0-100% range
+        survivability = max(0.0, min(100.0, survivability))
+        return survivability
 
     def _compute_concentration_risk(self, strategies: list[dict], allocations: list[dict]) -> float:
         """Herfindahl-Hirschman Index of allocation concentration."""
@@ -371,7 +373,9 @@ class PortfolioIntelligenceEngine(BaseAgent):
         n = len(weights)
         min_hhi = 1.0 / n if n > 0 else 0
         normalized = (hhi - min_hhi) / (1.0 - min_hhi) if (1.0 - min_hhi) > 0 else 1.0
-        return max(0.0, min(1.0, normalized))
+        # Clamp concentration risk to 0-100% range
+        normalized = max(0.0, min(1.0, normalized))
+        return normalized
 
     def _compute_diversification_score(self, corr_matrix: np.ndarray, allocations: list[dict]) -> float:
         """Diversification score: 1 - effective number of bets / N."""
@@ -393,7 +397,9 @@ class PortfolioIntelligenceEngine(BaseAgent):
         # Score: how close effective diversification is to N, adjusted by correlation
         raw = min(1.0, effective_n / n)
         corr_penalty = 1.0 - min(0.5, max(0, avg_corr - 0.2))
-        return max(0.0, raw * corr_penalty)
+        # Clamp diversification score to 0-100% range
+        score = max(0.0, min(1.0, raw * corr_penalty))
+        return score
 
     async def _persist_intelligence(self, intelligence: dict) -> None:
         """Persist portfolio intelligence to portfolio_intelligence table."""

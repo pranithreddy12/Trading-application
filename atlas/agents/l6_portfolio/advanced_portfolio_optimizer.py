@@ -126,7 +126,7 @@ class AdvancedPortfolioOptimizer(BaseAgent):
                         WHERE strategy_id = s.id
                         ORDER BY start_date DESC LIMIT 1
                     ) br ON TRUE
-                    WHERE s.status IN ('active', 'paper', 'shadow')
+                    WHERE s.status IN ('active', 'paper', 'shadow') OR s.deployment_mode IN ('paper', 'shadow', 'live')
                     ORDER BY br.short_window_score DESC NULLS LAST
                 """)
             )

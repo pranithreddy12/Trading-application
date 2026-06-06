@@ -26,7 +26,7 @@ def compute_short_window_metrics(
     sub_df: pd.DataFrame,
     position_series: pd.Series,
     market_return: pd.Series,
-    position_size: float = 0.10,
+    position_size: float | np.ndarray = 0.10,
     commission_pct: float = 0.001,
     slippage_pct: float = 0.0005,
     spread_cost_pct: float = 0.0005,
@@ -57,9 +57,11 @@ def compute_short_window_metrics(
         sub["position"].diff().fillna(0) != 0, total_roundtrip, 0.0
     )
 
+    # Use per-bar position size if array, else scalar
+    _pos_size_arr = position_size if isinstance(position_size, np.ndarray) else np.full(len(sub), position_size)
     sub["strategy_return"] = (
-        sub["position"] * sub["market_return"] * position_size
-    ) - (sub["trade_cost"] * position_size)
+        sub["position"] * sub["market_return"] * _pos_size_arr
+    ) - (sub["trade_cost"] * _pos_size_arr)
 
     sub["cum_return"] = (1 + sub["strategy_return"]).cumprod()
 
@@ -102,8 +104,10 @@ def compute_short_window_metrics(
         if np.isnan(profit_factor) or np.isinf(profit_factor):
             profit_factor = 1.0
 
-        roll_max = sub["cum_return"].cummax()
-        drawdown = sub["cum_return"] / roll_max - 1
+        # SAFETY: Cap cum_return at 0 before computing drawdown to prevent below-100% values
+        _cum_safe = sub["cum_return"].clip(lower=0)
+        roll_max = _cum_safe.cummax()
+        drawdown = _cum_safe / roll_max - 1
         max_drawdown = float(drawdown.min())
 
         # Per-trade metrics from actual closed trades
@@ -122,12 +126,14 @@ def compute_short_window_metrics(
         # Even with 0 trades, compute basic metrics
         win_rate = 0.0
         profit_factor = 1.0
-        max_drawdown = float(sub["cum_return"].min() - 1) if len(sub) > 0 else 0.0
+        # SAFETY: Cap cum_return at 0 before computing drawdown to prevent below-100% values
+        _cum_safe = sub["cum_return"].clip(lower=0)
+        max_drawdown = float(_cum_safe.min() - 1) if len(sub) > 0 else 0.0
 
     # Gross edge (no cost version)
     sub_no_cost = sub.copy()
     sub_no_cost["strat_no_cost"] = (
-        sub_no_cost["position"] * sub_no_cost["market_return"] * position_size
+        sub_no_cost["position"] * sub_no_cost["market_return"] * _pos_size_arr
     )
     sub_no_cost["cum_no_cost"] = (1 + sub_no_cost["strat_no_cost"]).cumprod()
     gross_edge = (

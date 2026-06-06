@@ -1,5 +1,9 @@
 """
-FitnessScorer — Multi-component composite fitness scoring.
+FitnessScorer — Multi-component composite fitness scoring (DEPRECATED).
+
+NOTE: This class is no longer called by the pipeline. The primary scoring
+is now computed in BacktestRunner._run_backtest() via composite_fitness_score
+and in score_contract.compute_institutional_score(). Kept for reference.
 
 Replaces short_window_score as the primary selection signal.
 Computes a 0-100 composite score from normalized components:

@@ -1,0 +1,123 @@
+# SAFE_DELETE candidates — Files guaranteed non-runtime
+# Generated: June 1, 2026
+# Rule: No imports from atlas/agents, atlas/core, atlas/data, atlas/api, atlas/dashboard, atlas/config, atlas/governance
+
+# === __pycache__ directories ===
+atlas/__pycache__/
+atlas/agents/__pycache__/
+atlas/agents/l1_data/__pycache__/
+atlas/agents/l1_pattern/__pycache__/
+atlas/agents/l2_strategy/__pycache__/
+atlas/agents/l3_backtest/__pycache__/
+atlas/agents/l3_validation/__pycache__/
+atlas/agents/l4_risk/__pycache__/
+atlas/agents/l5_execution/__pycache__/
+atlas/agents/l6_portfolio/__pycache__/
+atlas/agents/l7_meta/__pycache__/
+atlas/agents/scouts/__pycache__/
+atlas/api/__pycache__/
+atlas/api/services/__pycache__/
+atlas/config/__pycache__/
+atlas/core/__pycache__/
+atlas/core/scout_contracts/__pycache__/
+atlas/dashboard/__pycache__/
+atlas/dashboard/control_plane/__pycache__/
+atlas/dashboard/system_visualization/__pycache__/
+atlas/data/__pycache__/
+atlas/data/ingestion/__pycache__/
+atlas/data/storage/__pycache__/
+atlas/governance/__pycache__/
+atlas/scripts/__pycache__/
+atlas/scripts/soak/__pycache__/
+
+# === Log files (root-level) ===
+pipeline_output.log
+soak_clean_output.log
+soak_clean_v2_output.log
+soak_final_output.log
+soak_output.log
+
+# === Log files (atlas/) ===
+atlas/api_server.log
+atlas/gen_output.log
+atlas/soak.log
+atlas/soak_6h.log
+atlas/soak_90min_output.log
+atlas/soak_output.log
+atlas/phase25_soak_pipeline.log
+atlas/phase26_ab_a_scouts_off.log
+atlas/phase26_ab_b_scouts_on.log
+atlas/phase26_soak_pipeline.log
+atlas/phase27_soak_output.log
+atlas/phase28_soak.log
+atlas/phase29_soak_console.log
+atlas/phase30_soak.log
+atlas/pipeline_phase30_6h.log
+atlas/scripts/day5/validation.log
+atlas/scripts/phase25_soak_pipeline.log
+
+# === logs/ directory (entire) ===
+logs/api_server.log
+logs/api_server_port8001.log
+logs/api_server_port8002.log
+logs/autonomous_cycle_20260530_130836.log
+logs/autonomous_cycle_2026-05-30_130929.log
+logs/autonomous_cycle_2026-05-30_193205.log
+logs/autonomous_cycle_2026-05-30_193302.log
+logs/autonomous_cycle_2026-05-30_193321.log
+logs/autonomous_cycle_2026-06-01_101445.log
+logs/autonomous_cycle_2026-06-01_114411.log
+logs/cycle_20260530_193319.log
+logs/cycle_30min_20260530_193201.log
+logs/cycle_30min_20260530_193300.log
+logs/run_10min.log
+logs/run_5min_scouts.log
+
+# === scripts/logs/ directory (entire) ===
+scripts/logs/phase37_soak_30m.log
+scripts/logs/phase37_soak_full.log
+scripts/logs/phase38_strict_soak_30m.log
+
+# === PID files ===
+logs/dashboard.pid
+logs/pipeline.pid
+atlas/phase30_soak_pid.txt
+atlas/pipeline_pid.txt
+
+# === Debug/utility scripts (root-level, not in test suite) ===
+dt.py
+test_coder.py
+test_copy_execution.py
+test_copy_smoke.py
+test_copy_trade.py
+test_db_signals.py
+test_inject_strategy.py
+test_risk_and_idempotency.py
+
+# === Debug scripts (atlas/scripts/) ===
+atlas/scripts/debug_hash.py
+atlas/scripts/debug_hash2.py
+atlas/scripts/debug_hash3.py
+
+# === Generated documentation ===
+ATLAS_Integrated_Masterpiece.docx
+ATLAS_Integrated_Masterpiece.txt
+ATLAS_Integrated_Masterpiece_Full.txt
+demo.txt
+atlas/ATLAS_Integrated_Masterpiece.docx
+
+# === Generated JSONL output ===
+scripts/monitor_output.jsonl
+scripts/monitor_real_output.jsonl
+
+# === Backup file ===
+.gemini/settings.json.bak
+
+# === Runtime directory debug file ===
+atlas/agents/l2_strategy/test_fix.py
+
+# === Windows artifact ===
+atlas/nul
+
+# === Memory file (generated, not runtime) ===
+atlas/memory.md

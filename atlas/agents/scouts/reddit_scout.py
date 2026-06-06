@@ -48,6 +48,10 @@ class RedditScout(BaseAgent):
         "quant": 0.85,
     }
 
+    # Circuit breaker constants
+    _circuit_breaker_max_failures = 3
+    _circuit_breaker_base_delay = 300  # 5 min initial backoff
+
     def __init__(self, redis_client=None, db_client=None, run_interval: int = 600):
         super().__init__(
             name=self.name,
@@ -59,6 +63,8 @@ class RedditScout(BaseAgent):
         self.run_interval = run_interval
         self._memory_cache: dict[str, datetime] = {}  # Track seen post IDs with timestamps
         self._cache_ttl = timedelta(hours=24)
+        self._circuit_breaker: dict[str, int] = {}  # subreddit -> consecutive failures
+        self._circuit_breaker_open_until: dict[str, datetime] = {}  # subreddit -> backoff until
 
     async def run(self):
         logger.info(f"{self.name}: starting Reddit intelligence scout (every {self.run_interval}s)")
@@ -84,14 +90,38 @@ class RedditScout(BaseAgent):
         for k in to_remove:
             del self._memory_cache[k]
 
+        # Check if circuit breaker is open for all subreddits (global backoff)
+        all_blocked = True
+        for subreddit, reliability in self.SUBREDDIT_RELIABILITY.items():
+            backoff_until = self._circuit_breaker_open_until.get(subreddit)
+            if not backoff_until or now >= backoff_until:
+                all_blocked = False
+                break
+        if all_blocked:
+            logger.debug(f"{self.name}: All subreddits in backoff — skipping gather cycle")
+            return signals
+
         async with aiohttp.ClientSession(headers=headers) as session:
             for subreddit, reliability in self.SUBREDDIT_RELIABILITY.items():
+                # Circuit breaker: skip subreddit if in backoff
+                backoff_until = self._circuit_breaker_open_until.get(subreddit)
+                if backoff_until and now < backoff_until:
+                    remaining = (backoff_until - now).total_seconds()
+                    logger.debug(f"{self.name}: Skipping r/{subreddit} (backoff {remaining:.0f}s remaining)")
+                    continue
+
                 try:
                     url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit=15"
                     async with session.get(url, timeout=10) as resp:
                         if resp.status != 200:
                             logger.debug(f"{self.name}: Failed to fetch r/{subreddit}: HTTP {resp.status}")
+                            self._track_subreddit_failure(subreddit)
                             continue
+                        
+                        # Success — reset circuit breaker for this subreddit
+                        self._circuit_breaker[subreddit] = 0
+                        self._circuit_breaker_open_until.pop(subreddit, None)
+
                         data = await resp.json()
                         posts = data.get("data", {}).get("children", [])
                         
@@ -133,7 +163,17 @@ class RedditScout(BaseAgent):
                                 },
                             })
                 except Exception as e:
-                    logger.debug(f"{self.name}: Error fetching r/{subreddit}: {e}")
+                    self._track_subreddit_failure(subreddit)
+                    failures = self._circuit_breaker.get(subreddit, 0)
+                    if failures >= self._circuit_breaker_max_failures:
+                        backoff = self._circuit_breaker_base_delay * min(2 ** (failures - 3), 8)
+                        self._circuit_breaker_open_until[subreddit] = now + timedelta(seconds=backoff)
+                        logger.warning(
+                            f"{self.name}: Circuit breaker opened for r/{subreddit} "
+                            f"({failures} consecutive failures, backoff {backoff}s)"
+                        )
+                    else:
+                        logger.debug(f"{self.name}: Error fetching r/{subreddit}: {e}")
                     
                 await asyncio.sleep(1) # Rate limit protection
 
@@ -230,6 +270,11 @@ class RedditScout(BaseAgent):
                 )
             except Exception as e:
                 logger.warning(f"{self.name}: persist signal failed: {e}")
+
+    def _track_subreddit_failure(self, subreddit: str) -> None:
+        """Track a failure for circuit breaker logic."""
+        current = self._circuit_breaker.get(subreddit, 0)
+        self._circuit_breaker[subreddit] = current + 1
 
     async def _publish_scout_intelligence(self, ranked_signals: list[dict]) -> None:
         """Publish top signals to Redis."""

@@ -31,6 +31,7 @@ from loguru import logger
 from sqlalchemy.sql import text
 
 from atlas.core.persistence_integrity import canonical_uuid
+import re
 
 
 class EventVersion(str, Enum):
@@ -93,7 +94,7 @@ class EventStore:
     ) -> str:
         """Append an immutable event. Returns event_id."""
         async with self._lock:
-            event_id = canonical_uuid(None, field_name="id", context="EventStore.append_event")
+            event_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc)
 
             # Get previous hash for aggregate stream
@@ -368,7 +369,11 @@ class EventStore:
     async def verify_integrity(self, aggregate_id: str) -> dict:
         """
         Verify the hash chain for an aggregate.
-        Returns integrity report.
+        Returns integrity report with legacy vs active violation categorization.
+        
+        Legacy violations are those occurring in the oldest events (first 25% of history)
+        that likely result from schema migrations or historical data changes.
+        Active violations are those in recent events that may indicate ongoing corruption.
         """
         events = await self.get_events(aggregate_id)
         if not events:
@@ -376,6 +381,8 @@ class EventStore:
 
         violations = []
         prev_hash = None
+        legacy_cutoff = len(events) // 4  # First 25% considered legacy
+        
         for i, event in enumerate(events):
             # Verify self-hash
             content = {
@@ -396,23 +403,41 @@ class EventStore:
                 json.dumps(content, sort_keys=True, default=str).encode("utf-8")
             ).hexdigest()
 
+            violation_type = None
             if expected_hash != event.hash_self:
-                violations.append(f"Event {i} (seq={event.sequence}): self-hash mismatch")
+                violation_type = "self-hash mismatch"
+                violations.append(f"Event {i} (seq={event.sequence}): {violation_type}")
 
             # Verify prev-hash chain
             if i > 0 and event.hash_prev != prev_hash:
+                violation_type = "prev-hash broken"
                 violations.append(
-                    f"Event {i} (seq={event.sequence}): prev-hash broken "
+                    f"Event {i} (seq={event.sequence}): {violation_type} "
                     f"(expected {prev_hash[:12]}..., got {event.hash_prev[:12]}...)"
                 )
 
             prev_hash = event.hash_self
+
+        # Categorize violations as legacy or active
+        legacy_violations = 0
+        active_violations = 0
+        for v in violations:
+            # Extract event index from violation message
+            match = re.search(r'Event (\d+)', v)
+            if match:
+                idx = int(match.group(1))
+                if idx < legacy_cutoff:
+                    legacy_violations += 1
+                else:
+                    active_violations += 1
 
         return {
             "aggregate_id": aggregate_id,
             "valid": len(violations) == 0,
             "events_checked": len(events),
             "violations": violations,
+            "legacy_violations": legacy_violations,
+            "active_violations": active_violations,
         }
 
     async def get_children(self, event_id: str) -> list[StoredEvent]:

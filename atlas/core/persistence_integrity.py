@@ -89,7 +89,12 @@ class IdentityContractViolation(RuntimeError):
 def strict_identity_contracts_enabled() -> bool:
     """Return True when core IDs must be rejected instead of repaired."""
 
-    return os.getenv(STRICT_IDENTITY_CONTRACT_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return os.getenv(STRICT_IDENTITY_CONTRACT_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _is_strict_identity_field(field_name: str, table_name: str | None = None) -> bool:
@@ -117,7 +122,9 @@ class IdentityEnvelope:
     immutable: bool = True
 
     @classmethod
-    def from_raw(cls, raw: Any, *, field_name: str, context: str = "") -> "IdentityEnvelope":
+    def from_raw(
+        cls, raw: Any, *, field_name: str, context: str = ""
+    ) -> "IdentityEnvelope":
         canonical = canonical_uuid(raw, field_name=field_name, context=context)
         return cls(id=canonical, identity_type=field_name, creation_timestamp=None)
 
@@ -139,7 +146,9 @@ def _get_governance_engine():
     try:
         gov = importlib.import_module("atlas.governance")
         # initialize runtime with current strictness
-        _GOV_RUNTIME = gov.GovernanceRuntimeContext(strict_mode=strict_identity_contracts_enabled())
+        _GOV_RUNTIME = gov.GovernanceRuntimeContext(
+            strict_mode=strict_identity_contracts_enabled()
+        )
         _GOV_JOURNAL = gov.IdentityViolationJournal()
         _GOV_ENGINE = gov.GovernanceViolationEngine(_GOV_RUNTIME, _GOV_JOURNAL)
         return _GOV_ENGINE
@@ -205,9 +214,16 @@ def canonical_uuid(
         pass
     op_type = None
     try:
-        from atlas.governance.context import IdentityOperationType, GovernanceExecutionContext
+        from atlas.governance.context import (
+            IdentityOperationType,
+            GovernanceExecutionContext,
+        )
 
-        op_type = IdentityOperationType(operation) if operation else IdentityOperationType.VALIDATE
+        op_type = (
+            IdentityOperationType(operation)
+            if operation
+            else IdentityOperationType.VALIDATE
+        )
         exec_ctx = GovernanceExecutionContext(**exec_context) if exec_context else None
         # detect callers that don't provide semantic operation as potential bypasses
         if op_type is IdentityOperationType.VALIDATE and _GOV_RUNTIME is not None:
@@ -218,7 +234,11 @@ def canonical_uuid(
 
     if value is None or value == "":
         # missing identity
-        payload = {"type": "missing_identity", "field": field_name, "context": context or "unknown"}
+        payload = {
+            "type": "missing_identity",
+            "field": field_name,
+            "context": context or "unknown",
+        }
         if gov and op_type:
             gov.before_identity_operation(op_type, payload, exec_ctx)
 
@@ -226,31 +246,55 @@ def canonical_uuid(
             # after hook records the rejection
             if gov and op_type:
                 try:
-                    gov.after_identity_operation(op_type, payload, gov.evaluate(payload), exec_ctx)
+                    gov.after_identity_operation(
+                        op_type, payload, gov.evaluate(payload), exec_ctx
+                    )
                 except Exception:
                     pass
             raise IdentityContractViolation(
                 f"Missing UUID field '{field_name}' in {context or 'unknown context'}"
             )
         recovered = str(uuid.uuid4())
-        logger.warning(
+        logger.debug(
             f"UUID normalization: generated new value for missing field '{field_name}' in {context or 'unknown context'} -> {recovered}"
         )
         if gov and op_type:
-            gov.after_identity_operation(op_type, {**payload, "value": recovered}, gov.evaluate({**payload, "value": recovered}), exec_ctx, snapshot={"recovered": recovered})
+            gov.after_identity_operation(
+                op_type,
+                {**payload, "value": recovered},
+                gov.evaluate({**payload, "value": recovered}),
+                exec_ctx,
+                snapshot={"recovered": recovered},
+            )
         return recovered
 
     candidate = str(value)
     try:
         val = str(uuid.UUID(candidate))
-        payload = {"type": "validated", "field": field_name, "context": context or "unknown", "value": val}
+        payload = {
+            "type": "validated",
+            "field": field_name,
+            "context": context or "unknown",
+            "value": val,
+        }
         if gov and op_type:
             gov.before_identity_operation(op_type, payload, exec_ctx)
             # after successful validation
-            gov.after_identity_operation(op_type, payload, gov.evaluate(payload), exec_ctx, snapshot={"validated": val})
+            gov.after_identity_operation(
+                op_type,
+                payload,
+                gov.evaluate(payload),
+                exec_ctx,
+                snapshot={"validated": val},
+            )
         return val
     except Exception:
-        payload = {"type": "invalid_identity", "field": field_name, "context": context or "unknown", "value": candidate}
+        payload = {
+            "type": "invalid_identity",
+            "field": field_name,
+            "context": context or "unknown",
+            "value": candidate,
+        }
         if gov and op_type:
             try:
                 gov.before_identity_operation(op_type, payload, exec_ctx)
@@ -260,18 +304,26 @@ def canonical_uuid(
         if not allow_generate or (strict_mode and is_strict_identity):
             if gov and op_type:
                 try:
-                    gov.after_identity_operation(op_type, payload, gov.evaluate(payload), exec_ctx)
+                    gov.after_identity_operation(
+                        op_type, payload, gov.evaluate(payload), exec_ctx
+                    )
                 except Exception:
                     pass
             raise IdentityContractViolation(
                 f"Invalid UUID field '{field_name}' in {context or 'unknown context'} ({candidate})"
             )
         recovered = str(uuid.uuid4())
-        logger.warning(
+        logger.debug(
             f"UUID normalization: recovered invalid field '{field_name}' in {context or 'unknown context'} ({candidate}) -> {recovered}"
         )
         if gov and op_type:
-            gov.after_identity_operation(op_type, {**payload, "recovered": recovered}, gov.evaluate({**payload, "recovered": recovered}), exec_ctx, snapshot={"recovered": recovered})
+            gov.after_identity_operation(
+                op_type,
+                {**payload, "recovered": recovered},
+                gov.evaluate({**payload, "recovered": recovered}),
+                exec_ctx,
+                snapshot={"recovered": recovered},
+            )
         return recovered
 
 
@@ -286,7 +338,9 @@ def normalize_uuid_params(
     normalized = dict(params)
     recovered_fields: list[str] = []
     table_key = table_name.lower()
-    fields = tuple(dict.fromkeys(DEFAULT_UUID_FIELDS + UUID_PARAM_FIELDS.get(table_key, ())))
+    fields = tuple(
+        dict.fromkeys(DEFAULT_UUID_FIELDS + UUID_PARAM_FIELDS.get(table_key, ()))
+    )
     if not fields:
         return normalized, recovered_fields
 
@@ -297,7 +351,10 @@ def normalize_uuid_params(
         if field_name not in normalized:
             continue
         before = normalized[field_name]
-        is_field_strict = _is_strict_identity_field(field_name, table_name) or field_name in strict_table_fields
+        is_field_strict = (
+            _is_strict_identity_field(field_name, table_name)
+            or field_name in strict_table_fields
+        )
         allow_generate = not (strict_mode_global and is_field_strict)
         after = canonical_uuid(
             before,
@@ -532,6 +589,8 @@ class SchemaContractRegistry:
             for guidance in report.guidance:
                 logger.warning(f"Schema guidance: {guidance}")
         else:
-            logger.info(f"Schema contract validation passed for {len(self.contracts)} contracts")
+            logger.info(
+                f"Schema contract validation passed for {len(self.contracts)} contracts"
+            )
 
         return report
