@@ -87,7 +87,7 @@ class PositionManager:
                 avg_price = float(avg_price)
 
                 current_price = prices.get(sym)
-                if not current_price:
+                if current_price is None:
                     continue
 
                 # Calculate Unrealized PnL
@@ -101,9 +101,20 @@ class PositionManager:
                 # Update MTM PnL in DB
                 await conn.execute(
                     text(
-                        "UPDATE positions SET unrealized_pnl = :pnl, last_mark_time = NOW() WHERE id = :id"
+                        """
+                        UPDATE positions
+                        SET
+                            current_price = :cp,
+                            unrealized_pnl = :pnl,
+                            last_mark_time = NOW()
+                        WHERE id = :id
+                        """
                     ),
-                    {"pnl": unrealized_pnl, "id": pid},
+                    {
+                        "cp": current_price,
+                        "pnl": unrealized_pnl,
+                        "id": pid,
+                    },
                 )
 
                 # Enforce Exit Conditions (Stop Loss / Take Profit)
