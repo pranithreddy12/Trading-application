@@ -4987,6 +4987,392 @@ class TimescaleClient:
         }
         await self._execute_insert(query, params)
 
+    # =====================================================================
+    # P6 T6 — Alpha Rebuild v1 SHADOW persistence (ADDITIVE).
+    # These read/write the additive *_v1 tables (migration_005) ONLY. They
+    # NEVER touch legacy columns, strategies.status, or any consumer path —
+    # nothing in the live pipeline calls them yet (no cutover). Writes use a
+    # direct idempotent upsert via engine.begin() (NOT _execute_insert) so the
+    # shadow store does not trigger scout-signal mirroring or failed_inserts
+    # dead-lettering, which are reserved for production data flows.
+    # =====================================================================
+
+    @staticmethod
+    def _coerce_ts(value):
+        return (
+            datetime.fromisoformat(value) if isinstance(value, str) else value
+        )
+
+    async def ensure_v1_tables(self) -> None:
+        """Idempotently create the additive v1 shadow tables + indexes.
+
+        Mirrors migration_005_ledger_metrics_v1.sql. Safe to call repeatedly;
+        creates NEW tables only — alters/drops nothing. NOT wired into connect();
+        callers (backfill/ops/tests) invoke it explicitly so startup behavior is
+        unchanged.
+        """
+        stmts = [
+            """
+            CREATE TABLE IF NOT EXISTS ledger_metrics_v1 (
+                strategy_id             UUID        NOT NULL,
+                start_date              TIMESTAMPTZ NOT NULL,
+                end_date                TIMESTAMPTZ NOT NULL,
+                n_trades                INT         NOT NULL,
+                total_return            NUMERIC,
+                gross_edge              NUMERIC,
+                cost_burden             NUMERIC,
+                max_drawdown            NUMERIC,
+                win_rate                NUMERIC,
+                profit_factor           NUMERIC,
+                expectancy              NUMERIC,
+                sharpe                  NUMERIC,
+                sortino                 NUMERIC,
+                calmar                  NUMERIC,
+                avg_trade_duration_bars NUMERIC,
+                metrics_version         TEXT        NOT NULL DEFAULT 'ledger_metrics_v1',
+                computed_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (strategy_id, start_date, end_date),
+                CONSTRAINT fk_ledger_metrics_v1_strategy
+                    FOREIGN KEY (strategy_id) REFERENCES strategies (id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_ledger_metrics_v1_end ON ledger_metrics_v1 (end_date DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS strategy_scores_v1 (
+                strategy_id      UUID        NOT NULL,
+                start_date       TIMESTAMPTZ NOT NULL,
+                end_date         TIMESTAMPTZ NOT NULL,
+                research_fitness NUMERIC,
+                deploy_fitness   NUMERIC,
+                q                NUMERIC,
+                m                NUMERIC,
+                perf_q           NUMERIC,
+                robust_q         NUMERIC,
+                sig_gate         NUMERIC,
+                overfit_gate     NUMERIC,
+                cost_gate        NUMERIC,
+                fitness_version  TEXT        NOT NULL DEFAULT 'fitness_v1',
+                computed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (strategy_id, start_date, end_date),
+                CONSTRAINT fk_strategy_scores_v1_strategy
+                    FOREIGN KEY (strategy_id) REFERENCES strategies (id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_strategy_scores_v1_deploy ON strategy_scores_v1 (deploy_fitness DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS validator_results_v1 (
+                strategy_id       UUID        NOT NULL,
+                start_date        TIMESTAMPTZ NOT NULL,
+                end_date          TIMESTAMPTZ NOT NULL,
+                status_v1         TEXT        NOT NULL,
+                deploy_fitness    NUMERIC,
+                research_fitness  NUMERIC,
+                n_trades          INT,
+                coverage_complete BOOLEAN,
+                structural_ok     BOOLEAN,
+                policy_version    TEXT        NOT NULL DEFAULT 'validator_policy_v1',
+                computed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (strategy_id, start_date, end_date),
+                CONSTRAINT fk_validator_results_v1_strategy
+                    FOREIGN KEY (strategy_id) REFERENCES strategies (id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_validator_results_v1_status ON validator_results_v1 (status_v1)",
+        ]
+        async with self.engine.begin() as conn:
+            for stmt in stmts:
+                await conn.execute(text(stmt))
+
+    async def save_ledger_metrics_v1(
+        self, strategy_id: str, start_date, end_date, metrics: dict
+    ) -> None:
+        """Upsert P1 ledger_metrics_v1 outputs for one backtest window (additive)."""
+        query = """
+            INSERT INTO ledger_metrics_v1 (
+                strategy_id, start_date, end_date, n_trades, total_return,
+                gross_edge, cost_burden, max_drawdown, win_rate, profit_factor,
+                expectancy, sharpe, sortino, calmar, avg_trade_duration_bars,
+                metrics_version
+            ) VALUES (
+                :strategy_id, :start_date, :end_date, :n_trades, :total_return,
+                :gross_edge, :cost_burden, :max_drawdown, :win_rate, :profit_factor,
+                :expectancy, :sharpe, :sortino, :calmar, :avg_trade_duration_bars,
+                :metrics_version
+            )
+            ON CONFLICT (strategy_id, start_date, end_date) DO UPDATE SET
+                n_trades = EXCLUDED.n_trades,
+                total_return = EXCLUDED.total_return,
+                gross_edge = EXCLUDED.gross_edge,
+                cost_burden = EXCLUDED.cost_burden,
+                max_drawdown = EXCLUDED.max_drawdown,
+                win_rate = EXCLUDED.win_rate,
+                profit_factor = EXCLUDED.profit_factor,
+                expectancy = EXCLUDED.expectancy,
+                sharpe = EXCLUDED.sharpe,
+                sortino = EXCLUDED.sortino,
+                calmar = EXCLUDED.calmar,
+                avg_trade_duration_bars = EXCLUDED.avg_trade_duration_bars,
+                metrics_version = EXCLUDED.metrics_version,
+                computed_at = NOW()
+        """
+        params = {
+            "strategy_id": str(strategy_id),
+            "start_date": self._coerce_ts(start_date),
+            "end_date": self._coerce_ts(end_date),
+            "n_trades": int(metrics.get("n_trades", 0)),
+            "total_return": metrics.get("total_return"),
+            "gross_edge": metrics.get("gross_edge"),
+            "cost_burden": metrics.get("cost_burden"),
+            "max_drawdown": metrics.get("max_drawdown"),
+            "win_rate": metrics.get("win_rate"),
+            "profit_factor": metrics.get("profit_factor"),
+            "expectancy": metrics.get("expectancy"),
+            "sharpe": metrics.get("sharpe"),
+            "sortino": metrics.get("sortino"),
+            "calmar": metrics.get("calmar"),
+            "avg_trade_duration_bars": metrics.get("avg_trade_duration_bars"),
+            "metrics_version": metrics.get("metrics_version", "ledger_metrics_v1"),
+        }
+        async with self.engine.begin() as conn:
+            await conn.execute(text(query), params)
+
+    async def save_strategy_scores_v1(
+        self, strategy_id: str, start_date, end_date, fitness: dict
+    ) -> None:
+        """Upsert P2 fitness_v1 outputs for one backtest window (additive)."""
+        query = """
+            INSERT INTO strategy_scores_v1 (
+                strategy_id, start_date, end_date, research_fitness, deploy_fitness,
+                q, m, perf_q, robust_q, sig_gate, overfit_gate, cost_gate,
+                fitness_version
+            ) VALUES (
+                :strategy_id, :start_date, :end_date, :research_fitness, :deploy_fitness,
+                :q, :m, :perf_q, :robust_q, :sig_gate, :overfit_gate, :cost_gate,
+                :fitness_version
+            )
+            ON CONFLICT (strategy_id, start_date, end_date) DO UPDATE SET
+                research_fitness = EXCLUDED.research_fitness,
+                deploy_fitness = EXCLUDED.deploy_fitness,
+                q = EXCLUDED.q,
+                m = EXCLUDED.m,
+                perf_q = EXCLUDED.perf_q,
+                robust_q = EXCLUDED.robust_q,
+                sig_gate = EXCLUDED.sig_gate,
+                overfit_gate = EXCLUDED.overfit_gate,
+                cost_gate = EXCLUDED.cost_gate,
+                fitness_version = EXCLUDED.fitness_version,
+                computed_at = NOW()
+        """
+        params = {
+            "strategy_id": str(strategy_id),
+            "start_date": self._coerce_ts(start_date),
+            "end_date": self._coerce_ts(end_date),
+            "research_fitness": fitness.get("research_fitness"),
+            "deploy_fitness": fitness.get("deploy_fitness"),
+            "q": fitness.get("Q"),
+            "m": fitness.get("M"),
+            "perf_q": fitness.get("perf_Q"),
+            "robust_q": fitness.get("robust_Q"),
+            "sig_gate": fitness.get("sig_gate"),
+            "overfit_gate": fitness.get("overfit_gate"),
+            "cost_gate": fitness.get("cost_gate"),
+            "fitness_version": fitness.get("fitness_version", "fitness_v1"),
+        }
+        async with self.engine.begin() as conn:
+            await conn.execute(text(query), params)
+
+    async def save_validator_result_v1(
+        self, strategy_id: str, start_date, end_date, result: dict
+    ) -> None:
+        """Upsert P3 validator_policy_v1 SHADOW status for one backtest window.
+
+        Writes status_v1 into validator_results_v1 ONLY — it does NOT modify
+        strategies.status (no authority switch).
+        """
+        query = """
+            INSERT INTO validator_results_v1 (
+                strategy_id, start_date, end_date, status_v1, deploy_fitness,
+                research_fitness, n_trades, coverage_complete, structural_ok,
+                policy_version
+            ) VALUES (
+                :strategy_id, :start_date, :end_date, :status_v1, :deploy_fitness,
+                :research_fitness, :n_trades, :coverage_complete, :structural_ok,
+                :policy_version
+            )
+            ON CONFLICT (strategy_id, start_date, end_date) DO UPDATE SET
+                status_v1 = EXCLUDED.status_v1,
+                deploy_fitness = EXCLUDED.deploy_fitness,
+                research_fitness = EXCLUDED.research_fitness,
+                n_trades = EXCLUDED.n_trades,
+                coverage_complete = EXCLUDED.coverage_complete,
+                structural_ok = EXCLUDED.structural_ok,
+                policy_version = EXCLUDED.policy_version,
+                computed_at = NOW()
+        """
+        params = {
+            "strategy_id": str(strategy_id),
+            "start_date": self._coerce_ts(start_date),
+            "end_date": self._coerce_ts(end_date),
+            "status_v1": result.get("status"),
+            "deploy_fitness": result.get("deploy_fitness"),
+            "research_fitness": result.get("research_fitness"),
+            "n_trades": result.get("n_trades"),
+            "coverage_complete": result.get("coverage_complete"),
+            "structural_ok": result.get("structural_ok", True),
+            "policy_version": result.get("policy_version", "validator_policy_v1"),
+        }
+        async with self.engine.begin() as conn:
+            await conn.execute(text(query), params)
+
+    async def get_ledger_metrics_v1(self, strategy_id: str) -> dict | None:
+        """Latest (by end_date) ledger_metrics_v1 row for a strategy, or None."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM ledger_metrics_v1 WHERE strategy_id = :sid "
+                    "ORDER BY end_date DESC LIMIT 1"
+                ),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else None
+
+    async def get_strategy_scores_v1(self, strategy_id: str) -> dict | None:
+        """Latest (by end_date) strategy_scores_v1 row for a strategy, or None."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM strategy_scores_v1 WHERE strategy_id = :sid "
+                    "ORDER BY end_date DESC LIMIT 1"
+                ),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else None
+
+    async def get_validator_result_v1(self, strategy_id: str) -> dict | None:
+        """Latest (by end_date) validator_results_v1 row for a strategy, or None."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT * FROM validator_results_v1 WHERE strategy_id = :sid "
+                    "ORDER BY end_date DESC LIMIT 1"
+                ),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else None
+
+    async def get_backtest_trades(self, strategy_id: str) -> list[dict]:
+        """P6 T7 — READ-ONLY: all ledger trades for a strategy, chronological.
+        Source for ledger_metrics_v1. Selects only; never modifies backtest_trades."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text(
+                    "SELECT pnl_pct, bars_held, entry_time, exit_time "
+                    "FROM backtest_trades WHERE strategy_id = :sid "
+                    "ORDER BY entry_time ASC"
+                ),
+                {"sid": str(strategy_id)},
+            )
+            return [dict(r._mapping) for r in result.fetchall()]
+
+    async def get_strategy_ids_with_backtest_results(
+        self, limit: int | None = None
+    ) -> list[str]:
+        """P6 T7 — READ-ONLY: distinct strategy_ids having >=1 backtest_results row,
+        ordered for deterministic sampling. Selects only."""
+        q = "SELECT DISTINCT strategy_id FROM backtest_results ORDER BY strategy_id"
+        params: dict = {}
+        if limit is not None:
+            q += " LIMIT :lim"
+            params["lim"] = int(limit)
+        async with self.engine.connect() as conn:
+            result = await conn.execute(text(q), params)
+            return [str(r[0]) for r in result.fetchall()]
+
+    async def get_reconciliation_rows(self) -> list[dict]:
+        """P6 T8 — READ-ONLY: legacy-vs-shadow joined rows, one per strategy that
+        has shadow output, matched on the SAME backtest window (apples-to-apples).
+        Legacy comes from backtest_results + strategies.status (read only); shadow
+        from the *_v1 tables. Modifies nothing."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT
+                        vr.strategy_id::text                      AS strategy_id,
+                        s.status                                  AS legacy_status,
+                        br.sharpe                                 AS legacy_sharpe,
+                        br.win_rate                               AS legacy_win_rate,
+                        (br.results::jsonb ->> 'profit_factor')   AS legacy_profit_factor,
+                        br.max_drawdown                           AS legacy_max_drawdown,
+                        lm.sharpe                                 AS sharpe_v1,
+                        lm.win_rate                               AS win_rate_v1,
+                        lm.profit_factor                          AS profit_factor_v1,
+                        lm.max_drawdown                           AS max_drawdown_v1,
+                        lm.n_trades                               AS n_trades_v1,
+                        sc.deploy_fitness                         AS deploy_fitness,
+                        sc.research_fitness                       AS research_fitness,
+                        vr.status_v1                              AS status_v1,
+                        vr.coverage_complete                      AS coverage_complete
+                    FROM validator_results_v1 vr
+                    JOIN ledger_metrics_v1 lm
+                        USING (strategy_id, start_date, end_date)
+                    JOIN strategy_scores_v1 sc
+                        USING (strategy_id, start_date, end_date)
+                    JOIN strategies s
+                        ON s.id = vr.strategy_id
+                    JOIN backtest_results br
+                        ON br.strategy_id = vr.strategy_id
+                       AND br.start_date = vr.start_date
+                       AND br.end_date   = vr.end_date
+                    ORDER BY vr.strategy_id
+                """)
+            )
+            return [dict(r._mapping) for r in result.fetchall()]
+
+    async def get_legacy_status_counts(self) -> dict:
+        """P6 T8 — READ-ONLY: counts of strategies by legacy status (full population)."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT status, count(*) AS n FROM strategies GROUP BY status")
+            )
+            return {str(r._mapping["status"]): int(r._mapping["n"]) for r in result.fetchall()}
+
+    async def get_shadow_computed_strategy_ids(self) -> list[str]:
+        """P6 T9 — READ-ONLY: distinct strategy_ids already present in
+        validator_results_v1. Used for resume-safe replay (skip already-computed).
+        Selects only."""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("SELECT DISTINCT strategy_id FROM validator_results_v1")
+            )
+            return [str(r[0]) for r in result.fetchall()]
+
+    async def get_shadow_governor_rows(self) -> list[dict]:
+        """P6 T10 — READ-ONLY: per-strategy inputs for the shadow governor sim,
+        joined from the THREE v1 tables only (validator_results_v1 + strategy_scores_v1
+        + ledger_metrics_v1) on the shared window key. No legacy tables read; modifies
+        nothing. (overfit value is not denormalized into v1 — it is enforced
+        transitively via deploy_fitness, since overfit>=0.5 forces deploy_fitness=0.)"""
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT
+                        vr.strategy_id::text   AS strategy_id,
+                        vr.status_v1           AS status_v1,
+                        vr.coverage_complete   AS coverage_complete,
+                        lm.n_trades            AS n_trades,
+                        sc.deploy_fitness      AS deploy_fitness,
+                        sc.research_fitness    AS research_fitness
+                    FROM validator_results_v1 vr
+                    JOIN strategy_scores_v1 sc USING (strategy_id, start_date, end_date)
+                    JOIN ledger_metrics_v1  lm USING (strategy_id, start_date, end_date)
+                    ORDER BY sc.deploy_fitness DESC NULLS LAST
+                """)
+            )
+            return [dict(r._mapping) for r in result.fetchall()]
+
     async def get_open_paper_trades(self) -> list[dict]:
         query = "SELECT * FROM paper_trades WHERE status = 'open'"
         async with self.engine.connect() as conn:

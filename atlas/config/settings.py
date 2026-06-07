@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     scout_groups: str = ""  # JSON: [{"name":"Dummy","discord":[{"guild_id":"...","channels":["..."]}],"youtube":["..."]}]
     kaggle_username: str = ""
     kaggle_api_key: str = ""
+    # P6 T1 — authority flag for the Alpha Rebuild stack cutover.
+    # One of {legacy, shadow, canonical}; default 'legacy' = zero behavior change.
+    stack_version: str = Field(default="legacy", alias="ATLAS_STACK_VERSION")
 
     model_config = SettingsConfigDict(
         env_file=dotenv_path, env_file_encoding="utf-8", extra="ignore"
