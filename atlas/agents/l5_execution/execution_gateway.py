@@ -8,8 +8,18 @@ Strategy → OrderTracker → Risk → KillSwitch → BrokerAdapter → Position
 
 import asyncio
 import random
+import time
 import uuid
+from datetime import datetime
 from typing import Optional
+
+try:
+    from zoneinfo import ZoneInfo  # stdlib (py>=3.9); tzdata present on this host
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - fallback if tzdata missing
+    import pytz
+    _ET = pytz.timezone("America/New_York")
+
 from sqlalchemy.sql import text
 
 from loguru import logger
@@ -17,6 +27,7 @@ from redis.asyncio import Redis
 
 from atlas.core.agent_base import BaseAgent
 from atlas.core.event_lineage import EventLineageClient
+from atlas.core.exit_policy import resolve_exit_policy
 from atlas.agents.l4_risk.risk_controller import RiskController
 from atlas.agents.l4_risk.kill_switch import KillSwitch
 from atlas.data.storage.timescale_client import TimescaleClient
@@ -24,6 +35,31 @@ from atlas.config.settings import get_settings
 
 from .broker_adapter import BrokerAdapter
 from .order_tracker import OrderTracker, OrderState
+
+
+# --- Issue 1: market-hours gate -------------------------------------------------
+_CRYPTO_SUFFIXES = ("USDT", "USDC", "BUSD", "BTC", "ETH")
+
+
+def _is_crypto(symbol: str) -> bool:
+    s = (symbol or "").upper()
+    return any(s.endswith(suf) for suf in _CRYPTO_SUFFIXES)
+
+
+def is_market_open(symbol: str) -> bool:
+    """Crypto trades 24/7; US equities only on weekdays 09:30-16:00 ET.
+
+    Prevents placing equity paper orders against a frozen Friday close on
+    weekends/after-hours (every fill +$0.00, and duplicate fills accumulating).
+    """
+    if _is_crypto(symbol):
+        return True
+    now = datetime.now(_ET)
+    if now.weekday() >= 5:  # 5=Sat, 6=Sun
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
 from .position_manager import PositionManager
 from .recovery_manager import RecoveryManager
 from .dead_letter import DeadLetterManager
@@ -80,6 +116,11 @@ class ExecutionGateway(BaseAgent):
 
         self.tracker = OrderTracker(redis_client, db_client, instance_id=instance_id)
         self.positions = PositionManager(redis_client, db_client, broker)
+
+        # Issue 2: per-(symbol, side) cooldown to block duplicate simultaneous
+        # fills (multiple strategies firing the same signal in the same second).
+        self._last_trade_ts: dict[tuple[str, str], float] = {}
+        self._TRADE_COOLDOWN_S: float = 30.0
         self.dead_letter = DeadLetterManager(redis_client, db_client)
         self.recovery = RecoveryManager(
             redis_client,
@@ -357,7 +398,13 @@ class ExecutionGateway(BaseAgent):
             )
 
         estimated_price = params.get("estimated_price") or params.get("price") or 0.0
-        stop_pct = params.get("stop_loss_pct") or None
+        # PositionSizer's stop_loss_pct is a FRACTION of price, and it must be the
+        # SAME stop the position will exit at. params["stop_loss_pct"] is a PERCENT
+        # number (e.g. 0.3 == 0.3%); resolve it to a fraction via the shared exit
+        # policy so sizing and exits use one stop. (Previously the percent number
+        # was passed straight in, so a 0.3% design was mis-sized as a 30% stop.)
+        stop_frac = resolve_exit_policy(params)["stop_loss_frac"]
+        stop_pct = stop_frac if stop_frac > 0 else None
 
         return {
             "strategy_id": str(strategy.get("id")),
@@ -380,6 +427,27 @@ class ExecutionGateway(BaseAgent):
         sid = trade_req["strategy_id"]
         sym = trade_req["symbol"]
         side = trade_req["side"]
+
+        # Issue 1: market-hours gate. Skip equity orders when the US market is
+        # closed (weekends/after-hours) — otherwise they fill at a frozen close
+        # (every PnL +$0.00) and duplicate fills pile up in the trade log.
+        if not is_market_open(sym):
+            logger.info(f"Market closed for {sym} — skipping order ({side})")
+            return False
+
+        # Issue 2: per-(symbol, side) cooldown — block duplicate simultaneous
+        # entries from multiple strategies seeing the same signal. The check+set
+        # is synchronous (atomic under asyncio) so concurrent coroutines dedupe.
+        _cd_key = (sym, side)
+        _now = time.monotonic()
+        _last = self._last_trade_ts.get(_cd_key)
+        if _last is not None and (_now - _last) < self._TRADE_COOLDOWN_S:
+            logger.info(
+                f"Cooldown: {sym} {side} — "
+                f"{self._TRADE_COOLDOWN_S - (_now - _last):.0f}s remaining; skipping duplicate"
+            )
+            return False
+        self._last_trade_ts[_cd_key] = _now
 
         # 0. Risk-normalized position sizing (Phase 14 Fix)
         # We must obtain a real market price to size the position correctly.

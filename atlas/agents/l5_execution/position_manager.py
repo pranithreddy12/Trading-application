@@ -18,6 +18,11 @@ from loguru import logger
 from redis.asyncio import Redis
 
 from atlas.data.storage.timescale_client import TimescaleClient
+from atlas.core.exit_policy import (
+    resolve_exit_policy,
+    check_price_exit,
+    check_time_exit,
+)
 from .broker_adapter import BrokerAdapter
 from sqlalchemy.sql import text
 
@@ -60,10 +65,18 @@ class PositionManager:
     async def update_mark_to_market(self):
         """Calculate Unrealized PnL and enforce exit conditions."""
         async with self.db.engine.begin() as conn:
-            # Get all open positions
+            # Get all open positions. Sprint 0: also pull created_at (for the
+            # time-stop) and the owning strategy's parameters (for the designed
+            # SL/TP), so exits use the SAME policy the backtest validated under.
             r = await conn.execute(
                 text(
-                    "SELECT id, strategy_id, symbol, side, qty, avg_price, trace_id, feature_snapshot_id FROM positions"
+                    """
+                    SELECT p.id, p.strategy_id, p.symbol, p.side, p.qty,
+                           p.avg_price, p.trace_id, p.feature_snapshot_id,
+                           p.created_at, p.current_price, s.parameters
+                    FROM positions p
+                    LEFT JOIN strategies s ON s.id::text = p.strategy_id::text
+                    """
                 )
             )
             positions = r.fetchall()
@@ -82,13 +95,19 @@ class PositionManager:
             prices = {row[0]: float(row[1]) for row in r_prices.fetchall()}
 
             for pos in positions:
-                pid, sid, sym, side, qty, avg_price, tid, fsid = pos
+                pid, sid, sym, side, qty, avg_price, tid, fsid, created_at, last_mark, parameters = pos
                 qty = float(qty)
                 avg_price = float(avg_price)
 
-                current_price = prices.get(sym)
-                if current_price is None:
-                    continue
+                # Sprint 1C: use a live price when available; otherwise fall back to
+                # the last mark (or entry price) so the TIME-STOP can still fire for
+                # symbols with stale/absent market data (e.g. equities on weekends).
+                live_price = prices.get(sym)
+                price_is_live = live_price is not None
+                current_price = (
+                    float(live_price) if price_is_live
+                    else (float(last_mark) if last_mark else avg_price)
+                )
 
                 # Calculate Unrealized PnL
                 if side == "buy":
@@ -98,31 +117,56 @@ class PositionManager:
                     unrealized_pnl = qty * (avg_price - current_price)
                     pct_move = (avg_price - current_price) / avg_price
 
-                # Update MTM PnL in DB
-                await conn.execute(
-                    text(
-                        """
-                        UPDATE positions
-                        SET
-                            current_price = :cp,
-                            unrealized_pnl = :pnl,
-                            last_mark_time = NOW()
-                        WHERE id = :id
-                        """
-                    ),
-                    {
-                        "cp": current_price,
-                        "pnl": unrealized_pnl,
-                        "id": pid,
-                    },
-                )
+                # Update the MTM mark only with a LIVE price (never overwrite the
+                # last good mark with a stale fallback).
+                if price_is_live:
+                    await conn.execute(
+                        text(
+                            """
+                            UPDATE positions
+                            SET current_price = :cp, unrealized_pnl = :pnl, last_mark_time = NOW()
+                            WHERE id = :id
+                            """
+                        ),
+                        {"cp": current_price, "pnl": unrealized_pnl, "id": pid},
+                    )
 
-                # Enforce Exit Conditions (Stop Loss / Take Profit)
-                # Example: Stop Loss at -5%, Take Profit at +10%
-                if pct_move <= -0.05 or pct_move >= 0.10:
-                    exit_reason = "take_profit" if pct_move >= 0.10 else "stop_loss"
+                # Enforce Exit Conditions — Sprint 0 unified exit policy.
+                # Resolve the SAME stop_loss_pct / take_profit_pct / hold_time_max
+                # the strategy was designed and backtested under (was a hardcoded
+                # -5% / +10% bracket with no time-stop, which never matched the
+                # backtest). Falls back to defaults when parameters are absent.
+                policy = resolve_exit_policy(parameters)
+                # SL/TP require a LIVE price; the time-stop below fires regardless
+                # of price availability (Sprint 1C).
+                if price_is_live:
+                    triggered, exit_reason = check_price_exit(
+                        side,
+                        avg_price,
+                        current_price,
+                        policy["stop_loss_frac"],
+                        policy["take_profit_frac"],
+                    )
+                else:
+                    triggered, exit_reason = False, None
+
+                # Time-stop: mirror the backtest's hold_time_max (bars == minutes
+                # on the 1m feed). Catches positions the price legs never close.
+                if not triggered and created_at is not None:
+                    try:
+                        minutes_held = (
+                            datetime.now(created_at.tzinfo) - created_at
+                        ).total_seconds() / 60.0
+                    except Exception:
+                        minutes_held = 0.0
+                    if check_time_exit(minutes_held, policy["hold_time_max"]):
+                        triggered, exit_reason = True, "time_stop"
+
+                if triggered:
                     logger.info(
-                        f"Position {sym} ({sid}) triggered {exit_reason} at {current_price}"
+                        f"Position {sym} ({sid}) triggered {exit_reason} at {current_price} "
+                        f"(move={pct_move:+.3%}, SL={policy['stop_loss_pct']:.2f}% "
+                        f"TP={policy['take_profit_pct']:.2f}% hold_max={policy['hold_time_max']}m)"
                     )
                     # In a fully connected system, we'd emit an exit signal here.
                     # For demo purposes, we will close it directly.
@@ -162,7 +206,7 @@ class PositionManager:
             f"price={exit_price} "
             f"qty={qty} "
             f"side={exit_side} "
-            f"strategy={strategy_id[:8]}"
+            f"strategy={str(strategy_id)[:8]}"
         )
         import uuid
 
@@ -249,6 +293,18 @@ class PositionManager:
                     new_avg = (
                         existing_avg_price * existing_qty + avg_price * qty
                     ) / new_qty
+                    # Sprint 1C: re-check the ACCUMULATED notional against the
+                    # per-position cap. The incoming-order guard above only sized
+                    # one order; same-side re-entries could compound past the cap
+                    # (observed: META 2x$3.5k -> $7k). Reject the increase so the
+                    # per-position cap is never breached by accumulation.
+                    combined_notional = new_qty * new_avg
+                    if combined_notional > self.MAX_NOTIONAL_PER_POS:
+                        raise ValueError(
+                            f"Accumulated notional ${combined_notional:,.0f} for {symbol} "
+                            f"(existing {existing_qty:g} + {qty:g} @ ${new_avg:,.2f}) exceeds "
+                            f"MAX_NOTIONAL_PER_POS ${self.MAX_NOTIONAL_PER_POS:,.0f}; rejecting increase."
+                        )
                     update_query = "UPDATE positions SET qty = :qty, avg_price = :avg_price, updated_at = NOW(), trace_id = :tid, feature_snapshot_id = :fsid WHERE id = :id"
                     await conn.execute(
                         text(update_query),
