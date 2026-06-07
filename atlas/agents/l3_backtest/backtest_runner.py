@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 import pandas as pd
 import numpy as np
@@ -55,6 +56,7 @@ class DummyStrategy:
 class BacktestRunner(BaseAgent):
     MAX_CONCURRENT_BACKTESTS = 4
     QUEUE_PRESSURE_THRESHOLD = 500
+    CLAIM_BATCH_SIZE = 25  # Sprint 1D: rows claimed per iteration (claim-safe)
 
     def __init__(self, redis_client):
         super().__init__("BacktestRunner", "backtester", "L3", redis_client)
@@ -67,6 +69,19 @@ class BacktestRunner(BaseAgent):
         self.slippage_pct = 0.0005
         self.spread_cost_pct = 0.0005
         self.position_size = 0.10  # fixed position size (10% per trade)
+
+        # Sprint 1E — throughput knobs (env-driven; defaults preserve Sprint 1D
+        # behavior). For a multi-process backlog drain, keep CLAIM_BATCH_SIZE small
+        # so claimed_at reflects in-flight work, and raise the reclaim threshold so
+        # an in-progress batch is never reclaimed mid-run (the §11 double-process
+        # hazard). All instance-level so each process can be tuned independently.
+        self.MAX_CONCURRENT_BACKTESTS = int(
+            os.environ.get("ATLAS_MAX_CONCURRENT_BACKTESTS", self.MAX_CONCURRENT_BACKTESTS)
+        )
+        self.CLAIM_BATCH_SIZE = int(
+            os.environ.get("ATLAS_CLAIM_BATCH_SIZE", self.CLAIM_BATCH_SIZE)
+        )
+        self.RECLAIM_MINUTES = int(os.environ.get("ATLAS_RECLAIM_MINUTES", 10))
 
         # Dynamic slippage config
         self.DYN_SLIPPAGE_MIN_MULT = 0.5
@@ -86,29 +101,45 @@ class BacktestRunner(BaseAgent):
 
         while True:
             try:
-                strategies = await self.timescale.get_strategies_by_status(
-                    "pending_backtest"
+                # Sprint 1D: reclaim orphaned claims (a runner crashed mid-backtest,
+                # leaving rows stuck in 'backtesting') before claiming new work.
+                reclaimed = await self.timescale.reclaim_stale_backtesting(
+                    self.RECLAIM_MINUTES
+                )
+                if reclaimed:
+                    logger.warning(
+                        f"Reclaimed {reclaimed} stale 'backtesting' rows -> pending_backtest"
+                    )
+
+                # Backlog size (for the queue-pressure signal / logging).
+                backlog = await self.timescale.count_by_status("pending_backtest")
+                if backlog > self.QUEUE_PRESSURE_THRESHOLD:
+                    logger.warning(
+                        f"Backtest queue pressure: {backlog} pending "
+                        f"(threshold={self.QUEUE_PRESSURE_THRESHOLD}) — signaling throttle"
+                    )
+                    await self.messaging.publish(
+                        Channel.STRATEGY_SIGNALS,
+                        {
+                            "type": "queue_pressure",
+                            "pending_count": backlog,
+                            "action": "throttle_ideator",
+                        },
+                    )
+
+                # Sprint 1D: claim a batch atomically (FOR UPDATE SKIP LOCKED ->
+                # status 'backtesting'). Two concurrent runners can never receive
+                # the same rows, so it is now safe to run multiple instances.
+                strategies = await self.timescale.claim_pending_backtest(
+                    self.CLAIM_BATCH_SIZE
                 )
 
                 if strategies:
-                    print(f"=== FOUND {len(strategies)} STRATEGIES ===", flush=True)
-                    logger.info(f"Found {len(strategies)} pending_backtest strategies")
+                    print(f"=== CLAIMED {len(strategies)} STRATEGIES ===", flush=True)
+                    logger.info(
+                        f"Claimed {len(strategies)} strategies (backlog={backlog})"
+                    )
                     consecutive_errors = 0
-
-                    # Queue governor: signal Ideator to throttle when backlog exceeds threshold
-                    if len(strategies) > self.QUEUE_PRESSURE_THRESHOLD:
-                        logger.warning(
-                            f"Backtest queue pressure: {len(strategies)} pending "
-                            f"(threshold={self.QUEUE_PRESSURE_THRESHOLD}) — signaling throttle"
-                        )
-                        await self.messaging.publish(
-                            Channel.STRATEGY_SIGNALS,
-                            {
-                                "type": "queue_pressure",
-                                "pending_count": len(strategies),
-                                "action": "throttle_ideator",
-                            },
-                        )
 
                     sem = asyncio.Semaphore(self.MAX_CONCURRENT_BACKTESTS)
 
@@ -247,6 +278,25 @@ class BacktestRunner(BaseAgent):
                     raise ValueError(
                         "No valid strategy class with generate_signals found"
                     )
+
+                # === Sprint 0: unify exits ===
+                # The generated class never sets SL/TP, so the backtest used to
+                # run with stops DISABLED while live forced a hardcoded -5/+10.
+                # Resolve the strategy's DESIGNED stop_loss_pct/take_profit_pct
+                # (percent numbers) into fractions and attach them to the
+                # instance, so the trade state machine below applies the exact
+                # same exits the live MTM loop will. (Time-stop/hold_time_max is
+                # already embedded in the generated generate_signals().)
+                from atlas.core.exit_policy import resolve_exit_policy
+                _exit_policy = resolve_exit_policy(params)
+                strategy_instance.stop_loss_pct = _exit_policy["stop_loss_frac"]
+                strategy_instance.take_profit_pct = _exit_policy["take_profit_frac"]
+                logger.info(
+                    f"{strategy_id}: Exit policy — "
+                    f"SL={_exit_policy['stop_loss_pct']:.2f}% "
+                    f"TP={_exit_policy['take_profit_pct']:.2f}% "
+                    f"hold_max={_exit_policy['hold_time_max']} bars"
+                )
 
             except Exception as e:
                 await self._log_exec_failure(strategy_id, code, e)
@@ -992,7 +1042,10 @@ class BacktestRunner(BaseAgent):
         #   -1 = enter short OR exit long
         # Also checks stop-loss/take-profit on each bar while in position.
         # =====================================================
-        # Extract SL/TP from strategy instance (default: disabled)
+        # Extract SL/TP from strategy instance. Sprint 0: these are now set
+        # from the strategy's designed params via exit_policy.resolve_exit_policy
+        # (as FRACTIONS) at instantiation time. Falls back to 0.0 (disabled)
+        # only if the instance was constructed without that step.
         sl_pct = getattr(strategy, "stop_loss_pct", 0.0)
         tp_pct = getattr(strategy, "take_profit_pct", 0.0)
 

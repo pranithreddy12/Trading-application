@@ -284,7 +284,7 @@ class BinanceRestClient:
                 return
             except Exception as exc:
                 self.errors += 1
-                logger.warning(f"[bars] {symbol} error: {exc}")
+                logger.warning(f"[bars] {symbol} error: {repr(exc)}")
 
             await asyncio.sleep(self.poll_bars)
 

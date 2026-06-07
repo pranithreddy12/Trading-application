@@ -300,3 +300,14 @@ CREATE INDEX IF NOT EXISTS idx_scout_quarantine_time ON scout_quarantine (quaran
 -- Add trace_id to strategies
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS trace_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_strategies_trace ON strategies (trace_id);
+
+-- Add strategy_family to strategies (set by save_strategy(); previously only added
+-- out-of-band by scripts/add_missing_columns.py, which made it absent on fresh DBs)
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS strategy_family TEXT;
+CREATE INDEX IF NOT EXISTS idx_strategies_family ON strategies (strategy_family);
+
+-- Sprint 1D: claim bookkeeping for race-safe backtest claiming (FOR UPDATE SKIP LOCKED).
+-- claimed_at stamps when a row was moved pending_backtest -> backtesting so a crashed
+-- runner's orphaned claims can be reclaimed by age.
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_strategies_status ON strategies (status);

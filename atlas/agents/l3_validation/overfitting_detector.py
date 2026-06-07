@@ -77,10 +77,19 @@ class OverfittingDetector(BaseAgent):
             "noise_degradation_pct": float,
           }
         """
+        # Sprint 1C: persist a row on EVERY return path so advanced-validation
+        # coverage is complete (require-coverage governance). Previously these
+        # early returns wrote nothing — and base_return<=0 is the common case for
+        # weak strategies, which is why overfitting_analysis stalled. A strategy
+        # that can't be verified is treated as overfit (probability 1.0).
         if df is None or len(df) < 30:
-            return self._empty_result("insufficient_data")
+            res = self._empty_result("insufficient_data")
+            await self._persist(strategy_id, res)
+            return res
         if signals is None or (signals == 0).all():
-            return self._empty_result("no_signals")
+            res = self._empty_result("no_signals")
+            await self._persist(strategy_id, res)
+            return res
 
         close = df["close"].values
         base_rets = np.diff(close) / close[:-1]
@@ -88,7 +97,7 @@ class OverfittingDetector(BaseAgent):
         base_return = float(np.sum(base_pos * base_rets))
 
         if base_return <= 0:
-            return {
+            res = {
                 "overfit_probability": 1.0,
                 "robustness_score": 0.0,
                 "parameter_stability_score": 0.0,
@@ -96,6 +105,8 @@ class OverfittingDetector(BaseAgent):
                 "noise_degradation_pct": 0.0,
                 "error": "non_positive_base_return",
             }
+            await self._persist(strategy_id, res)
+            return res
 
         # ---- Shuffle Test ----
         shuffle_returns = []

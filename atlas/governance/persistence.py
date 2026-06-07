@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     DateTime,
     create_engine,
+    event,
     select,
 )
 from sqlalchemy import text
@@ -37,7 +38,26 @@ class GovernancePersistenceLayer:
 
     def __init__(self, db_url: str | None = None):
         self.db_url = db_url or f"sqlite:///{DB_PATH}"
-        self.engine = create_engine(self.db_url, connect_args={"check_same_thread": False})
+        self.engine = create_engine(
+            self.db_url,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+        # Sprint 1E — governance.db is a single-writer SQLite sitting in the backtest
+        # hot path. Tune connection-level pragmas for throughput + concurrency WITHOUT
+        # changing any governance logic or what gets recorded:
+        #   WAL                -> writers don't block readers; no whole-file lock
+        #                         (lets multiple BacktestRunners coexist safely)
+        #   synchronous=NORMAL -> fsync at checkpoint, not every commit (safe under WAL)
+        #   busy_timeout       -> wait for the lock instead of erroring "database is locked"
+        if str(self.db_url).startswith("sqlite"):
+
+            @event.listens_for(self.engine, "connect")
+            def _set_sqlite_pragmas(dbapi_conn, _rec):  # noqa: ANN001
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA synchronous=NORMAL")
+                cur.execute("PRAGMA busy_timeout=30000")
+                cur.close()
         self.metadata = MetaData()
         # Core tables
         self.operation_log = Table(

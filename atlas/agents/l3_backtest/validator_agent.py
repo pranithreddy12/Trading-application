@@ -1,7 +1,9 @@
 import asyncio
 import math
+import os
 from loguru import logger
 from atlas.core.agent_base import BaseAgent
+from atlas.core.score_contract import evaluate_advanced_governance
 from atlas.data.storage.timescale_client import TimescaleClient
 from atlas.config.settings import settings
 from atlas.agents.l3_backtest.short_window_evaluator import (
@@ -24,13 +26,14 @@ class ValidatorAgent(BaseAgent):
     agent_type = "validator"
     layer = "L3"
 
-    # Production thresholds (strict)
+    # Production thresholds — aligned to spec Section VII "Paper Trading Minimum"
+    # (SQF-ATLAS-2026-001). Stricter live minimums are enforced downstream.
     PROD_RULES = {
-        "min_sharpe": 1.0,
-        "max_drawdown": -25.0,
-        "min_trades": 50,
-        "min_win_rate": 0.45,
-        "min_profit_factor": 1.2,
+        "min_sharpe": 1.5,          # spec: Sharpe (annualized) >= 1.5
+        "max_drawdown": -15.0,      # spec: Max Drawdown <= 15%
+        "min_trades": 100,          # spec: Number of Trades >= 100
+        "min_win_rate": 0.45,       # spec: Win Rate >= 45%
+        "min_profit_factor": 1.5,   # spec: Profit Factor >= 1.5
         "max_drawdown_absolute": -100.0,  # HARD GATE: No drawdown below -100%
         "overfit_ratio": 0.5,
     }
@@ -195,6 +198,20 @@ class ValidatorAgent(BaseAgent):
             # Regime robustness score [0,1] — rewards multi-regime strategies
             regime_score = float(self._safe(self._extract(result, "regime_score"), 0.5))
 
+            # ── Sprint 1B: advanced-validator governance (additive overlay) ──
+            # Env-driven. ADVISORY (default) computes + logs but never changes
+            # status; ENFORCE demotes validated/elite → research_candidate on
+            # failure (require-coverage policy). Do NOT flip to ENFORCE until the
+            # advanced-validator backfill is complete and a soak has been analyzed.
+            gov_profile = os.environ.get("VALIDATION_PROFILE", "calibration")
+            gov_mode = os.environ.get("ADVANCED_GOVERNANCE_MODE", "ADVISORY").upper()
+            try:
+                advanced_metrics = await self.db.get_advanced_validation(strategy_id)
+            except Exception as _e:
+                logger.debug(f"{name}: advanced-validation fetch failed: {_e}")
+                advanced_metrics = {}
+            governance = evaluate_advanced_governance(advanced_metrics, gov_profile)
+
             # ------------------------------------------------------------------
             # SCOUT-AWARE DYNAMIC VALIDATION (Phase 10.9)
             # Adjust pass thresholds based on live market conditions.
@@ -211,6 +228,21 @@ class ValidatorAgent(BaseAgent):
                     failed_tests.append(f"scout_strict: adjusted_score {adjusted_score:.1f} < 50")
 
             status = self._assign_tier(score, scored_passed, result)
+
+            # Sprint 1B governance application — advisory by default.
+            if status in ("validated", "elite") and not governance["passed"]:
+                if gov_mode == "ENFORCE":
+                    logger.info(
+                        f"{name}: advanced-governance ENFORCE demote "
+                        f"{status}→research_candidate [{gov_profile}] {governance['failures']}"
+                    )
+                    status = "research_candidate"
+                else:
+                    logger.info(
+                        f"{name}: advanced-governance ADVISORY would-demote "
+                        f"{status} [{gov_profile}] {governance['failures']}"
+                    )
+
             notes = self._build_notes(result, score, grade, status, failed_tests)
 
             # Persist validation metrics into strategy parameters via update (as validation_notes)
@@ -223,6 +255,11 @@ class ValidatorAgent(BaseAgent):
                 "regime_score": regime_score,
                 "composite_score": score,
                 "tier": status,
+                "advanced_governance_mode": gov_mode,
+                "advanced_governance_profile": gov_profile,
+                "advanced_governance_passed": governance["passed"],
+                "advanced_governance_failures": governance["failures"],
+                "advanced_metrics": governance["details"],
             }
 
             # Compute short pass-rate snapshot (validated vs total)
@@ -338,14 +375,17 @@ class ValidatorAgent(BaseAgent):
 
         env = getattr(settings, "environment", "dev")
         
-        # HARD GATE: Trades < 50 cannot become validated (Phase 8 requirement)
+        # HARD SIGNIFICANCE GATE: trades below the floor cannot become
+        # validated/elite REGARDLESS of composite score (dev 50 / prod 100 per
+        # spec Section VII). Closes the score>=60 bypass that admitted 213/225
+        # of the validated pool with <50 trades.
         total_trades = 0
         if result:
             total_trades = int(self._safe(self._extract(result, "total_trades"), 0))
         
         if env in ("dev", "staging"):
             if score >= 60:
-                return "elite" if total_trades >= 50 else "validated"
+                return "research_candidate" if total_trades < 50 else "elite"
             if score >= 35:
                 if total_trades < 50:
                     return "research_candidate"  # Cannot be validated with <50 trades
@@ -357,11 +397,9 @@ class ValidatorAgent(BaseAgent):
             return "failed_validation"
 
         if score >= 90:
-            return "elite" if total_trades >= 50 else "validated"
+            return "research_candidate" if total_trades < 100 else "elite"
         if score >= 70:
-            if total_trades < 50:
-                return "research_candidate"
-            return "validated"
+            return "research_candidate" if total_trades < 100 else "validated"
         if score >= 50:
             return "research_candidate"
         if score >= 30:

@@ -32,11 +32,10 @@ from atlas.core.execution_cost_intelligence import (
 from atlas.agents.l3_backtest.regime_selector import RegimeSelector
 
 ARCHETYPES = [
-    "momentum",
-    "mean_reversion",
-    "breakout",
-    "volatility_regime",
-    "trend_following",
+    "mean_reversion", "mean_reversion", "mean_reversion",
+    "momentum", "momentum", "momentum",
+    "breakout", "breakout",
+    "trend_following", "trend_following"
 ]
 
 TEMP_MAP = [0.4, 0.7, 0.5, 0.85, 1.0]
@@ -367,6 +366,57 @@ STRATEGY_GRAMMAR = {
         ],
         "valid_regimes": ["ranging", "normal_vol", "oversold"],
     },
+    "trend_pullback": {
+        "families": ["trend", "oscillator"],
+        "secondary": ["momentum"],
+        "entry_templates": [
+            ("trend_strength", ">", (0.002, 0.005)),
+            ("rsi_14", "<", (40, 50)),
+            ("price_vs_vwap_pct", "<", (0.0, 0.002)),
+        ],
+        "exit_templates": [
+            ("rsi_14", ">", (65, 75)),
+            ("trend_strength", "<", (0.0, 0.001)),
+        ],
+        "valid_regimes": ["trending", "bullish"],
+    },
+    "ema_cross": {
+        "families": ["trend"],
+        "secondary": ["momentum", "volume"],
+        "entry_templates": [
+            ("ema_spread_pct", ">", (0.001, 0.003)),
+            ("trend_strength", ">", (0.001, 0.003)),
+        ],
+        "exit_templates": [
+            ("ema_spread_pct", "<", (-0.001, 0.0)),
+        ],
+        "valid_regimes": ["trending", "bullish"],
+    },
+    "donchian_breakout": {
+        "families": ["volatility", "momentum"],
+        "secondary": ["volume"],
+        "entry_templates": [
+            ("bollinger_band_position", ">", (0.9, 1.0)),
+            ("relative_volume", ">", (1.5, 2.5)),
+        ],
+        "exit_templates": [
+            ("bollinger_band_position", "<", (0.5, 0.6)),
+        ],
+        "valid_regimes": ["high_vol", "trending"],
+    },
+    "adx_trend": {
+        "families": ["trend", "momentum"],
+        "secondary": ["volatility"],
+        "entry_templates": [
+            ("trend_strength", ">", (0.003, 0.006)),
+            ("volatility_regime", ">", (1.1, 1.5)),
+            ("price_vs_vwap_pct", ">", (0.001, 0.004)),
+        ],
+        "exit_templates": [
+            ("trend_strength", "<", (0.001, 0.002)),
+        ],
+        "valid_regimes": ["trending", "high_vol"],
+    },
 }
 
 # =====================================================
@@ -400,6 +450,22 @@ ARCHETYPE_RISK_PROFILES = {
     "liquidity_absorption": {
         "sl_pct": 0.4, "tp_pct": 0.8, "hold_min": 3, "hold_max": 25,
         "cooldown": 4, "rr_ratio": 2.0,
+    },
+    "trend_pullback": {
+        "sl_pct": 0.5, "tp_pct": 1.5, "hold_min": 5, "hold_max": 40,
+        "cooldown": 8, "rr_ratio": 3.0,
+    },
+    "ema_cross": {
+        "sl_pct": 0.6, "tp_pct": 2.0, "hold_min": 10, "hold_max": 80,
+        "cooldown": 12, "rr_ratio": 3.3,
+    },
+    "donchian_breakout": {
+        "sl_pct": 0.8, "tp_pct": 2.5, "hold_min": 5, "hold_max": 60,
+        "cooldown": 10, "rr_ratio": 3.1,
+    },
+    "adx_trend": {
+        "sl_pct": 0.7, "tp_pct": 3.0, "hold_min": 15, "hold_max": 100,
+        "cooldown": 15, "rr_ratio": 4.2,
     },
 }
 

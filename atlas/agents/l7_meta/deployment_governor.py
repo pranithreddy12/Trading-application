@@ -60,6 +60,7 @@ class DeploymentGovernor(BaseAgent):
         while self.status == "running":
             try:
                 await self._select_and_promote_paper_candidates()
+                await self._evaluate_paper_strategies_for_promotion()
                 await self._sweep_pending_deployments()
                 await self._check_live_regressions()
             except Exception as e:
@@ -307,6 +308,68 @@ class DeploymentGovernor(BaseAgent):
             },
         )
 
+    async def _evaluate_paper_strategies_for_promotion(self):
+        """
+        Evaluate strategies currently in paper mode.
+        If they meet high performance standards based on real paper trades,
+        promote them to shadow or partial_live.
+        """
+        async with self.db.engine.connect() as conn:
+            r = await conn.execute(
+                text("""
+                    SELECT 
+                        d.id as deployment_id,
+                        d.strategy_id,
+                        sp.monthly_return_pct,
+                        sp.sharpe_ratio,
+                        sp.profit_factor,
+                        sp.max_drawdown_pct,
+                        sp.total_trades,
+                        sp.win_rate
+                    FROM deployment_governance d
+                    JOIN strategy_performance sp ON d.strategy_id = sp.strategy_id::text
+                    WHERE d.status = 'paper' 
+                      AND sp.total_trades >= 5
+                """)
+            )
+            candidates = r.fetchall()
+
+        for row in candidates:
+            d_dict = dict(row._mapping)
+            dep_id = str(d_dict['deployment_id'])
+            strategy_id = str(d_dict['strategy_id'])
+            
+            # Use 0 for missing metrics to penalize lack of data safely
+            ret = float(d_dict.get('monthly_return_pct') or 0.0)
+            sharpe = float(d_dict.get('sharpe_ratio') or 0.0)
+            pf = float(d_dict.get('profit_factor') or 0.0)
+            win_rate = float(d_dict.get('win_rate') or 0.0)
+            # Expectancy approximation: PF is used, we can also use win_rate for proxy
+            expectancy = pf * win_rate 
+            dd = float(d_dict.get('max_drawdown_pct') or 0.0)
+            
+            # User-defined deployment score formula
+            deployment_score = (0.30 * ret) + (0.25 * sharpe) + (0.20 * pf) + (0.15 * expectancy) - (0.10 * dd)
+            
+            # Minimum threshold for promotion
+            if deployment_score > 5.0 and ret > 5.0:
+                logger.info(
+                    f"{self.name}: Strategy {strategy_id} passed paper threshold! "
+                    f"Score: {deployment_score:.2f} (Ret:{ret:.1f}%, PF:{pf:.2f})"
+                )
+                # Promote to live (or shadow/partial_live)
+                await self.propose_deployment(
+                    strategy_id=strategy_id,
+                    proposed_by="DeploymentGovernor(performance_promotion)",
+                    mode="live",
+                    metadata={
+                        "selection_method": "performance_score",
+                        "deployment_score": deployment_score,
+                        "monthly_return_pct": ret,
+                        "profit_factor": pf,
+                    },
+                )
+
     async def _check_live_regressions(self):
         """Check for performance regressions in live strategies."""
         async with self.db.engine.connect() as conn:
@@ -333,6 +396,12 @@ class DeploymentGovernor(BaseAgent):
 
     # Deployment gate thresholds by mode
     # Progressive: paper (lenient) → shadow → partial_live → live (strict)
+    # UNIT FIX (Sprint 1B): walk_forward_score is a FRACTION in [0, 1] (fraction
+    # of windows survived), as persisted by WalkForwardAnalyzer. The previous
+    # 30.0/40.0/50.0 thresholds were on a 0–100 scale and therefore unreachable
+    # (observed max ~0.80), silently disabling the gate. Restated on [0, 1] to
+    # match the Sprint 1B calibration→spec band (overfit/regime/monte_carlo were
+    # already correct fractions).
     GATE_THRESHOLDS = {
         "paper": {
             "min_walk_forward_score": 0.0,
@@ -341,19 +410,19 @@ class DeploymentGovernor(BaseAgent):
             "min_monte_carlo_survival": 0.0,
         },
         "shadow": {
-            "min_walk_forward_score": 30.0,
+            "min_walk_forward_score": 0.30,  # was 30.0 (unit bug); >=30% windows
             "max_overfit_probability": 0.7,
             "min_regime_survival": 0.2,  # At least 1/5 regimes
             "min_monte_carlo_survival": 0.3,  # 30% sims positive
         },
         "partial_live": {
-            "min_walk_forward_score": 40.0,
+            "min_walk_forward_score": 0.45,  # was 40.0 (unit bug)
             "max_overfit_probability": 0.6,
             "min_regime_survival": 0.4,  # At least 2/5 regimes
             "min_monte_carlo_survival": 0.5,  # 50% sims positive
         },
         "live": {
-            "min_walk_forward_score": 50.0,
+            "min_walk_forward_score": 0.60,  # was 50.0 (unit bug); spec >=60% windows
             "max_overfit_probability": 0.5,
             "min_regime_survival": 0.6,  # At least 3/5 regimes
             "min_monte_carlo_survival": 0.7,  # 70% sims positive

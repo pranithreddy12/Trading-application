@@ -4165,15 +4165,27 @@ class TimescaleClient:
                 f"Missing strategy_name in spec. Keys: {list(spec.keys())} | spec: {spec}"
             )
 
+        strategy_family = spec.get("strategy_family")
+        if not strategy_family and strategy_name:
+            parts = strategy_name.split("_")
+            if len(parts) >= 2:
+                if parts[1] in ("equity", "crypto"):
+                    strategy_family = parts[0]
+                elif len(parts) >= 3 and parts[2] in ("equity", "crypto"):
+                    strategy_family = f"{parts[0]}_{parts[1]}"
+                else:
+                    strategy_family = parts[0]
+
         strategy_id = str(uuid.uuid4())
         trace_id = str(uuid.uuid4())
         query = """
-            INSERT INTO strategies (id, name, code, parameters, status, created_at, author_agent, prompt, raw_response, normalized_strategy, strategy_signature, trace_id, generation_batch)
-            VALUES (:id, :name, :code, :parameters, :status, :created_at, :author_agent, :prompt, :raw_response, :normalized_strategy, :strategy_signature, :trace_id, :generation_batch)
+            INSERT INTO strategies (id, name, strategy_family, code, parameters, status, created_at, author_agent, prompt, raw_response, normalized_strategy, strategy_signature, trace_id, generation_batch)
+            VALUES (:id, :name, :strategy_family, :code, :parameters, :status, :created_at, :author_agent, :prompt, :raw_response, :normalized_strategy, :strategy_signature, :trace_id, :generation_batch)
         """
         params = {
             "id": strategy_id,
             "name": strategy_name,
+            "strategy_family": strategy_family,
             "code": "",
             "parameters": json.dumps(spec),
             "status": status,
@@ -4269,14 +4281,67 @@ class TimescaleClient:
                 stage="coder",
             )
 
+    async def get_advanced_validation(self, strategy_id: str) -> dict:
+        """Fetch the latest advanced-validation metrics for a strategy (Sprint 1B).
+
+        These live in four separate tables populated by
+        BacktestRunner._run_advanced_validation and are NOT part of
+        backtest_results, so they need a dedicated accessor. Returns a flat dict
+        with each metric (None where that validator produced no row):
+            walk_forward_score, monte_carlo_survival_score, overfit_probability,
+            regime_survival_score, n_regimes_survived
+        Consumed by ValidatorAgent's advanced-governance gate.
+        """
+        async with self.engine.connect() as conn:
+            result = await conn.execute(
+                text("""
+                    SELECT
+                      wf.walk_forward_score          AS walk_forward_score,
+                      mc.monte_carlo_survival_score  AS monte_carlo_survival_score,
+                      od.overfit_probability         AS overfit_probability,
+                      rv.regime_survival_score       AS regime_survival_score,
+                      rv.n_regimes_survived          AS n_regimes_survived
+                    FROM (SELECT 1) base
+                    LEFT JOIN LATERAL (
+                        SELECT walk_forward_score FROM walk_forward_analysis w
+                        WHERE w.strategy_id = :sid ORDER BY analyzed_at DESC LIMIT 1
+                    ) wf ON true
+                    LEFT JOIN LATERAL (
+                        SELECT monte_carlo_survival_score FROM monte_carlo_analysis m
+                        WHERE m.strategy_id = :sid ORDER BY simulated_at DESC LIMIT 1
+                    ) mc ON true
+                    LEFT JOIN LATERAL (
+                        SELECT overfit_probability FROM overfitting_analysis o
+                        WHERE o.strategy_id = :sid ORDER BY analyzed_at DESC LIMIT 1
+                    ) od ON true
+                    LEFT JOIN LATERAL (
+                        SELECT regime_survival_score, n_regimes_survived
+                        FROM regime_validation r
+                        WHERE r.strategy_id = :sid ORDER BY validated_at DESC LIMIT 1
+                    ) rv ON true
+                """),
+                {"sid": str(strategy_id)},
+            )
+            row = result.fetchone()
+            return dict(row._mapping) if row else {}
+
     async def get_backtest_result(self, strategy_id: str) -> dict | None:
-        """Fetch latest backtest result for a strategy"""
+        """Fetch latest backtest result for a strategy.
+
+        Sprint 1C: a strategy can have MULTIPLE backtest_results rows (re-backtests
+        on newer data create new (strategy_id,start,end) PKs — observed up to 7 per
+        strategy). Without ORDER BY, fetchone() returned an arbitrary/stale row, so
+        the ValidatorAgent could validate against an old backtest. Always take the
+        most recent by end_date.
+        """
         async with self.engine.connect() as conn:
             result = await conn.execute(
                 text("""
                     SELECT *, results::jsonb as results_json
                     FROM backtest_results
                     WHERE strategy_id = :sid
+                    ORDER BY end_date DESC
+                    LIMIT 1
                 """),
                 {"sid": str(strategy_id)},
             )
@@ -4358,6 +4423,79 @@ class TimescaleClient:
                 actor="TimescaleClient",
                 stage="status_update",
             )
+
+    async def count_by_status(self, status: str) -> int:
+        """Cheap count of strategies in a given status (for backlog signals)."""
+        async with self.engine.connect() as conn:
+            return int(
+                await conn.scalar(
+                    text("SELECT count(*) FROM strategies WHERE status = :s"),
+                    {"s": status},
+                )
+                or 0
+            )
+
+    async def claim_pending_backtest(self, limit: int) -> list[dict]:
+        """Sprint 1D — atomically claim up to `limit` pending_backtest strategies.
+
+        Uses FOR UPDATE SKIP LOCKED inside a single statement and transitions the
+        claimed rows pending_backtest -> backtesting BEFORE returning them, so two
+        concurrent BacktestRunners can never claim the same strategy (no duplicate
+        backtests / racing status & result writes). Returns the claimed rows in the
+        same shape as get_strategies_by_status.
+        """
+        query = """
+            WITH claimed AS (
+                SELECT id
+                FROM strategies
+                WHERE status = 'pending_backtest'
+                ORDER BY created_at
+                LIMIT :n
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE strategies s
+            SET status = 'backtesting', claimed_at = NOW()
+            FROM claimed
+            WHERE s.id = claimed.id
+            RETURNING s.id, s.name, s.code, s.parameters, s.status,
+                      s.created_at, s.author_agent, s.trace_id
+        """
+        async with self.engine.begin() as conn:
+            rows = (await conn.execute(text(query), {"n": int(limit)})).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": str(r[0]),
+                    "name": r[1],
+                    "code": r[2],
+                    "parameters": r[3] if isinstance(r[3], dict) else json.loads(r[3]),
+                    "status": r[4],
+                    "created_at": r[5],
+                    "author_agent": r[6],
+                    "trace_id": str(r[7]) if r[7] else None,
+                }
+            )
+        return out
+
+    async def reclaim_stale_backtesting(self, older_than_minutes: int = 10) -> int:
+        """Sprint 1D — requeue strategies stuck in 'backtesting' (a runner crashed
+        mid-backtest) back to 'pending_backtest' so work is never permanently lost.
+        """
+        async with self.engine.begin() as conn:
+            res = await conn.execute(
+                text(
+                    """
+                    UPDATE strategies
+                    SET status = 'pending_backtest'
+                    WHERE status = 'backtesting'
+                      AND (claimed_at IS NULL
+                           OR claimed_at < NOW() - make_interval(mins => :m))
+                    """
+                ),
+                {"m": int(older_than_minutes)},
+            )
+            return res.rowcount or 0
 
     async def get_strategies_by_status(self, status: str) -> list[dict]:
         """Returns all strategies matching status"""
@@ -5324,3 +5462,63 @@ class TimescaleClient:
     # ================================================================
     # PHASE 26 — SCOUT COUPLING TELEMETRY METHODS
     # ================================================================
+
+    # ================================================================
+    # PHASE 31 — STRATEGY PERFORMANCE LEAGUE TABLE
+    # ================================================================
+    async def update_strategy_performance(self) -> None:
+        """Calculate paper trading metrics and upsert into strategy_performance."""
+        query = """
+            WITH trade_stats AS (
+                SELECT 
+                    strategy_id,
+                    COUNT(*) as total_trades,
+                    SUM(pnl) as realized_pnl,
+                    AVG(CASE WHEN pnl > 0 THEN pnl END) as avg_win,
+                    AVG(CASE WHEN pnl < 0 THEN pnl END) as avg_loss,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END)::numeric / NULLIF(COUNT(*), 0) as win_rate,
+                    (SUM(CASE WHEN pnl > 0 THEN pnl END) / NULLIF(ABS(SUM(CASE WHEN pnl < 0 THEN pnl END)), 0)) as profit_factor,
+                    AVG(pnl) as avg_trade_pnl
+                FROM paper_trades
+                GROUP BY strategy_id
+            ),
+            pos_stats AS (
+                SELECT 
+                    strategy_id,
+                    SUM(unrealized_pnl) as unrealized_pnl
+                FROM positions
+                GROUP BY strategy_id
+            )
+            INSERT INTO strategy_performance (
+                strategy_id, computed_at, total_trades, realized_pnl, unrealized_pnl,
+                avg_trade_pnl, win_rate, profit_factor, expectancy, monthly_return_pct
+            )
+            SELECT 
+                ts.strategy_id,
+                NOW(),
+                ts.total_trades,
+                ts.realized_pnl,
+                COALESCE(ps.unrealized_pnl, 0),
+                ts.avg_trade_pnl,
+                ts.win_rate,
+                ts.profit_factor,
+                (ts.win_rate * COALESCE(ts.avg_win, 0)) + ((1 - ts.win_rate) * COALESCE(ts.avg_loss, 0)),
+                (ts.realized_pnl + COALESCE(ps.unrealized_pnl, 0)) / 5000.0 * 100.0 -- Approx return on $5k allocation
+            FROM trade_stats ts
+            LEFT JOIN pos_stats ps ON ps.strategy_id = ts.strategy_id
+            ON CONFLICT (strategy_id) DO UPDATE SET
+                computed_at = NOW(),
+                total_trades = EXCLUDED.total_trades,
+                realized_pnl = EXCLUDED.realized_pnl,
+                unrealized_pnl = EXCLUDED.unrealized_pnl,
+                avg_trade_pnl = EXCLUDED.avg_trade_pnl,
+                win_rate = EXCLUDED.win_rate,
+                profit_factor = EXCLUDED.profit_factor,
+                expectancy = EXCLUDED.expectancy,
+                monthly_return_pct = EXCLUDED.monthly_return_pct;
+        """
+        async with self.engine.begin() as conn:
+            try:
+                await conn.execute(text(query))
+            except Exception as e:
+                logger.error(f"Failed to update strategy_performance: {e}")

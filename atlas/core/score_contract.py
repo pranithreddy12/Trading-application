@@ -151,3 +151,115 @@ def compute_advanced_institutional_score(results: dict) -> float:
                 pass
 
     return max(0.0, min(100.0, composite))
+
+
+# =====================================================================
+# Sprint 1B — ADVANCED VALIDATOR GOVERNANCE (additive hard-gate overlay)
+# =====================================================================
+# This is a SEPARATE pass/fail overlay on the four advanced validators. It does
+# NOT modify compute_institutional_score (the base score is preserved). The
+# caller (ValidatorAgent) decides whether to ENFORCE (block validated/elite) or
+# run ADVISORY (compute + log only).
+#
+# CRITICAL UNIT NOTE: all four metrics are FRACTIONS in [0, 1] as persisted by
+# BacktestRunner._run_advanced_validation (walk_forward_score, monte_carlo_
+# survival_score, overfit_probability, regime_survival_score). The regime gate
+# uses the integer COUNT n_regimes_survived (0..5) to map directly to the master
+# spec's "≥3 of 5 regimes". Thresholds must therefore be expressed on these
+# native scales — NOT 0..100 (the bug that made DeploymentGovernor's
+# min_walk_forward_score of 30/40/50 unreachable).
+ADVANCED_GOVERNANCE_THRESHOLDS = {
+    # Calibration: lets the current best strategies through while backtests are
+    # still short. Empirically (June 2026): wf max 0.80/avg 0.09, mc avg 0.39,
+    # overfit avg 0.18, n_regimes_survived max 3.
+    "calibration": {
+        "min_walk_forward_score": 0.30,
+        "min_monte_carlo_survival": 0.50,
+        "max_overfit_probability": 0.50,
+        "min_regimes_survived": 2,
+    },
+    # Spec: master-spec Section VII targets (paper minimums). Almost nothing
+    # passes today — intended for once backtests produce ≥100 trades / longer
+    # windows. Same precedence as the Sprint 1 trade-count floor.
+    "spec": {
+        "min_walk_forward_score": 0.60,   # spec: profitable in >=60% of windows
+        "min_monte_carlo_survival": 0.70,
+        "max_overfit_probability": 0.50,
+        "min_regimes_survived": 3,         # spec: >=3 of 5 regimes
+    },
+}
+
+
+def evaluate_advanced_governance(advanced: dict, profile: str = "calibration") -> dict:
+    """Additive hard-gate evaluation over the four advanced validators.
+
+    Policy = REQUIRE-COVERAGE: a missing metric (no validator row) is a FAILURE —
+    a strategy cannot be considered robust without having survived the adversary
+    layer. The caller enforces or merely logs this result.
+
+    Args:
+        advanced: dict from TimescaleClient.get_advanced_validation(); keys
+            walk_forward_score, monte_carlo_survival_score, overfit_probability,
+            regime_survival_score, n_regimes_survived (any may be None).
+        profile: "calibration" (default) or "spec".
+
+    Returns:
+        {passed: bool, failures: [str], profile: str, thresholds: {...},
+         details: {metric: value_or_None}}
+    """
+    th = ADVANCED_GOVERNANCE_THRESHOLDS.get(
+        profile, ADVANCED_GOVERNANCE_THRESHOLDS["calibration"]
+    )
+    advanced = advanced or {}
+    failures: list[str] = []
+
+    def _num(key):
+        v = advanced.get(key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    wf = _num("walk_forward_score")
+    mc = _num("monte_carlo_survival_score")
+    of = _num("overfit_probability")
+    nreg = _num("n_regimes_survived")
+
+    # walk-forward (higher better)
+    if wf is None:
+        failures.append("missing:walk_forward_score")
+    elif wf < th["min_walk_forward_score"]:
+        failures.append(f"walk_forward {wf:.3f} < {th['min_walk_forward_score']}")
+
+    # monte-carlo survival (higher better)
+    if mc is None:
+        failures.append("missing:monte_carlo_survival")
+    elif mc < th["min_monte_carlo_survival"]:
+        failures.append(f"monte_carlo {mc:.3f} < {th['min_monte_carlo_survival']}")
+
+    # overfit probability (LOWER better)
+    if of is None:
+        failures.append("missing:overfit_probability")
+    elif of > th["max_overfit_probability"]:
+        failures.append(f"overfit {of:.3f} > {th['max_overfit_probability']}")
+
+    # regime survival count (higher better)
+    if nreg is None:
+        failures.append("missing:n_regimes_survived")
+    elif nreg < th["min_regimes_survived"]:
+        failures.append(f"regimes_survived {nreg:.0f} < {th['min_regimes_survived']}")
+
+    return {
+        "passed": len(failures) == 0,
+        "failures": failures,
+        "profile": profile,
+        "thresholds": dict(th),
+        "details": {
+            "walk_forward_score": wf,
+            "monte_carlo_survival_score": mc,
+            "overfit_probability": of,
+            "n_regimes_survived": nreg,
+        },
+    }
